@@ -10,12 +10,12 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import zipfile
 from pathlib import Path
 
 from jsonschema import Draft202012Validator
 
+from . import run_script as launcher
 from .db import now
 from .paths import BUILTIN
 
@@ -147,7 +147,8 @@ class Plugins:
         if not path.exists() or Path(plugin["dir"]).resolve() not in path.resolve().parents:
             raise ValueError(f"Plugin script not found: {script}")
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-u", str(path), *args, cwd=str(path.parent), env=self.script_env(plugin, extra_env),
+            *launcher.command(path, args), cwd=str(path.parent),
+            env=launcher.environment(self.script_env(plugin, extra_env)),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, creationflags=NO_WINDOW)
         result, lines = None, []
         try:

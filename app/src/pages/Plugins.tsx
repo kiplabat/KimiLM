@@ -32,7 +32,7 @@ function SettingField({ field, value, options, onChange }: any) {
 
 function PluginCard({ p, onChange }: any) {
   const { toast, refreshBoot } = useApp();
-  const [open, setOpen] = useState(!p.configured && p.enabled && p.id === "datavera");
+  const [open, setOpen] = useState(false);
   const [values, setValues] = useState<any>({});
   const [busy, setBusy] = useState("");
   const [setup, setSetup] = useState<any>(p.setup_state?.message ? p.setup_state : null);
@@ -263,7 +263,7 @@ export default function Plugins({ tab }: { tab?: string }) {
   const t = tab || "plugins";
   return (
     <div className="page">
-      <PageHeader title="Plugins & connectors" subtitle="Plugins bundle connectors, skills, harnesses and ready-made tasks. Datavera ships built in." />
+      <PageHeader title="Plugins & connectors" subtitle="Plugins bundle connectors, skills, harnesses and ready-made tasks. Turn on the ones you need." />
       <Tabs value={t} onChange={(v: string) => go("plugins", v)} tabs={[{ id: "plugins", label: "Plugins" }, { id: "connectors", label: "Connectors (MCP)" }]} />
       {t === "plugins" ? <Plugins_ /> : <Connectors />}
     </div>

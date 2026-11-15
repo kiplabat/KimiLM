@@ -37,7 +37,7 @@ function Sidebar() {
   return (
     <aside className="sidebar">
       <div className="brand" onClick={() => go("home")}>
-        <img src="./icon.png" alt="" /> <span>Datavera Agent</span>
+        <img src="./icon.png" alt="" /> <span>KimiLM</span>
       </div>
       <button className="new-chat" onClick={() => go("home")}><MessageSquarePlus size={16} /> New chat</button>
       <div className="search"><Search size={14} /><input placeholder="Search chats" value={q} onChange={(e) => setQ(e.target.value)} /></div>
@@ -93,7 +93,7 @@ function Sidebar() {
 export default function App() {
   const { route, boot, bootError } = useApp();
   if (bootError && !boot) {
-    return <div className="center-screen"><h2>Can't reach the engine</h2><p>{bootError}</p><p className="muted">If this persists, restart Datavera Agent. Logs are in the app's data folder.</p></div>;
+    return <div className="center-screen"><h2>Can't reach the engine</h2><p>{bootError}</p><p className="muted">If this persists, restart KimiLM. Logs are in the app's data folder.</p></div>;
   }
   if (!boot) return <div className="center-screen"><Spinner size={28} /><p className="muted">Starting…</p></div>;
   const needsOnboarding = !boot.settings?.onboarding_done && boot.models.length === 0;

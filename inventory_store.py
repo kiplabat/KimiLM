@@ -192,9 +192,16 @@ class Inventory:
         return destination
 
 
-async def list_all(client, output):
-    """Deterministic pagination of list_my_datasets (all statuses), saving every page as evidence."""
-    output = Path(output)
+class PaginationError(ValueError):
+    """A pass through list_my_datasets that did not add up. Carries what it did get, for the retry."""
+
+    def __init__(self, message, seen=None, expected=None, pages=0):
+        super().__init__(message)
+        self.seen, self.expected, self.pages = seen or {}, expected, pages
+
+
+async def _list_pass(client, output):
+    """One pass of list_my_datasets (all statuses), saving every page as evidence."""
     output.mkdir(parents=True, exist_ok=False)
     seen, expected, page, identities = {}, None, 1, []
     while True:
@@ -202,7 +209,8 @@ async def list_all(client, output):
         if expected is None:
             expected = result["total"]
         if result.get("total") != expected or result.get("page") != page:
-            raise ValueError("Inventory changed during refresh; no cache changes applied. Retry later.")
+            raise PaginationError(f"The catalogue changed during the sync (the server reported {expected} "
+                                  f"datasets, then {result.get('total')})", seen, expected, page)
         rows = result["datasets"]
         (output / f"page_{page}.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         for row in rows:
@@ -212,11 +220,41 @@ async def list_all(client, output):
         if not result["has_more"]:
             break
         if not rows or page >= 10000:
-            raise ValueError("Invalid pagination; no cache changes applied")
+            raise PaginationError("Invalid pagination (an empty page before the end)", seen, expected, page)
         page += 1
-    if len(seen) != expected or len(identities) != len(seen):
-        raise ValueError("Missing/repeated IDs during pagination; no cache changes applied")
+    repeated = sorted(i for i, n in Counter(identities).items() if n > 1)
+    if len(seen) != expected or repeated:
+        missing = max(0, expected - len(seen))
+        detail = (f"the server reported {expected} datasets, the pages held {len(seen)} different ones"
+                  + (f"; {missing} missing" if missing else "")
+                  + (f"; {len(repeated)} repeated: {', '.join(repeated[:10])}{' …' if len(repeated) > 10 else ''}"
+                     if repeated else ""))
+        raise PaginationError(f"Missing/repeated IDs during pagination ({detail})", seen, expected, page)
     return seen, expected, page
+
+
+async def list_all(client, output):
+    """Every dataset of the account, page by page. Fails safe: on a problem nothing is written to the catalogue.
+
+    If a pass doesn't add up (datasets reordered or edited while paging), it is retried once into a sibling
+    folder (<output>-retry). The retry is used if it is complete; otherwise the two passes together are accepted
+    only if they report the same total and hold exactly that many different datasets (newer rows win)."""
+    output = Path(output)
+    try:
+        return await _list_pass(client, output)
+    except PaginationError as first:
+        print(f"Catalogue sync: {first}. Trying once more…", flush=True)
+        import asyncio
+        await asyncio.sleep(2)
+        try:
+            return await _list_pass(client, output.with_name(output.name + "-retry"))
+        except PaginationError as second:
+            if first.expected is not None and first.expected == second.expected:
+                union = {**first.seen, **second.seen}
+                if len(union) == second.expected:
+                    print(f"Catalogue sync: combined two passes ({len(union)} datasets).", flush=True)
+                    return union, second.expected, max(first.pages, second.pages)
+            raise ValueError(f"{second}. No cache changes applied; try again in a minute.") from second
 
 
 async def sync_inventory(client, inventory, output):

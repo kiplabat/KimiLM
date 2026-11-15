@@ -1,4 +1,4 @@
-# Datavera Agent engine (Python 3.12). Pinned to the versions tested together.
+# KimiLM engine (Python 3.12). Pinned to the versions tested together.
 fastapi==0.162.5
 uvicorn==0.54.0
 python-multipart==0.0.33
@@ -10,9 +10,13 @@ croniter==7.0.0
 psutil==7.2.2
 keyring==25.7.0
 beautifulsoup4==4.15.0
-# used by the Datavera dataset-publisher pipeline, run_python and file tools
+# used by run_python, the file tools and plugin pipelines (e.g. Datavera's dataset publisher)
 pandas==3.1.1
 matplotlib==3.11.2
 openpyxl==3.1.5
 filelock==4.2.10
 python-dotenv==1.2.4
+# reading PDFs (web pages and files), images and video frames for vision models
+pypdf==7.1.0
+pillow==13.0.0
+av==19.0.2

@@ -1,9 +1,9 @@
 {
-  "name": "datavera-agent",
-  "productName": "Datavera Agent",
-  "version": "2.0.0",
+  "name": "kimilm",
+  "productName": "KimiLM",
+  "version": "2.2.0",
   "description": "Local AI agents on your own computer: chat, projects, memory, skills, plugins, harnesses and scheduled tasks. Models run on your machine.",
-  "author": "Datavera <hello@datavera.io>",
+  "author": "Kiplabat Tarus",
   "license": "MIT",
   "private": true,
   "main": "electron/main.cjs",

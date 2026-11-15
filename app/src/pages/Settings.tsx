@@ -19,7 +19,7 @@ export default function Settings() {
       {shell && (
         <div className="card stack-s">
           <h3>Running in the background</h3>
-          <Toggle checked={shell.openAtLogin} onChange={(v: boolean) => setShellPref({ openAtLogin: v })} label="Start Datavera Agent when I sign in to Windows (in the tray) — needed for schedules" />
+          <Toggle checked={shell.openAtLogin} onChange={(v: boolean) => setShellPref({ openAtLogin: v })} label="Start KimiLM when I sign in to Windows (in the tray) — needed for schedules" />
           <Toggle checked={shell.keepInTray} onChange={(v: boolean) => setShellPref({ keepInTray: v })} label="Closing the window keeps the app running in the tray" />
         </div>
       )}
@@ -42,7 +42,17 @@ export default function Settings() {
           <Field label="Free memory after (minutes idle)">
             <input className="input narrow" type="number" min={0} value={s.unload_after_minutes} onChange={(e) => set({ unload_after_minutes: Number(e.target.value) })} />
           </Field>
+          <Field label="Models loaded at once" help="More lets agents use different models in parallel; each needs memory.">
+            <input className="input narrow" type="number" min={1} max={6} value={s.max_loaded_models ?? 3} onChange={(e) => set({ max_loaded_models: Number(e.target.value) })} />
+          </Field>
+          <Field label="Agents at once (teams)">
+            <input className="input narrow" type="number" min={1} max={8} value={s.max_parallel_agents ?? 4} onChange={(e) => set({ max_parallel_agents: Number(e.target.value) })} />
+          </Field>
+          <Field label="Time limit per reply (minutes)" help="Agents stop and report what they found.">
+            <input className="input narrow" type="number" min={1} value={s.turn_time_limit_minutes ?? 30} onChange={(e) => set({ turn_time_limit_minutes: Number(e.target.value) })} />
+          </Field>
         </div>
+        <Toggle checked={s.browser_search ?? true} onChange={(v: boolean) => set({ browser_search: v })} label="When search engines return nothing useful, search again in a real browser window (Edge)" />
         <Field label="Hugging Face token (optional)" help="Only for models that require you to accept a licence on huggingface.co. Stored in Windows Credential Manager.">
           <div className="row gap-s"><input className="input" type="password" value={hf} placeholder={boot.has_hf_token ? "saved ••••" : "hf_…"} onChange={(e) => setHf(e.target.value)} />
             <Button onClick={async () => { await set({ hf_token: hf }); setHf(""); toast("Saved", "ok"); }}>Save</Button></div>
@@ -61,7 +71,7 @@ export default function Settings() {
       </div>
       <div className="card stack-s">
         <h3>About</h3>
-        <div className="small">Datavera Agent {boot.version} · llama.cpp {boot.runtime.tag}</div>
+        <div className="small">KimiLM {boot.version} · llama.cpp {boot.runtime.tag}</div>
         <div className="small muted">Data folder: {boot.data_dir}</div>
         {desktop && <div className="row gap-s"><Button small icon={<FolderOpen size={13} />} onClick={() => desktop.openPath(boot.data_dir)}>Open data folder</Button>
           <Button small onClick={() => desktop.openLogs()}>Open logs</Button></div>}

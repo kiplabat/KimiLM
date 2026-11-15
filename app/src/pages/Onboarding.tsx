@@ -16,7 +16,7 @@ export default function Onboarding() {
   const finish = async () => { await api.put("/settings", { onboarding_done: true }); await refreshBoot(); go("home"); };
   return (
     <div className="page onboarding">
-      <h1 className="hero">Welcome to Datavera Agent</h1>
+      <h1 className="hero">Welcome to KimiLM</h1>
       <p className="subtitle center">Your own AI agents, running entirely on this computer. Three quick steps.</p>
       <div className="steps">
         <div className="card step-card">
@@ -50,8 +50,8 @@ export default function Onboarding() {
         <div className="card step-card">
           <div className="step-num"><Plug size={18} /></div>
           <div className="grow">
-            <h3>3. Connect Datavera (optional)</h3>
-            <p>To publish datasets or check your analytics, paste your Datavera API key in Plugins → Datavera. You can do this any time.</p>
+            <h3>3. Add plugins (optional)</h3>
+            <p>Plugins connect KimiLM to your apps and services and add skills and ready-made tasks. Turn them on, or add your own MCP connectors, in Plugins. You can do this any time.</p>
             <Button onClick={() => go("plugins")}>Open Plugins</Button>
           </div>
         </div>
