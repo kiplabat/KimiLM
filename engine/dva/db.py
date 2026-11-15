@@ -60,6 +60,37 @@ CREATE TABLE IF NOT EXISTS usage (
   input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0, cost REAL DEFAULT 0, estimated INTEGER DEFAULT 0);
 CREATE INDEX IF NOT EXISTS usage_month ON usage(month);
 CREATE INDEX IF NOT EXISTS usage_chat ON usage(chat_id);
+CREATE TABLE IF NOT EXISTS kb_docs (
+  id TEXT PRIMARY KEY, project_id TEXT, name TEXT, path TEXT, size INTEGER DEFAULT 0, status TEXT, error TEXT,
+  chunks INTEGER DEFAULT 0, chars INTEGER DEFAULT 0, added TEXT, updated TEXT);
+CREATE INDEX IF NOT EXISTS kb_docs_project ON kb_docs(project_id);
+CREATE TABLE IF NOT EXISTS kb_chunks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, doc_id TEXT, project_id TEXT, seq INTEGER, text TEXT, vec BLOB);
+CREATE INDEX IF NOT EXISTS kb_chunks_doc ON kb_chunks(doc_id);
+CREATE INDEX IF NOT EXISTS kb_chunks_project ON kb_chunks(project_id);
+CREATE TABLE IF NOT EXISTS msg_vec (message_id TEXT PRIMARY KEY, chat_id TEXT, vec BLOB);
+CREATE INDEX IF NOT EXISTS msg_vec_chat ON msg_vec(chat_id);
+CREATE TABLE IF NOT EXISTS mem_vec (memory_id TEXT PRIMARY KEY, text TEXT, vec BLOB);
+"""
+
+# Full-text search (SQLite FTS5) over messages and knowledge passages, kept in step by triggers. If this SQLite has
+# no FTS5, search falls back to LIKE (slower, no ranking).
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS msg_fts USING fts5(content, content='messages', content_rowid='rowid',
+  tokenize='unicode61 remove_diacritics 2');
+CREATE TRIGGER IF NOT EXISTS msg_fts_ai AFTER INSERT ON messages BEGIN
+  INSERT INTO msg_fts(rowid, content) VALUES (new.rowid, new.content); END;
+CREATE TRIGGER IF NOT EXISTS msg_fts_ad AFTER DELETE ON messages BEGIN
+  INSERT INTO msg_fts(msg_fts, rowid, content) VALUES ('delete', old.rowid, old.content); END;
+CREATE TRIGGER IF NOT EXISTS msg_fts_au AFTER UPDATE OF content ON messages BEGIN
+  INSERT INTO msg_fts(msg_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+  INSERT INTO msg_fts(rowid, content) VALUES (new.rowid, new.content); END;
+CREATE VIRTUAL TABLE IF NOT EXISTS kb_fts USING fts5(text, content='kb_chunks', content_rowid='id',
+  tokenize='unicode61 remove_diacritics 2');
+CREATE TRIGGER IF NOT EXISTS kb_fts_ai AFTER INSERT ON kb_chunks BEGIN
+  INSERT INTO kb_fts(rowid, text) VALUES (new.id, new.text); END;
+CREATE TRIGGER IF NOT EXISTS kb_fts_ad AFTER DELETE ON kb_chunks BEGIN
+  INSERT INTO kb_fts(kb_fts, rowid, text) VALUES ('delete', old.id, old.text); END;
 """
 
 # Columns added after the first release: (table, column, definition). Applied once, on start.
@@ -67,6 +98,8 @@ MIGRATIONS = [
     ("chats", "settings_json", "TEXT DEFAULT '{}'"),        # per-chat limits (reply length, steps, time…)
     ("chats", "parent_chat_id", "TEXT"),                   # agents started by another chat (teams)
     ("chats", "agent_name", "TEXT"),
+    ("projects", "notes", "TEXT DEFAULT ''"),               # living project notes (2.4.0)
+    ("projects", "memory_mode", "TEXT DEFAULT 'shared'"),   # shared | isolated (2.4.0)
 ]
 
 
@@ -92,6 +125,18 @@ class DB:
                 have = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
                 if column not in have:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            self.fts = self._setup_fts()
+
+    def _setup_fts(self):
+        try:
+            new = not self.conn.execute("SELECT 1 FROM sqlite_master WHERE name='msg_fts'").fetchone()
+            self.conn.executescript(FTS_SCHEMA)
+            if new:     # index what is already there (chats from before 2.4.0)
+                self.conn.execute("INSERT INTO msg_fts(msg_fts) VALUES ('rebuild')")
+                self.conn.execute("INSERT INTO kb_fts(kb_fts) VALUES ('rebuild')")
+            return True
+        except sqlite3.OperationalError:
+            return False
 
     @staticmethod
     def _row(row):

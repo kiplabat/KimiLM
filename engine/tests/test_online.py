@@ -166,9 +166,10 @@ def test_lead_and_local_workers(env):
     assert wait_job(c, job["job_id"], timeout=120, approve="allow")["status"] == "done"
     msg = last_assistant(c, chat["id"])
     assert msg["meta"]["online"], "the lead is the strongest model"
-    team = [s for s in msg["meta"]["steps"] if s["type"] == "team"][0]
-    assert team["agents"] and all(a["model"] == env["local"] for a in team["agents"]), team
-    assert any("checked the results" in s.get("text", "") for s in msg["meta"]["steps"] if s["type"] == "note")
+    team = [s for s in msg["meta"]["steps"] if s["type"] == "orchestra"][0]
+    assert team["tasks"] and all(t["model"] == env["local"] for t in team["tasks"]), team   # workers run locally
+    assert all(t["status"] == "done" for t in team["tasks"])
+    assert any(line["text"].startswith("Planner accepted") for line in team["log"])          # the lead read them
 
 
 def test_online_failure_falls_back_to_local_under_auto(env):

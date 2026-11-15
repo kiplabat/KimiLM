@@ -7,6 +7,8 @@ from . import Tool, ToolError
 async def remember(ctx, text, scope="project"):
     if scope == "project" and not ctx.project:
         scope = "global"
+    if scope == "global" and ctx.app.memory.isolated(ctx.project):
+        scope = "project"                  # this project keeps its memory to itself
     scope_id = ctx.project["id"] if scope == "project" else (ctx.chat["id"] if scope == "chat" else "")
     try:
         row, created = ctx.app.memory.add(scope, text, scope_id, "fact", "agent", ctx.chat["id"])
@@ -17,18 +19,57 @@ async def remember(ctx, text, scope="project"):
 
 
 async def search_memory(ctx, query):
-    words = [w for w in query.lower().split() if len(w) > 2]
-    rows = []
-    for row in ctx.app.memory.list():
-        if row["scope"] == "project" and (not ctx.project or row["scope_id"] != ctx.project["id"]):
-            continue
-        if row["scope"] == "chat" and row["scope_id"] != ctx.chat["id"]:
-            continue
-        score = sum(w in row["text"].lower() for w in words)
-        if score:
-            rows.append((score, row))
-    rows.sort(key=lambda r: -r[0])
-    return "\n".join(f"- ({r['scope']}) {r['text']}" for _, r in rows[:15]) or "Nothing in memory matches."
+    rows = await ctx.app.knowledge.search_memory(query, ctx.chat, ctx.project)
+    return "\n".join(f"- ({r['scope']}) {r['text']}" for r in rows) or "Nothing in memory matches."
+
+
+def _when(iso):
+    return (iso or "")[:10]
+
+
+async def search_chats(ctx, query):
+    hits = await ctx.app.knowledge.search_chats(query, ctx.chat, ctx.project, k=8)
+    if not hits:
+        return ("No earlier chat matches. (This project keeps its chats to itself.)"
+                if ctx.app.memory.isolated(ctx.project) else "No earlier chat matches.")
+    out = []
+    for h in hits:
+        where = f" · project {h['project_name']}" if h.get("project_name") else ""
+        lines = [f"- chat_id {h['id']}: “{h.get('title') or 'untitled'}” ({_when(h.get('updated'))}{where})"]
+        for m in h["matches"]:
+            lines.append(f"    {m['role']}: {m['snippet']}")
+        out.append("\n".join(lines))
+    return "\n".join(out) + "\n\nUse read_chat with a chat_id to read more of one."
+
+
+async def read_chat(ctx, chat_id, query=""):
+    k = ctx.app.knowledge
+    if chat_id == ctx.chat["id"]:
+        raise ToolError("That is this chat; its messages are already in front of you")
+    if not ctx.app.db.get("chats", chat_id) or not k.may_read_chat(chat_id, ctx.chat, ctx.project):
+        raise ToolError("No chat with that id that this chat may read (use search_chats to find one)")
+    return k.read_chat(chat_id, query) or "That chat is empty."
+
+
+async def search_knowledge(ctx, query):
+    if not ctx.project:
+        return "This chat is not in a project, so there are no knowledge files to search."
+    hits = await ctx.app.knowledge.search_knowledge(ctx.project["id"], query, k=8)
+    if not hits:
+        return "Nothing in the project's knowledge files matches."
+    return "\n\n".join(f"[{h['doc']}] {h['text']}" for h in hits)
+
+
+async def update_project_notes(ctx, text, section="Status"):
+    if not ctx.project:
+        raise ToolError("This chat is not in a project; use remember instead")
+    try:
+        _, added = ctx.app.memory.add_note(ctx.project["id"], section, text)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    if added:
+        ctx.emit("memory_saved", item={"id": "notes", "text": text, "scope": "notes"})
+    return (f"Added to the project notes under {section}." if added else "The notes already say that.")
 
 
 async def load_skill(ctx, name):
@@ -103,6 +144,20 @@ TOOLS = [
          remember, "memory", label="Remember", summary=lambda a: f"Remember: {a.get('text')}"),
     Tool("search_memory", "Search what has been remembered.", S({"query": {"type": "string"}}, ["query"]),
          search_memory, "memory", label="Search memory", summary=lambda a: f"Search memory: {a.get('query')}"),
+    Tool("search_chats", "Search the user's earlier chats (by words and meaning). Returns matching chats with "
+         "snippets and their chat_id.", S({"query": {"type": "string"}}, ["query"]), search_chats, "memory",
+         label="Search earlier chats", summary=lambda a: f"Search earlier chats: {a.get('query')}"),
+    Tool("read_chat", "Read an earlier chat found with search_chats (long chats: the parts matching query).",
+         S({"chat_id": {"type": "string"}, "query": {"type": "string"}}, ["chat_id"]), read_chat, "memory",
+         label="Read an earlier chat", summary=lambda a: f"Read earlier chat {a.get('chat_id')}"),
+    Tool("search_knowledge", "Search the project's knowledge files (documents the user added to the project). "
+         "Returns passages with their file names.", S({"query": {"type": "string"}}, ["query"]), search_knowledge,
+         "memory", label="Search knowledge files", summary=lambda a: f"Search knowledge files: {a.get('query')}"),
+    Tool("update_project_notes", "Add one line to the project's running notes: a decision, a status change or an "
+         "open question that matters beyond this chat.",
+         S({"text": {"type": "string"}, "section": {"enum": ["Decisions", "Status", "Open questions"]}}, ["text"]),
+         update_project_notes, "memory", label="Update project notes",
+         summary=lambda a: f"Project notes ({a.get('section') or 'Status'}): {a.get('text')}"),
     Tool("load_skill", "Load a skill's full instructions before doing a task it covers.",
          S({"name": {"type": "string"}}, ["name"]), load_skill, "skills", label="Load skill",
          summary=lambda a: f"Load skill {a.get('name')}"),

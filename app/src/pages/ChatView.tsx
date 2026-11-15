@@ -1,8 +1,8 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle, Ban, Brain, Check, CheckCircle2, ChevronDown, ChevronRight, Circle, Clock, Cloud, Copy, CornerDownRight,
-  ExternalLink, FileText, FolderOpen, Loader2, MoreHorizontal, Paperclip, Pin, RotateCcw, Send, ShieldCheck, Sparkles,
-  Trash2, Users, X, XCircle,
+  Eye, ExternalLink, FileText, FolderOpen, Loader2, MoreHorizontal, Paperclip, Pause, Pin, Play, RotateCcw, Send,
+  ShieldCheck, Sparkles, Trash2, Users, Workflow, X, XCircle,
 } from "lucide-react";
 import { api, desktop, fileUrl, fmtBytes, fmtTime } from "../api";
 import { go, useApp, useEvent } from "../store";
@@ -125,6 +125,99 @@ function TeamCards({ agents }: any) {
   );
 }
 
+const TASK_LABEL: any = { waiting: "waiting", paused: "paused", running: "working", review: "being checked", done: "accepted", failed: "failed", cancelled: "cancelled" };
+
+function taskIcon(t: any) {
+  if (t.paused && t.status === "running") return <Pause size={14} className="warn-c" />;
+  switch (t.status) {
+    case "done": return <CheckCircle2 size={14} className="ok" />;
+    case "failed": return <XCircle size={14} className="bad" />;
+    case "cancelled": return <Ban size={14} className="muted" />;
+    case "paused": return <Pause size={14} className="warn-c" />;
+    case "review": return <Eye size={14} className="accent" />;
+    case "running": return <Loader2 size={14} className="spin accent" />;
+    default: return <Clock size={14} className="muted" />;
+  }
+}
+
+function OrchestraTask({ t, live }: any) {
+  const [open, setOpen] = useState(false);
+  const { toast } = useApp();
+  const act = async (what: string) => {
+    try { await api.post(`/chats/${t.chat_id}/${what}`, what === "pause" ? { reason: "paused by you" } : {}); }
+    catch (e: any) { toast(e.message, "error"); }
+  };
+  return (
+    <div className={`orch-task st-${t.paused && t.status === "running" ? "paused" : t.status}`}>
+      <div className="row between gap-s">
+        <span className="row gap-s ellipsis">{taskIcon(t)}<b className="ellipsis">{t.name}</b><span className="muted small">{t.id}</span></span>
+        <span className="row gap-xs">
+          {live && t.status === "running" && t.chat_id && (t.paused
+            ? <button className="icon-btn" title="Resume this agent" onClick={() => act("resume")}><Play size={13} /></button>
+            : <button className="icon-btn" title="Pause this agent (it stops at its next step and frees its model)" onClick={() => act("pause")}><Pause size={13} /></button>)}
+          {t.chat_id && <button className="icon-btn" title="Open this agent's chat" onClick={() => go("chat", t.chat_id)}><ExternalLink size={13} /></button>}
+        </span>
+      </div>
+      <div className="small muted ellipsis">
+        {TASK_LABEL[t.status] || t.status}{t.attempts > 1 ? ` · attempt ${t.attempts}` : ""} · {t.agent ? `${t.agent} · ` : ""}{t.harness}
+        {t.model_name ? <> · {t.online ? <Cloud size={11} /> : null} {t.model_name}</> : null}
+      </div>
+      {t.depends_on?.length > 0 && <div className="small muted">after {t.depends_on.join(", ")}</div>}
+      <div className="small clamp-2" title={t.goal}>{t.goal}</div>
+      {t.status === "running" && t.progress && <div className="small accent ellipsis">{t.paused ? "paused" : t.progress}</div>}
+      {t.status === "waiting" && t.wait_reason && <div className="small muted">{t.wait_reason}</div>}
+      {t.note && <div className="small orch-note">Planner: {t.note}</div>}
+      {t.output && (
+        <div className="orch-output">
+          <button className="link small" onClick={() => setOpen(!open)}>{open ? "Hide result" : "Show result"}</button>
+          {open && <div className="small"><Markdown>{t.output}</Markdown></div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function OrchestraCard({ step, live }: any) {
+  const [showLog, setShowLog] = useState(false);
+  const tasks: any[] = step?.tasks || [];
+  if (!tasks.length) return null;
+  const byId: any = Object.fromEntries(tasks.map((t) => [t.id, t]));
+  const depth: any = {};
+  const level = (t: any, seen: Set<string> = new Set()): number => {
+    if (depth[t.id] !== undefined) return depth[t.id];
+    if (seen.has(t.id)) return 0;
+    seen.add(t.id);
+    const deps = (t.depends_on || []).filter((d: string) => byId[d]);
+    return (depth[t.id] = deps.length ? 1 + Math.max(...deps.map((d: string) => level(byId[d], seen))) : 0);
+  };
+  tasks.forEach((t) => level(t));
+  const lanes: any[][] = [];
+  tasks.forEach((t) => { (lanes[depth[t.id]] = lanes[depth[t.id]] || []).push(t); });
+  const done = tasks.filter((t) => ["done", "failed", "cancelled"].includes(t.status)).length;
+  const running = tasks.filter((t) => t.status === "running").length;
+  return (
+    <div className="orch">
+      <div className="orch-head">
+        <span className="row gap-s"><Workflow size={14} /> <b>Team</b>
+          <span className="muted small">{done} of {tasks.length} done{running ? ` · ${running} working` : ""}</span></span>
+        <span className="row gap-s">
+          {step.log?.length > 0 && <button className="link small" onClick={() => setShowLog(!showLog)}>{showLog ? "Hide the planner's log" : `Planner's log (${step.log.length})`}</button>}
+          {desktop && step.folder && <button className="icon-btn" title="Open the shared team folder" onClick={() => desktop.openPath(step.folder)}><FolderOpen size={13} /></button>}
+        </span>
+      </div>
+      <div className="orch-lanes">
+        {lanes.map((lane, i) => (
+          <div key={i} className="orch-lane">
+            <div className="orch-lane-title">{i === 0 ? "Start" : `Then (${i})`}</div>
+            {lane.map((t) => <OrchestraTask key={t.id} t={t} live={live} />)}
+          </div>
+        ))}
+      </div>
+      {showLog && <div className="orch-log">{step.log.map((l: any, i: number) => <div key={i}><span className="muted">{Math.round(l.at)}s</span> {l.text}</div>)}</div>}
+    </div>
+  );
+}
+
 function Steps({ steps, approvals, onDecide, log }: any) {
   return (
     <>
@@ -138,6 +231,7 @@ function Steps({ steps, approvals, onDecide, log }: any) {
         if (s.type === "note") return <div key={i} className="note">{s.text}</div>;
         if (s.type === "steer") return <div key={i} className="note steer"><CornerDownRight size={14} /> You added while it worked: “{s.text}”</div>;
         if (s.type === "team") return <TeamCards key={i} agents={s.agents} />;
+        if (s.type === "orchestra") return <OrchestraCard key={i} step={s} />;
         return null;
       })}
     </>
@@ -185,6 +279,7 @@ function LiveTurn({ live, onDecide }: any) {
       <PlanView plan={live.plan} current={live.current} />
       <Steps steps={live.steps} approvals={live.approvals} onDecide={onDecide} log={live.log} />
       {live.team && <TeamCards agents={live.team} />}
+      {live.orchestra && <OrchestraCard step={live.orchestra} live />}
       <LogView lines={live.log} />
       {live.approvals.filter((a: any) => !a.call_id).map((a: any) => (
         <ToolCard key={a.approval_id} step={{ label: a.agent ? `${a.agent}: ${a.label || a.tool}` : a.label || a.tool, description: a.description, state: "running", arguments: {} }} approval={a} onDecide={onDecide} />
@@ -255,7 +350,7 @@ export default function ChatView({ chatId }: { chatId: string }) {
     try {
       const c = await api.get(`/chats/${chatId}`);
       setChat(c);
-      if (c.running_job && !live) setLive((l: any) => l || { message_id: null, steps: [], approvals: c.pending_approvals.map((a: any) => ({ ...a })), log: [], status: "Working…", reasoning: "" });
+      if (c.running_job && !live) setLive((l: any) => l || { message_id: null, steps: [], approvals: c.pending_approvals.map((a: any) => ({ ...a })), log: [], status: "Working…", reasoning: "", orchestra: c.orchestra });
       if (!c.running_job) setLive(null);
     } catch (e: any) { toast(e.message, "error"); go("home"); }
   };
@@ -283,6 +378,9 @@ export default function ChatView({ chatId }: { chatId: string }) {
         break;
       case "note": update((l) => ({ ...l, steps: [...l.steps, { type: "note", text: e.text }] })); break;
       case "team": update((l) => ({ ...l, team: e.agents })); break;
+      case "orchestra": update((l) => ({ ...l, orchestra: e })); break;
+      case "paused": setChat((c: any) => c ? { ...c, paused: true } : c); update((l) => ({ ...l, status: `Paused: ${e.reason}` })); break;
+      case "resumed": setChat((c: any) => c ? { ...c, paused: false } : c); break;
       case "agent_approval": update((l) => ({ ...l, approvals: [...l.approvals.filter((a: any) => a.approval_id !== e.approval_id), { ...e }], status: `Waiting for your approval (${e.agent})` })); break;
       case "agent_approval_done": update((l) => ({ ...l, approvals: l.approvals.filter((a: any) => a.approval_id !== e.approval_id) })); break;
       case "assistant_start": update((l) => ({ ...l, message_id: e.message_id, status: "Starting…" })); break;
@@ -366,6 +464,9 @@ export default function ChatView({ chatId }: { chatId: string }) {
             <span className="chip chip-toggle" title="Approve changes (file writes, Python, connector actions) automatically in this chat">
               <ShieldCheck size={14} /><Toggle checked={chat.auto_approve} onChange={(v: boolean) => patch({ auto_approve: v })} label="Auto-approve" />
             </span>
+            {running && (chat.paused
+              ? <Button small icon={<Play size={13} />} onClick={() => api.post(`/chats/${chatId}/resume`)} title="Continue from where it paused">Resume</Button>
+              : <Button small kind="ghost" icon={<Pause size={13} />} onClick={() => api.post(`/chats/${chatId}/pause`, { reason: "paused by you" })} title="Pause at the next step (a team pauses all its agents); the model is freed while paused">Pause</Button>)}
             <button className="icon-btn" title="Chat files" onClick={() => setShowFiles(!showFiles)}><Paperclip size={16} /></button>
             <div className="popover-wrap">
               <button className="icon-btn" onClick={() => setMenu(!menu)}><MoreHorizontal size={18} /></button>

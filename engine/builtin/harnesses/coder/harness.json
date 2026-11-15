@@ -1,6 +1,6 @@
 {
   "name": "Coder",
-  "description": "Reads, writes and fixes code in your folders, runs it and its tests, and explains the changes.",
+  "description": "Reads, writes and fixes code in your folders, runs it, its tests and commands (git, build tools), and keeps fixing errors until it works.",
   "type": "loop",
   "mode": "agent",
   "tools": [

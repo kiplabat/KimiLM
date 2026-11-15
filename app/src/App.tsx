@@ -1,8 +1,9 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   Activity as ActivityIcon, BookOpen, Brain, CalendarClock, Cpu, FolderKanban, MessageSquarePlus, Plug, Search,
   Settings as SettingsIcon, Workflow, Loader2, Pin, WifiOff,
 } from "lucide-react";
+import { api } from "./api";
 import { go, useApp } from "./store";
 import { Badge, Spinner } from "./components/ui";
 import Home from "./pages/Home";
@@ -29,11 +30,25 @@ const NAV = [
   { page: "settings", label: "Settings", icon: SettingsIcon },
 ];
 
+function highlight(snippet: string) {
+  const esc = (snippet || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return esc.replace(/\*\*(.+?)\*\*/g, "<mark>$1</mark>");
+}
+
 function Sidebar() {
   const { route, projects, chats, jobs, modelStatus, connected } = useApp();
   const [q, setQ] = useState("");
+  const [found, setFound] = useState<any[] | null>(null);
   const looseChats = chats.filter((c: any) => !c.project_id);
   const filtered = q ? chats.filter((c: any) => (c.title || "").toLowerCase().includes(q.toLowerCase())) : looseChats;
+  useEffect(() => {      // search inside chats too (words, and meaning once the search model is installed)
+    setFound(null);
+    if (q.trim().length < 2) return;
+    const t = setTimeout(() => api.get(`/search?q=${encodeURIComponent(q)}&limit=25`).then((r) => setFound(r.results)).catch(() => setFound([])), 300);
+    return () => clearTimeout(t);
+  }, [q]);
+  const titleIds = new Set(filtered.map((c: any) => c.id));
+  const inside = (found || []).filter((r: any) => !titleIds.has(r.id));
   return (
     <aside className="sidebar">
       <div className="brand" onClick={() => go("home")}>
@@ -57,8 +72,8 @@ function Sidebar() {
             ))}
           </div>
         )}
-        <div className="side-section">
-          <div className="side-title"><span>{q ? "Results" : "Chats"}</span></div>
+        {(!q || filtered.length > 0) && <div className="side-section">
+          <div className="side-title"><span>{q ? "Chat titles" : "Chats"}</span></div>
           {filtered.slice(0, 80).map((c: any) => (
             <div key={c.id} className={`side-item${route.page === "chat" && route.id === c.id ? " active" : ""}`}
               onClick={() => go("chat", c.id)} title={c.title}>
@@ -68,7 +83,20 @@ function Sidebar() {
             </div>
           ))}
           {!q && looseChats.length === 0 && <div className="side-empty">Your chats appear here.</div>}
-        </div>
+        </div>}
+        {q.trim().length >= 2 && (
+          <div className="side-section">
+            <div className="side-title"><span>Inside chats</span>{found === null && <Spinner size={12} />}</div>
+            {found !== null && inside.length === 0 && <div className="side-empty">No other chat mentions this.</div>}
+            {inside.map((r: any) => (
+              <div key={r.id} className={`side-item side-hit${route.page === "chat" && route.id === r.id ? " active" : ""}`}
+                onClick={() => go("chat", r.id)} title={r.title}>
+                <div className="ellipsis"><b>{r.title || "New chat"}</b>{r.project_name ? <span className="muted"> · {r.project_name}</span> : null}</div>
+                {r.matches?.[0] && <div className="side-snippet" dangerouslySetInnerHTML={{ __html: highlight(r.matches[0].snippet) }} />}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
       <nav className="side-nav">
         {NAV.map(({ page, label, icon: Icon }) => (

@@ -398,16 +398,22 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         row["chats"] = a.db.all("SELECT id, title, updated, origin FROM chats WHERE project_id=? AND archived=0 "
                                 "AND parent_chat_id IS NULL ORDER BY updated DESC", (pid,))
         row["memories"] = a.memory.list("project", pid)
+        row["knowledge"] = a.knowledge.docs(pid)
         return row
 
     @api.put("/api/projects/{pid}")
     async def project_update(pid: str, request: Request):
         a, data = A(), await body(request)
         allowed = {k: v for k, v in data.items() if k in ("name", "instructions", "folders", "default_model",
-                                                         "default_harness", "connectors", "memory_enabled", "archived")}
+                                                         "default_harness", "connectors", "memory_enabled", "archived",
+                                                         "memory_mode")}
         for k in ("memory_enabled", "archived"):
             if k in allowed:
                 allowed[k] = int(bool(allowed[k]))
+        if "memory_mode" in allowed and allowed["memory_mode"] not in ("shared", "isolated"):
+            raise ValueError("memory_mode is shared or isolated")
+        if "notes" in data:
+            a.memory.set_notes(pid, data["notes"] or "")
         allowed["updated"] = now()
         a.db.update("projects", pid, allowed)
         a.bus.publish("projects_changed")
@@ -418,9 +424,89 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         a = A()
         a.db.run("UPDATE chats SET project_id=NULL WHERE project_id=?", (pid,))
         a.db.run("DELETE FROM memories WHERE scope='project' AND scope_id=?", (pid,))
+        a.knowledge.remove_project(pid)
         a.db.delete("projects", pid)
         a.bus.publish("projects_changed")
         return {"ok": True}
+
+    # ------------------------------------------------------------------ knowledge files (2.4.0)
+    @api.get("/api/projects/{pid}/knowledge")
+    async def knowledge_list(pid: str):
+        return {"docs": A().knowledge.docs(pid)}
+
+    @api.post("/api/projects/{pid}/knowledge")
+    async def knowledge_upload(pid: str, file: UploadFile = File(...)):
+        a = A()
+        if not a.db.get("projects", pid):
+            raise KeyError(pid)
+        tmp = a.paths.data / "tmp"
+        tmp.mkdir(exist_ok=True)
+        dest = tmp / (new_id("up_") + "-" + Path(file.filename or "file").name)
+        size = 0
+        with dest.open("wb") as f:
+            while chunk := await file.read(1 << 20):
+                size += len(chunk)
+                if size > 200 * 2**20:
+                    f.close()
+                    dest.unlink(missing_ok=True)
+                    raise ValueError("Knowledge files can be up to 200 MB")
+                f.write(chunk)
+        try:
+            return a.knowledge.add_file(pid, dest, name=Path(file.filename or "file").name, move=True)
+        finally:
+            dest.unlink(missing_ok=True)
+
+    @api.post("/api/projects/{pid}/knowledge/paths")
+    async def knowledge_add_paths(pid: str, request: Request):
+        """Files picked on this computer (the desktop app passes their paths): copied into the project."""
+        a, data = A(), await body(request)
+        if not a.db.get("projects", pid):
+            raise KeyError(pid)
+        added, errors = [], []
+        for p in (data.get("paths") or [])[:50]:
+            try:
+                added.append(a.knowledge.add_file(pid, p))
+            except (ValueError, OSError) as exc:
+                errors.append(f"{Path(p).name}: {exc}")
+        return {"added": added, "errors": errors}
+
+    @api.delete("/api/knowledge/{doc_id}")
+    async def knowledge_remove(doc_id: str):
+        A().knowledge.remove(doc_id)
+        return {"ok": True}
+
+    @api.post("/api/knowledge/{doc_id}/reindex")
+    async def knowledge_reindex(doc_id: str):
+        A().knowledge.reindex(doc_id)
+        return {"ok": True}
+
+    # ------------------------------------------------------------------ search (2.4.0)
+    @api.get("/api/search")
+    async def search(q: str, project_id: str = "", limit: int = 20):
+        """The sidebar's search: every chat (or one project's), by words and, with the search model, by meaning."""
+        a = A()
+        project = a.db.get("projects", project_id) if project_id else None
+        return {"results": await a.knowledge.search_chats(q, project=project, k=min(50, limit), everything=True)}
+
+    @api.get("/api/search/status")
+    async def search_status():
+        a = A()
+        return {"model": a.embedder.status(), "index": a.knowledge.stats()}
+
+    @api.post("/api/search/model")
+    async def search_model_download():
+        return A().embedder.download()
+
+    @api.post("/api/search/model/cancel")
+    async def search_model_cancel():
+        A().embedder.cancel()
+        return {"ok": True}
+
+    @api.delete("/api/search/model")
+    async def search_model_remove():
+        a = A()
+        await a.embedder.remove()
+        return a.embedder.status()
 
     # ------------------------------------------------------------------ chats
     @api.get("/api/chats")
@@ -473,6 +559,12 @@ def create_app(data_dir=None, resources_dir=None, token=None):
                                   "WHERE parent_chat_id=? ORDER BY created", (chat_id,))
         for ag in chat["agents"]:
             ag["running"] = bool(a.jobs.running_for_chat(ag["id"]))
+        from .orchestrator import is_paused
+        chat["paused"] = is_paused(a, chat_id)
+        orch = a.orchestras.get(chat_id)
+        if orch:                                   # a team is running: the board, for a page opened mid-run
+            orch.publish()
+            chat["orchestra"] = orch.step
         if chat.get("parent_chat_id"):
             parent = a.db.get("chats", chat["parent_chat_id"])
             chat["parent"] = {"id": parent["id"], "title": parent["title"]} if parent else None
@@ -558,6 +650,20 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         a = A()
         jid = a.jobs.running_for_chat(chat_id)
         return {"stopped": a.jobs.cancel(jid) if jid else False}
+
+    @api.post("/api/chats/{chat_id}/pause")
+    async def chat_pause(chat_id: str, request: Request):
+        """Pause a running agent (or a whole team) at its next step; its model is given back while it waits."""
+        from .orchestrator import pause_chat
+        data = await body(request)
+        pause_chat(A(), chat_id, (data.get("reason") or "paused by you")[:200])
+        return {"paused": True}
+
+    @api.post("/api/chats/{chat_id}/resume")
+    async def chat_resume(chat_id: str):
+        from .orchestrator import resume_chat
+        resume_chat(A(), chat_id)
+        return {"paused": False}
 
     @api.post("/api/chats/{chat_id}/upload")
     async def chat_upload(chat_id: str, file: UploadFile = File(...)):

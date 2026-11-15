@@ -4,10 +4,16 @@ Scopes: global (about you), project (about one project), chat (notes for one con
 way of working has learned from past tasks). After a conversation goes quiet, a short "learning pass" asks the
 local model what is worth remembering (bounded JSON, max 3 items), skips duplicates and secrets, and shows what it
 learned in the chat. Finished tasks leave lessons for the harness that ran them. Long chats are summarised so
-older turns still count. Everything is visible and editable on the Memory page."""
+older turns still count. Everything is visible and editable on the Memory page.
+
+2.4.0: the notes put in a prompt are the ones that bear on the request (knowledge.rank: meaning when the search
+model is installed, plus shared words), pinned ones first, so a large memory does not crowd the prompt. Projects
+keep living notes (decisions, status, open questions) that the learning pass and the agent add to. A project set to
+"Kept to this project" (memory_mode isolated) never reads or writes the global notes."""
 import asyncio
 import difflib
 import re
+from datetime import date
 
 from .db import new_id, now
 from .llm import LLMError
@@ -20,13 +26,18 @@ LEARN_SCHEMA = {
         "memories": {"type": "array", "maxItems": 3, "items": {
             "type": "object", "required": ["scope", "kind", "text"],
             "properties": {"scope": {"enum": ["global", "project", "chat"]},
-                           "kind": {"enum": ["fact", "preference", "correction"]},
-                           "text": {"type": "string", "minLength": 8, "maxLength": 220}}}},
+                           "kind": {"enum": ["fact", "preference", "correction", "decision"]},
+                           "text": {"type": "string", "minLength": 8, "maxLength": 300}}}},
         "skill_feedback": {"type": "array", "maxItems": 1, "items": {
             "type": "object", "required": ["skill", "suggestion"],
             "properties": {"skill": {"type": "string"}, "suggestion": {"type": "string", "maxLength": 400}}}},
     },
 }
+NOTES_ITEMS = {"type": "array", "maxItems": 2, "items": {
+    "type": "object", "required": ["section", "text"],
+    "properties": {"section": {"enum": ["Decisions", "Status", "Open questions"]},
+                   "text": {"type": "string", "minLength": 8, "maxLength": 300}}}}
+NOTE_SECTIONS = ("Decisions", "Status", "Open questions")
 LESSON_SCHEMA = {"type": "object", "required": ["lessons"], "properties": {"lessons": {
     "type": "array", "maxItems": 2, "items": {"type": "string", "minLength": 10, "maxLength": 220}}}}
 SUMMARY_SCHEMA = {"type": "object", "required": ["summary"],
@@ -88,19 +99,33 @@ class Memory:
         return not project or bool(project.get("memory_enabled", 1))
 
     # ------------------------------------------------------------------ use in prompts
-    def context(self, chat, project, harness_id=None, budget_chars=3500):
+    @staticmethod
+    def isolated(project):
+        return bool(project) and (project.get("memory_mode") or "shared") == "isolated"
+
+    async def context(self, chat, project, harness_id=None, query="", budget_chars=3500):
+        """Memory for a prompt: pinned notes first, then the ones most relevant to the request."""
         if not self.enabled(project):
             return ""
         blocks = []
-        sections = [("About the user (remembered)", self.list("global")[:15])]
+        sections = []
+        if not self.isolated(project):
+            sections.append(("About the user (remembered)", self.list("global"), 15))
         if project:
-            sections.append((f"About the project “{project['name']}”", self.list("project", project["id"])[:25]))
-        sections.append(("Notes for this conversation", self.list("chat", chat["id"])[:10]))
+            sections.append((f"About the project “{project['name']}”", self.list("project", project["id"]), 25))
+        sections.append(("Notes for this conversation", self.list("chat", chat["id"]), 10))
         if harness_id:
-            sections.append(("Lessons from earlier tasks", self.list("harness", harness_id)[:8]))
+            sections.append(("Lessons from earlier tasks", self.list("harness", harness_id), 8))
+        ranked = []
+        for title, rows, keep in sections:
+            if query and len(rows) > keep // 2:
+                pinned = [r for r in rows if r.get("pinned")]
+                rest = await self.app.knowledge.rank(query, [r for r in rows if not r.get("pinned")])
+                rows = pinned + rest
+            ranked.append((title, rows[:keep]))
         used = []
         size = 0
-        for title, rows in sections:
+        for title, rows in ranked:
             lines = []
             for r in rows:
                 line = f"- {r['text']}"
@@ -176,7 +201,8 @@ class Memory:
         if not any(r["role"] == "user" for r in new):
             return []
         transcript = "\n".join(f"{r['role'].upper()}: {r['content'][:1200]}" for r in new[-8:])
-        known = [r["text"] for r in self.list("global")[:20]]
+        isolated = self.isolated(project)
+        known = [] if isolated else [r["text"] for r in self.list("global")[:20]]
         if project:
             known += [r["text"] for r in self.list("project", project["id"])[:20]]
         loaded = sorted({s for r in rows for s in (r.get("meta") or {}).get("skills_loaded", [])})
@@ -188,6 +214,8 @@ class Memory:
                     "properties": {"skill": {"enum": loaded}, "suggestion": {"type": "string", "maxLength": 400}}}}}}
         else:
             schema = {**LEARN_SCHEMA, "properties": {"memories": LEARN_SCHEMA["properties"]["memories"]}}
+        if project:
+            schema = {**schema, "properties": {**schema["properties"], "project_notes": NOTES_ITEMS}}
         system = (
             "You maintain a small memory so a local assistant improves over time. From the conversation, pick at "
             "most 3 durable things worth remembering for future conversations: stable facts about the user or their "
@@ -198,7 +226,11 @@ class Memory:
             "passwords, health, money or identity details, one-off task details, or anything already known. "
             "Return an empty list when nothing is worth keeping — that is the usual answer."
             + (" If the user corrected how a loaded skill made the assistant behave, add one skill_feedback item "
-               "describing the change to the skill's instructions." if loaded else ""))
+               "describing the change to the skill's instructions." if loaded else "")
+            + (" For the project's running notes you may also add up to 2 project_notes items: a decision that was "
+               "made, a change in status, or an open question — only if it matters beyond this conversation."
+               if project else "")
+            + (" This project keeps its memory to itself: never use scope 'global'." if isolated else ""))
         user = ("Already known:\n" + ("\n".join(f"- {k}" for k in known) or "(nothing)") +
                 f"\n\nConversation:\n{transcript}")
         model_id = self._learning_model(chat)
@@ -217,6 +249,8 @@ class Memory:
             scope = item["scope"]
             if scope == "project" and not project:
                 scope = "global"
+            if scope == "global" and isolated:
+                scope = "project"
             if any(similar(item["text"], k) >= 0.8 for k in known):
                 continue
             try:
@@ -230,11 +264,59 @@ class Memory:
             self.db.insert("skill_suggestions", {"id": new_id("s_"), "skill": fb["skill"],
                                                  "suggestion": fb["suggestion"], "chat_id": chat_id, "created": now()})
             self.app.bus.publish("skill_suggestion", skill=fb["skill"])
+        for note in (out.get("project_notes") or []) if project else []:
+            try:
+                self.add_note(project["id"], note.get("section") or "Status", note.get("text") or "", source="learned")
+            except ValueError:
+                pass
         self.db.update("chats", chat_id, {"learned_upto": rows[-1]["id"]})
         if saved:
             self.app.bus.publish("memory_learned", chat_id=chat_id,
                                  items=[{"id": r["id"], "text": r["text"], "scope": r["scope"]} for r in saved])
         return saved
+
+    # ------------------------------------------------------------------ project notes (a living document)
+    def add_note(self, project_id, section, text, source="agent"):
+        """Add a dated line under a section of the project's notes (skipped if it is already there)."""
+        text = " ".join((text or "").split())
+        if not text:
+            raise ValueError("Nothing to add")
+        if SECRET_RE.search(text):
+            raise ValueError("That looks like a secret; notes never store those")
+        project = self.db.get("projects", project_id)
+        if not project:
+            raise KeyError(project_id)
+        notes = project.get("notes") or ""
+        for line in notes.splitlines():
+            if similar(line.split(":", 1)[-1].strip(), text) >= 0.85:
+                return notes, False
+        section = section if section in NOTE_SECTIONS else (section or "Notes").strip()[:40]
+        line = f"- {date.today().isoformat()}: {text}"
+        heading = f"## {section}"
+        lines = notes.splitlines()
+        if heading in lines:
+            i = lines.index(heading) + 1
+            while i < len(lines) and not lines[i].startswith("## "):
+                i += 1
+            while i > 0 and not lines[i - 1].strip():
+                i -= 1
+            lines.insert(i, line)
+        else:
+            lines += ([""] if lines and lines[-1].strip() else []) + [heading, line]
+        notes = "\n".join(lines).strip() + "\n"
+        if len(notes) > 30000:
+            raise ValueError("The project notes are full (30,000 characters). Tidy them on the project page first.")
+        self.db.update("projects", project_id, {"notes": notes, "updated": now()})
+        self.app.bus.publish("project_notes", project_id=project_id, source=source)
+        return notes, True
+
+    def set_notes(self, project_id, notes):
+        if SECRET_RE.search(notes or ""):
+            raise ValueError("That looks like a secret; notes never store those")
+        if len(notes or "") > 30000:
+            raise ValueError("Project notes can be up to 30,000 characters")
+        self.db.update("projects", project_id, {"notes": notes or "", "updated": now()})
+        self.app.bus.publish("project_notes", project_id=project_id, source="user")
 
     # ------------------------------------------------------------------ lessons after tasks
     async def reflect(self, harness_id, title, outcome_text, model_id):

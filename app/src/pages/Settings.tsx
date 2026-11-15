@@ -45,13 +45,35 @@ export default function Settings() {
           <Field label="Models loaded at once" help="More lets agents use different models in parallel; each needs memory.">
             <input className="input narrow" type="number" min={1} max={6} value={s.max_loaded_models ?? 3} onChange={(e) => set({ max_loaded_models: Number(e.target.value) })} />
           </Field>
-          <Field label="Agents at once (teams)">
-            <input className="input narrow" type="number" min={1} max={8} value={s.max_parallel_agents ?? 4} onChange={(e) => set({ max_parallel_agents: Number(e.target.value) })} />
-          </Field>
           <Field label="Time limit per reply (minutes)" help="Agents stop and report what they found.">
             <input className="input narrow" type="number" min={1} value={s.turn_time_limit_minutes ?? 30} onChange={(e) => set({ turn_time_limit_minutes: Number(e.target.value) })} />
           </Field>
         </div>
+      </div>
+      <div className="card stack-s">
+        <h3>Teams of agents</h3>
+        <p className="muted small">A planner (your strongest model) splits a multi-step request into tasks, starts each agent when the results it needs are ready, reads every result, sends work back with feedback, and writes the answer. Agents can be paused from the chat.</p>
+        <Field label="Use a team" help={s.team_mode === "always" ? "Every request in an Agent or Planner chat goes to the planner first." : s.team_mode === "off" ? "Only with a team harness or the team builder in the composer." : "The planner looks at requests that seem multi-step and decides whether one agent is enough."}>
+          <select className="input" value={s.team_mode || "auto"} onChange={(e) => set({ team_mode: e.target.value })}>
+            <option value="auto">Automatically, when a request looks multi-step</option>
+            <option value="always">For every Agent or Planner request</option>
+            <option value="off">Only when I ask (team harness or team builder)</option>
+          </select>
+        </Field>
+        <div className="row gap-m wrap">
+          <Field label="Agents at once">
+            <input className="input narrow" type="number" min={1} max={8} value={s.max_parallel_agents ?? 4} onChange={(e) => set({ max_parallel_agents: Number(e.target.value) })} />
+          </Field>
+          <Field label="Most tasks in a plan">
+            <input className="input narrow" type="number" min={2} max={16} value={s.max_team_tasks ?? 8} onChange={(e) => set({ max_team_tasks: Number(e.target.value) })} />
+          </Field>
+          <Field label="Team time limit (minutes)" help="The planner then writes up what is done.">
+            <input className="input narrow" type="number" min={5} value={s.team_time_limit_minutes ?? 120} onChange={(e) => set({ team_time_limit_minutes: Number(e.target.value) })} />
+          </Field>
+        </div>
+      </div>
+      <div className="card stack-s">
+        <h3>Web and downloads</h3>
         <Toggle checked={s.browser_search ?? true} onChange={(v: boolean) => set({ browser_search: v })} label="When search engines return nothing useful, search again in a real browser window (Edge)" />
         <Field label="Hugging Face token (optional)" help="Only for models that require you to accept a licence on huggingface.co. Stored in Windows Credential Manager.">
           <div className="row gap-s"><input className="input" type="password" value={hf} placeholder={boot.has_hf_token ? "saved ••••" : "hf_…"} onChange={(e) => setHf(e.target.value)} />
@@ -60,7 +82,7 @@ export default function Settings() {
       </div>
       <div className="card stack-s">
         <h3>Safety</h3>
-        <Toggle checked={s.allow_python} onChange={(v: boolean) => set({ allow_python: v })} label="Let the agent run Python code (always asks first unless auto-approve is on)" />
+        <Toggle checked={s.allow_python} onChange={(v: boolean) => set({ allow_python: v })} label="Let the agent run code: Python and commands such as tests and git (always asks first unless auto-approve is on)" />
         <Field label="If nobody answers an approval, decline after (minutes)">
           <input className="input narrow" type="number" min={1} value={s.approval_timeout_minutes} onChange={(e) => set({ approval_timeout_minutes: Number(e.target.value) })} />
         </Field>

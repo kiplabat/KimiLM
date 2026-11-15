@@ -1,6 +1,6 @@
 {
   "name": "Team lead",
-  "description": "Splits a big task between several agents that work at the same time (each with its own model and limits), then combines their results.",
+  "description": "A planner splits a big task between agents (each with its own model and limits): tasks that need others' results wait for them, and the planner checks every result before combining them.",
   "type": "loop",
   "mode": "team",
   "connectors": true,
