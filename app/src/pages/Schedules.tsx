@@ -65,7 +65,7 @@ export default function Schedules() {
   if (!list) return <div className="page"><Spinner /></div>;
   return (
     <div className="page">
-      <PageHeader title="Schedules" subtitle="Tasks that run on their own, each in its own chat, with the harness and model you choose. They run while Datavera Agent is open (it can start with Windows and stay in the tray — see Settings)."
+      <PageHeader title="Schedules" subtitle="Tasks that run on their own, each in its own chat, with the harness and model you choose. They run while KimiLM is open (it can start with Windows and stay in the tray — see Settings)."
         actions={<Button kind="primary" icon={<Plus size={14} />} onClick={() => setEdit({})}>New scheduled task</Button>} />
       {list.length === 0 && <Empty icon={<CalendarClock size={32} />} title="No scheduled tasks yet">Create one here, ask the agent in any chat ("every morning, …"), or add a ready-made one from a plugin.</Empty>}
       {list.map((s) => (

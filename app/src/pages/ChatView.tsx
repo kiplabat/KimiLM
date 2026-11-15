@@ -219,7 +219,7 @@ function UserMessage({ m, chatId }: any) {
         {meta.pending === "queue" && <span className="pending-tag"><Clock size={12} /> Queued — sent when the current reply ends</span>}
         {meta.pending === "steer" && <span className="pending-tag"><CornerDownRight size={12} /> Waiting for the agent's next step</span>}
         {meta.steered && <span className="pending-tag"><CornerDownRight size={12} /> Given to the agent while it worked ·&nbsp;</span>}
-        {meta.not_sent && <span className="pending-tag"><Ban size={12} /> Not sent (you pressed Stop)
+        {meta.not_sent && <span className="pending-tag"><Ban size={12} /> {meta.not_sent === "restart" ? "Not sent (the app was closed)" : "Not sent (you pressed Stop)"}
           <button className="link" onClick={() => act(() => api.post(`/chats/${chatId}/messages/${m.id}/resend`))}><Send size={11} /> Send now</button></span>}
         {(meta.pending || meta.not_sent) && <button className="icon-btn" title="Remove" onClick={() => act(() => api.del(`/chats/${chatId}/messages/${m.id}`))}><X size={12} /></button>}
         {!meta.pending && !meta.not_sent && fmtTime(m.created)}

@@ -1,12 +1,16 @@
 """Secrets (API keys, tokens) go to the operating system's credential store: Windows Credential Manager,
 macOS Keychain. If no store is available (some Linux setups), they fall back to a file only this user can read,
-and the UI says so. Secrets are never returned to the UI after they are saved."""
+and the UI says so. Secrets are never returned to the UI after they are saved.
+
+Keys saved before the app was renamed (service "DataveraAgent") are still found: the first read copies them to
+the KimiLM service and leaves the old entry in place; deleting a key removes both."""
 import json
 import os
 import stat
 from pathlib import Path
 
-SERVICE = "DataveraAgent"
+SERVICE = "KimiLM"
+LEGACY_SERVICES = ("DataveraAgent",)
 
 
 class Secrets:
@@ -42,10 +46,27 @@ class Secrets:
     def get(self, name):
         if self.secure:
             try:
-                return self._kr.get_password(SERVICE, name)
+                value = self._kr.get_password(SERVICE, name)
             except Exception:
                 return None
+            if value is None:
+                value = self._legacy(name)
+            return value
         return self._load().get(name)
+
+    def _legacy(self, name):
+        for service in LEGACY_SERVICES:
+            try:
+                value = self._kr.get_password(service, name)
+            except Exception:
+                continue
+            if value is not None:
+                try:
+                    self._kr.set_password(SERVICE, name, value)
+                except Exception:
+                    pass
+                return value
+        return None
 
     def set(self, name, value):
         if not value:
@@ -59,10 +80,11 @@ class Secrets:
 
     def delete(self, name):
         if self.secure:
-            try:
-                self._kr.delete_password(SERVICE, name)
-            except Exception:
-                pass
+            for service in (SERVICE, *LEGACY_SERVICES):
+                try:
+                    self._kr.delete_password(service, name)
+                except Exception:
+                    pass
         else:
             values = self._load()
             values.pop(name, None)

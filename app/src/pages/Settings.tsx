@@ -19,7 +19,7 @@ export default function Settings() {
       {shell && (
         <div className="card stack-s">
           <h3>Running in the background</h3>
-          <Toggle checked={shell.openAtLogin} onChange={(v: boolean) => setShellPref({ openAtLogin: v })} label="Start Datavera Agent when I sign in to Windows (in the tray) — needed for schedules" />
+          <Toggle checked={shell.openAtLogin} onChange={(v: boolean) => setShellPref({ openAtLogin: v })} label="Start KimiLM when I sign in to Windows (in the tray) — needed for schedules" />
           <Toggle checked={shell.keepInTray} onChange={(v: boolean) => setShellPref({ keepInTray: v })} label="Closing the window keeps the app running in the tray" />
         </div>
       )}
@@ -71,7 +71,7 @@ export default function Settings() {
       </div>
       <div className="card stack-s">
         <h3>About</h3>
-        <div className="small">Datavera Agent {boot.version} · llama.cpp {boot.runtime.tag}</div>
+        <div className="small">KimiLM {boot.version} · llama.cpp {boot.runtime.tag}</div>
         <div className="small muted">Data folder: {boot.data_dir}</div>
         {desktop && <div className="row gap-s"><Button small icon={<FolderOpen size={13} />} onClick={() => desktop.openPath(boot.data_dir)}>Open data folder</Button>
           <Button small onClick={() => desktop.openLogs()}>Open logs</Button></div>}

@@ -42,7 +42,7 @@ PLAN_SCHEMA_STEP = {"type": "object", "required": ["title"], "properties": {
 TEXT_TOOLCALL = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
 URL_RE = re.compile(r"https?://[^\s)>\]]+")
 
-BASE_PROMPT = """You are Datavera Agent, an assistant that runs entirely on the user's own computer using a local \
+BASE_PROMPT = """You are KimiLM, an assistant that runs entirely on the user's own computer using a local \
 model ({model}). Nothing the user shares leaves this computer unless a tool sends it (web pages, connectors).
 Today is {today}. The computer runs {os}.
 Be direct and practical. Use Markdown. Never invent file contents, numbers or sources: read, fetch or compute them."""
@@ -72,6 +72,10 @@ class LoopGuard:
     """Stops agents from going round in circles. Shared by every model call of a turn."""
     UNPRODUCTIVE = ("NO RELEVANT RESULTS", "Error:", "There is no tool called", "The arguments were not valid JSON",
                     "Blocked:")
+    # Results that can't change by doing something on this computer: an exact repeat stays blocked even after a
+    # change. Everything else (reading or listing files, running code, connector reads) may be repeated once a
+    # change succeeded, because the answer can be different now (e.g. read_file after edit_file).
+    WORLD_TOOLS = ("web_search", "web_fetch", "download_file")
 
     def __init__(self, turn):
         lim, h, db = turn.limits, turn.harness, turn.db
@@ -114,12 +118,15 @@ class LoopGuard:
                             "web_fetch, or answer with what you have.")
         return None
 
-    def record(self, name, args, ok, result, blocked=False):
+    def record(self, name, args, ok, result, blocked=False, changed=False):
         sig = name + _norm_args(args)
         if blocked:
             self.blocked += 1
             self.streak += 1
             return
+        if changed:   # a successful change (file written, code run, connector action): earlier reads may be stale
+            world = tuple(n + "{" for n in self.WORLD_TOOLS)
+            self.done = {s: r for s, r in self.done.items() if s.startswith(world)}
         self.total += 1
         self.counts[name] += 1
         self.done[sig] = result
@@ -707,7 +714,8 @@ class Turn:
             except Exception as exc:
                 result, ok = f"Error: {type(exc).__name__}: {str(exc)[:400]}", False
         result = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
-        self.guard.record(call["name"], call["arguments"], ok, result, blocked=bool(blocked))
+        self.guard.record(call["name"], call["arguments"], ok, result, blocked=bool(blocked),
+                          changed=bool(ok and tool and (tool.changes or call["name"] == "use_connector_tool")))
         step.update(ok=ok, result=result[:4000])
         self.emit("tool_result", call_id=call["id"], ok=ok, result=result[:4000], declined=step.get("declined", False),
                   blocked=bool(blocked))

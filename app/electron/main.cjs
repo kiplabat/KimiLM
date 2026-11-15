@@ -1,4 +1,4 @@
-// Datavera Agent — desktop shell.
+// KimiLM — desktop shell.
 // Starts the local engine (Python) with a random token, opens the window on it, keeps running in the tray so
 // chats, long tasks and schedules continue when the window is closed, and can start with Windows.
 const { app, BrowserWindow, Tray, Menu, ipcMain, dialog, shell, Notification, nativeImage, session } = require("electron");
@@ -7,6 +7,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const http = require("http");
 const path = require("path");
+const { migrateUserData, moveLoginItem } = require("./migrate.cjs");
 
 const isDev = !app.isPackaged;
 const token = crypto.randomBytes(24).toString("base64url");
@@ -19,8 +20,7 @@ let restarts = 0;
 
 const userData = app.getPath("userData");
 const prefsPath = path.join(userData, "shell-prefs.json");
-const logsDir = path.join(userData, "logs");
-fs.mkdirSync(logsDir, { recursive: true });
+const logsDir = path.join(userData, "logs");   // created after the first-start data move (migrate.cjs)
 
 function prefs() {
   try { return { keepInTray: true, openAtLogin: false, startHidden: false, ...JSON.parse(fs.readFileSync(prefsPath, "utf8")) }; }
@@ -67,7 +67,10 @@ function playwrightCli() {
 }
 
 function log(line) {
-  fs.appendFileSync(path.join(logsDir, "shell.log"), `${new Date().toISOString()} ${line}\n`);
+  try {
+    fs.mkdirSync(logsDir, { recursive: true });
+    fs.appendFileSync(path.join(logsDir, "shell.log"), `${new Date().toISOString()} ${line}\n`);
+  } catch {}
 }
 
 function startEngine() {
@@ -124,7 +127,7 @@ function iconPath() {
 
 function createWindow(show = true) {
   win = new BrowserWindow({
-    width: 1320, height: 860, minWidth: 900, minHeight: 600, show: false, title: "Datavera Agent",
+    width: 1320, height: 860, minWidth: 900, minHeight: 600, show: false, title: "KimiLM",
     backgroundColor: "#F7F5F2", icon: iconPath(), autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, "preload.cjs"), contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
@@ -139,7 +142,7 @@ function createWindow(show = true) {
       e.preventDefault();
       win.hide();
       if (!prefs().trayHintShown && Notification.isSupported()) {
-        new Notification({ title: "Datavera Agent is still running", body: "Chats, tasks and schedules continue in the background. Use the tray icon to open or quit." }).show();
+        new Notification({ title: "KimiLM is still running", body: "Chats, tasks and schedules continue in the background. Use the tray icon to open or quit." }).show();
         savePrefs({ trayHintShown: true });
       }
     }
@@ -154,9 +157,9 @@ function showWindow() {
 function createTray() {
   const image = nativeImage.createFromPath(iconPath()).resize({ width: 16, height: 16 });
   tray = new Tray(image);
-  tray.setToolTip("Datavera Agent");
+  tray.setToolTip("KimiLM");
   tray.setContextMenu(Menu.buildFromTemplate([
-    { label: "Open Datavera Agent", click: showWindow },
+    { label: "Open KimiLM", click: showWindow },
     { type: "separator" },
     { label: "Quit (stops tasks and schedules)", click: () => { quitting = true; app.quit(); } },
   ]));
@@ -165,7 +168,7 @@ function createTray() {
 
 function showFatal(err) {
   log(`fatal: ${err && err.stack || err}`);
-  dialog.showErrorBox("Datavera Agent could not start", `${err.message || err}\n\nLogs: ${logsDir}`);
+  dialog.showErrorBox("KimiLM could not start", `${err.message || err}\n\nLogs: ${logsDir}`);
   quitting = true;
   app.quit();
 }
@@ -214,8 +217,20 @@ if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   app.on("second-instance", showWindow);
-  app.setAppUserModelId("io.datavera.agent");
+  app.setAppUserModelId("com.kimilm.app");
   app.whenReady().then(async () => {
+    const moved = migrateUserData({ app, dialog });   // before anything writes into the data folder
+    fs.mkdirSync(logsDir, { recursive: true });
+    if (moved.status !== "none") log(`data from the earlier app name: ${moved.status} ${moved.from || ""} -> ${moved.to || ""} ${moved.detail || ""}`);
+    if (moved.status === "moved") {
+      moveLoginItem(app, !!prefs().openAtLogin);
+      if (Notification.isSupported()) {
+        new Notification({ title: "Welcome to KimiLM", body: "Datavera Agent is now KimiLM. Your chats, models, memory and settings came with you." }).show();
+      }
+    } else if (moved.status === "failed") {
+      dialog.showMessageBoxSync({ type: "warning", title: "KimiLM", message: "Your data from Datavera Agent could not be moved",
+        detail: `${moved.detail}\n\nKimiLM starts without it. Nothing was deleted: it is still in ${moved.from}. Logs: ${logsDir}` });
+    }
     try {
       await startEngine();
     } catch (err) {

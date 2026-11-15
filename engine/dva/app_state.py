@@ -10,6 +10,7 @@ from .jobs import Jobs
 from .llm import LLM
 from .mcp import Connectors
 from .memory import Memory
+from .migration import rewrite_moved_paths
 from .models import Models
 from .paths import Paths
 from .plugins import Plugins
@@ -38,6 +39,11 @@ class App:
         self.started = time.time()
         self.paths = Paths(data_dir, resources_dir)
         self.db = DB(self.paths.db)
+        try:   # the data folder was moved from the app's earlier name: fix stored paths once
+            rewrite_moved_paths(self.paths.data, self.db, self.log)
+        except Exception as exc:
+            self.log(f"rewriting moved paths failed: {type(exc).__name__}: {exc}")
+        self._release_pending_after_restart()
         self.bus = EventBus()
         self.secrets = Secrets(self.paths.data)
         self.runtime = Runtime(self.paths, self.db, self.bus)
@@ -56,6 +62,17 @@ class App:
         for key, value in DEFAULT_SETTINGS.items():
             if self.db.setting(key) is None:
                 self.db.set_setting(key, value)
+
+    def _release_pending_after_restart(self):
+        """Follow-ups queued while a reply was running are not sent if the app closed meanwhile: they show as
+        "Not sent (the app was closed)" with Send now, instead of staying "Queued" forever."""
+        rows = self.db.all("SELECT id, meta_json FROM messages WHERE role='user' AND meta_json LIKE '%\"pending\"%'")
+        for row in rows:
+            meta = row.get("meta") or {}
+            if meta.get("pending"):
+                meta.pop("pending", None)
+                meta["not_sent"] = "restart"
+                self.db.update("messages", row["id"], {"meta": meta})
 
     def spawn(self, coro):
         """Run in the background, keeping a reference (asyncio may otherwise drop a running task)."""

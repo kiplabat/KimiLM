@@ -40,7 +40,7 @@ function copyDir(src, dest, skip = (p) => false) {
 async function download(url, dest) {
   if (fs.existsSync(dest)) { console.log(`   cached ${path.basename(dest)}`); return dest; }
   console.log(`   downloading ${url}`);
-  const r = await fetch(url, { headers: { "User-Agent": "datavera-agent-build" } });
+  const r = await fetch(url, { headers: { "User-Agent": "kimilm-build" } });
   if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
   const buf = Buffer.from(await r.arrayBuffer());
   fs.writeFileSync(dest + ".part", buf);
@@ -103,7 +103,7 @@ async function llama() {
   const backend = key === "darwin" ? "metal" : "cpu";
   const pats = versions.backend_assets[key][backend];
   const api = `https://api.github.com/repos/${versions.llama_cpp_repo}/releases`;
-  const headers = { "User-Agent": "datavera-agent-build", Accept: "application/vnd.github+json",
+  const headers = { "User-Agent": "kimilm-build", Accept: "application/vnd.github+json",
     ...(process.env.GITHUB_TOKEN ? { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` } : {}) };
   const get = async (url) => {
     const r = await fetch(url, { headers });

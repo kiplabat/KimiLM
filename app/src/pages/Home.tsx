@@ -6,7 +6,7 @@ import { Composer, ConnectorPicker, FolderPicker, HarnessPicker, ModelPicker, Th
 const SUGGESTIONS = [
   { text: "Analyse the CSV files in my folder and summarise the key trends with charts", harness: "data-analyst" },
   { text: "Research the latest public data on solar capacity in Africa, with sources", harness: "researcher" },
-  { text: "Find and publish one new dataset about glacier mass balance", harness: "datavera:dataset-publisher" },
+  { text: "Read the PDFs in my folder and write a one-page brief with page references", harness: "document-reader" },
   { text: "Every weekday at 8:30, summarise new files in my reports folder", harness: "agent" },
   { text: "Create a skill for writing my monthly project report", harness: "agent" },
 ];

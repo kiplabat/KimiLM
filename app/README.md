@@ -1,15 +1,18 @@
-# Datavera Agent — desktop app (Windows first)
+# KimiLM — desktop app (Windows first)
 
 A desktop app for local AI agents: chat, projects, memory, skills, plugins, connectors (MCP), harnesses and
-scheduled tasks. **Models run only on this computer** (llama.cpp, CPU or GPU). Datavera ships as the built-in
-plugin; the command-line agent in the repository root keeps working and is what the Datavera plugin runs.
+scheduled tasks. **Models run only on this computer** (llama.cpp, CPU or GPU). Plugins are optional; Datavera is
+one of them (it runs the command-line agent in the repository root, which keeps working on its own).
+
+KimiLM was called **Datavera Agent** up to 2.1.x. Version 2.2.0 renamed it; see "Upgrading from Datavera Agent".
 
 ```
 app/                Electron shell (window, tray, start with Windows) + React UI (Vite)
-  electron/         main.cjs (starts the engine, window, tray), preload.cjs (safe bridge)
+  electron/         main.cjs (starts the engine, window, tray), preload.cjs (safe bridge),
+                    migrate.cjs (first start: moves the data from Datavera Agent)
   src/              the UI: pages/ (Chat, Projects, Models, Plugins, Skills, Harnesses, Schedules, Activity, Memory, Settings)
   scripts/          dev.mjs (development), prepare-resources.mjs (gathers what the installer ships)
-  build/            icons
+  build/            icons, installer.nsh (installer messages; offers to remove Datavera Agent)
 engine/             Python engine (FastAPI on 127.0.0.1 + a per-launch token) — see engine/README.md
 ```
 
@@ -40,12 +43,13 @@ npm run dist:win
 
 `dist:win` does three things:
 1. `vite build` — the UI into `app\dist`.
-2. `prepare-resources.mjs --platform win` — copies the engine and the Datavera pipeline code into
+2. `prepare-resources.mjs --platform win` — copies the engine and the Datavera plugin's pipeline code into
    `app\resources\engine`, downloads the embeddable Python 3.12 (`python.org`) and installs the engine's packages
    into it (`pip --target … --platform win_amd64`), and downloads the llama.cpp CPU build of the pinned release
-   (`engine\dva\versions.json`, currently `b12352`). Downloads are cached in `app\.cache`.
-3. `electron-builder --win` — writes `app\release\DataveraAgent-Setup-2.0.0.exe` (per-user install, no admin
-   rights, desktop + Start-menu shortcuts).
+   (`engine\dva\versions.json`). Downloads are cached in `app\.cache`.
+3. `electron-builder --win` — writes `app\release\KimiLM-Setup-<version>.exe` (per-user install, no admin
+   rights, desktop + Start-menu shortcuts). The installer shows each step and what it installed, and offers to
+   remove Datavera Agent if it finds it (`build\installer.nsh`).
 
 The installer is **not code-signed** yet, so Windows SmartScreen will warn ("More info → Run anyway") until a
 signing certificate is added (`win.certificateFile` / Azure Trusted Signing in `electron-builder.yml`).
@@ -54,11 +58,25 @@ signing certificate is added (`win.certificateFile` / Azure Trusted Signing in `
 
 | What | Where |
 |---|---|
-| App | `%LOCALAPPDATA%\Programs\Datavera Agent` |
-| Data (database, chats' workspaces, your skills/harnesses/plugins, logs) | `%APPDATA%\Datavera Agent` |
-| Models | `%APPDATA%\Datavera Agent\models` by default; change in **Settings → Models folder** (e.g. `D:\models`) |
-| Keys and tokens | Windows Credential Manager (service `DataveraAgent`) |
-| Datavera pipeline data (catalogue, runs) | `%APPDATA%\Datavera Agent\plugin-data\datavera` |
+| App | `%LOCALAPPDATA%\Programs\KimiLM` (or the folder chosen in the installer) |
+| Data (database `kimilm.sqlite3`, chats' workspaces, your skills/harnesses/plugins, logs) | `%APPDATA%\KimiLM` |
+| Models | `%APPDATA%\KimiLM\models` by default; change in **Settings → Models folder** (e.g. `D:\models`) |
+| Keys and tokens | Windows Credential Manager (service `KimiLM`) |
+| Datavera plugin data (catalogue, runs) | `%APPDATA%\KimiLM\plugin-data\datavera` |
+
+## Upgrading from Datavera Agent
+
+- **Installer:** if Datavera Agent is installed, the installer offers to remove it (recommended). Its data is kept.
+- **First start** (`electron/migrate.cjs`): `%APPDATA%\Datavera Agent` is moved to `%APPDATA%\KimiLM` — a rename
+  on the same drive, so even many GB of models move instantly. If KimiLM's folder already exists, each item it
+  doesn't have is moved; a failure puts back what was moved. If KimiLM already has its own database, nothing is
+  moved (two databases are never merged). If Datavera Agent is still running, KimiLM asks to close it.
+  `migrated-from.json` records the move; `MOVED-TO-KimiLM.txt` is left in the old place.
+- **Engine, next start:** the database is renamed to `kimilm.sqlite3` (with its `-wal`/`-shm` files), and paths
+  inside it that pointed into the old folder (models, attachments, downloads) are rewritten (`dva/migration.py`).
+- **Saved keys:** found under the old Credential Manager name (`DataveraAgent`) and copied to `KimiLM`.
+- **Start with Windows:** the old entry is removed; KimiLM's is added if it was on.
+- Unchanged on purpose: the Python package `dva`, `DVA_*` variables, the repository name.
 
 ## How the pieces talk
 

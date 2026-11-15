@@ -549,3 +549,105 @@ def test_scripts_can_import_their_neighbours_like_the_installed_app(tmp_path):
     launched = subprocess.run([sys.executable, "-P", "-m", "dva.run_script", str(folder / "main.py"), "x"],
                               capture_output=True, text=True, cwd=str(tmp_path), env=env)
     assert launched.stdout.strip() == "ok 42 ['x']", launched.stderr
+
+
+# ---------------------------------------------------------------- 2.2.0: KimiLM rename, restart and guard fixes
+def test_loop_guard_allows_rereading_after_a_change():
+    sys.path.insert(0, str(ENGINE))
+    from dva.runner import LoopGuard
+
+    class DB:
+        def setting(self, k, d=None):
+            return d
+
+    class T:
+        limits, harness, db = {}, {}, DB()
+    g = LoopGuard(T())
+    g.record("read_file", {"path": "app.py"}, True, "v1")
+    g.record("web_fetch", {"url": "https://x.org"}, True, "page")
+    assert "already called" in g.check("read_file", {"path": "app.py"})
+    g.record("edit_file", {"path": "app.py", "old": "a", "new": "b"}, True, "edited", changed=True)
+    assert g.check("read_file", {"path": "app.py"}) is None, "a file that just changed can be read again"
+    assert "already called" in g.check("web_fetch", {"url": "https://x.org"}), "web pages don't change by editing"
+    assert "already called" in g.check("edit_file", {"path": "app.py", "old": "a", "new": "b"})
+    g.record("run_python", {"code": "x"}, False, "Error: boom", changed=False)
+    assert "already called" in g.check("run_python", {"code": "x"}), "a failed run changes nothing"
+
+
+def _legacy_data_folder(root):
+    """A data folder as Datavera Agent left it, after the shell moved it to KimiLM's folder."""
+    import sqlite3
+    old = root / "Datavera Agent"
+    new = root / "KimiLM"
+    new.mkdir(parents=True)
+    con = sqlite3.connect(str(new / "datavera-agent.sqlite3"))
+    con.executescript("CREATE TABLE models (id TEXT PRIMARY KEY, name TEXT, path TEXT, files_json TEXT);"
+                      "CREATE TABLE messages (id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, role TEXT NOT NULL, "
+                      "content TEXT DEFAULT '', meta_json TEXT DEFAULT '{}', created TEXT);")
+    model_path = str(old / "models" / "qwen.gguf")
+    con.execute("INSERT INTO models VALUES ('m1', 'Qwen', ?, ?)", (model_path, json.dumps([model_path])))
+    con.execute("INSERT INTO messages VALUES ('u1', 'c1', 'user', 'later please', ?, '2026-11-15T08:00:00.000+00:00')",
+                (json.dumps({"attachments": [], "pending": "queue"}),))
+    con.execute("INSERT INTO messages VALUES ('u2', 'c1', 'user', 'see file', ?, '2026-11-15T08:00:01.000+00:00')",
+                (json.dumps({"attachments": [{"name": "a.csv", "path": str(old / "uploads" / "a.csv")}]}),))
+    con.commit()
+    con.close()
+    (new / "migrated-from.json").write_text(json.dumps({"from": str(old), "to": str(new), "paths_rewritten": False}))
+    return old, new
+
+
+def test_data_moved_from_datavera_agent_is_adopted(tmp_path, monkeypatch):
+    sys.path.insert(0, str(ENGINE))
+    monkeypatch.setenv("DVA_SECRETS", "file")
+    from dva.app_state import App
+    old, new = _legacy_data_folder(tmp_path)
+    app = App(str(new))
+    assert (new / "kimilm.sqlite3").exists() and not (new / "datavera-agent.sqlite3").exists()
+    model = app.db.get("models", "m1")
+    assert model["path"] == str(new.resolve() / "models" / "qwen.gguf")
+    assert model["files"] == [str(new.resolve() / "models" / "qwen.gguf")], "paths inside JSON are rewritten too"
+    att = app.db.get("messages", "u2")["meta"]["attachments"][0]["path"]
+    assert att == str(new.resolve() / "uploads" / "a.csv")
+    queued = app.db.get("messages", "u1")["meta"]
+    assert queued.get("not_sent") == "restart" and "pending" not in queued, "a queued message is released"
+    note = json.loads((new / "migrated-from.json").read_text())
+    assert note["paths_rewritten"] is True and note["rows_changed"] >= 3
+    app.db.conn.close()
+    again = App(str(new))                       # second start: nothing to do, nothing breaks
+    assert again.db.get("models", "m1")["path"] == model["path"]
+    again.db.conn.close()
+
+
+def test_keys_saved_under_the_old_name_are_found(monkeypatch):
+    sys.path.insert(0, str(ENGINE))
+    import keyring
+    from keyring.backend import KeyringBackend
+    from dva import secrets as sec
+    monkeypatch.delenv("DVA_SECRETS", raising=False)
+
+    class Memory(KeyringBackend):
+        priority = 1
+        store = {}
+
+        def get_password(self, service, user):
+            return self.store.get((service, user))
+
+        def set_password(self, service, user, password):
+            self.store[(service, user)] = password
+
+        def delete_password(self, service, user):
+            self.store.pop((service, user), None)
+
+    before = keyring.get_keyring()
+    keyring.set_keyring(Memory())
+    try:
+        Memory.store[("DataveraAgent", "plugin:datavera:api_key")] = "dv_sk_old"
+        s = sec.Secrets(tempfile.mkdtemp())
+        assert s.secure
+        assert s.get("plugin:datavera:api_key") == "dv_sk_old"
+        assert Memory.store[("KimiLM", "plugin:datavera:api_key")] == "dv_sk_old", "copied to the new name"
+        assert Memory.store[("DataveraAgent", "plugin:datavera:api_key")] == "dv_sk_old", "old entry kept"
+        s.delete("plugin:datavera:api_key")
+        assert not s.has("plugin:datavera:api_key"), "deleting removes both"
+    finally:
+        keyring.set_keyring(before)

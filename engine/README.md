@@ -1,4 +1,4 @@
-# Datavera Agent engine — technical reference
+# KimiLM engine — technical reference
 
 Python 3.12, FastAPI on `127.0.0.1` (token-protected), SQLite, llama.cpp. Started by the desktop app
 (`python -m dva serve --data-dir … --resources …` with `DVA_TOKEN` in the environment).
@@ -8,8 +8,9 @@ Python 3.12, FastAPI on `127.0.0.1` (token-protected), SQLite, llama.cpp. Starte
 | Module | Role |
 |---|---|
 | `server.py` | HTTP API + server-sent events (`/api/events`) + serves the built UI |
-| `app_state.py` | Wires the services; `start_turn()` saves the user message and starts the turn as a task; `post_message()` handles follow-ups while a chat is busy (`queue` → run right after, `steer` → handed to the running agent at its next step; after Stop they stay unsent); per-chat limits (`chats.settings`) |
-| `runner.py` | One chat turn: builds the prompt (harness + project instructions + memory + skills index + summary), runs the harness (chat / agent / planner / research / team loop, or a pipeline), streams events, saves one assistant message with ordered `meta.steps`. `LoopGuard` stops loops in every tool-using turn: exact and near-duplicate calls are refused (searches: ≥60 % word overlap), per-tool caps (web_search 6 by default), a "change approach" note after 3 unproductive results, a forced write-up after 6 (or 5 refused repeats, or the time limit) |
+| `migration.py` | After the data folder moved from Datavera Agent: rewrites stored paths once (`migrated-from.json`) |
+| `app_state.py` | Wires the services; on start, queued follow-ups left from a closed app become "Not sent (the app was closed)"; `start_turn()` saves the user message and starts the turn as a task; `post_message()` handles follow-ups while a chat is busy (`queue` → run right after, `steer` → handed to the running agent at its next step; after Stop they stay unsent); per-chat limits (`chats.settings`) |
+| `runner.py` | One chat turn: builds the prompt (harness + project instructions + memory + skills index + summary), runs the harness (chat / agent / planner / research / team loop, or a pipeline), streams events, saves one assistant message with ordered `meta.steps`. `LoopGuard` stops loops in every tool-using turn: exact and near-duplicate calls are refused (searches: ≥60 % word overlap), per-tool caps (web_search 6 by default), a "change approach" note after 3 unproductive results, a forced write-up after 6 (or 5 refused repeats, or the time limit). After a successful change (file written, code run, connector action) earlier reads, listings and runs may be repeated, since their answer can differ; web calls stay blocked |
 | `llm.py` | OpenAI-compatible client for llama-server: streaming, native tool calls, JSON-schema answers, reasoning split. Calls go to the server leased by the current task (context variable) unless `server=` is given |
 | `runtime.py` | llama.cpp builds (bundled CPU; Vulkan/CUDA downloaded from the pinned release), **several `llama-server`s at once** (one per model, up to `max_loaded_models`, memory-checked; idle ones unloaded LRU-first), model *leases*, "simultaneous replies" (`-np`, context × slots), vision projector (`--mmproj`, `--no-mmproj-offload` on CPU; falls back to no vision if it does not load), idle unload, CPU/GPU plans |
 | `models.py` | Recommended catalogue, **browse ranked for this computer** (HF `expand[]=gguf` parameter counts → size at Q4, fit, rough speed; trusted publishers filter), Hugging Face search and file listing with a recommended quant, downloads with phases, stall detection (45 s), 8 retries with backoff, readable errors, persisted across restarts (paused → Resume), vision parts (mmproj F16 preferred) with the model or added later, GGUF import (sibling or Ollama projector picked up), fit estimates, speed test |
@@ -64,7 +65,7 @@ prints progress lines, optional `::progress {"text": …}` and one `::result {"s
 `actions[]`, `schedule_templates[]`, plus `skills/` and `harnesses/` folders. Scripts receive
 `DVA_PLUGIN_SETTINGS` (JSON incl. secrets), `DVA_PLUGIN_DATA`, `DVA_PLUGIN_DIR`.
 
-## The built-in Datavera plugin
+## The Datavera plugin (built in, optional)
 
 `builtin/plugins/datavera`: the account connector (`https://api.datavera.io/v1/mcp/account`), skills
 `datavera-publishing` and `datavera-account`, the **dataset-publisher** pipeline harness (runs the repository's
