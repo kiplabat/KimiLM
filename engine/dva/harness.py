@@ -3,7 +3,10 @@
 type "loop"      the model works in a loop with tools. mode = chat (no tools) | agent (tools, step limit) |
                  planner (writes a short plan, then does each step, then reports) | research (fixed research
                  stages run by the app: search, read, download, notes, cited report) | team (a lead splits the work
-                 between agents that run in parallel, then combines their results).
+                 between agents that run in parallel, then combines their results). A team harness may set
+                 lead_role "strategist" (the lead is the strongest model, often online), worker_role (the role
+                 agents get a model by: "worker" runs them on this computer when possible) and review (the lead
+                 checks the results once and sends up to three fixes back to workers).
 type "pipeline"  a fixed sequence of steps written in Python (like the Datavera dataset publisher). The model is
                  asked only bounded questions inside it; the engine runs it as a task and streams its progress.
 
@@ -55,6 +58,9 @@ SCHEMA = {
         "needs": {"type": "array", "items": {"enum": ["browser", "model"]}},
         "timeout_minutes": {"type": "integer", "minimum": 1, "maximum": 1440},
         "icon": {"type": "string"},
+        "lead_role": {"enum": ["strategist", "worker"]},
+        "worker_role": {"enum": ["worker", "strategist", "vision"]},
+        "review": {"type": "boolean"},
     },
     "allOf": [
         {"if": {"properties": {"type": {"const": "pipeline"}}}, "then": {"required": ["entry"]}},

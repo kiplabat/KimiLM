@@ -133,9 +133,18 @@ class Models:
             r["exists"] = bool(r["path"]) and Path(r["path"]).exists()
         return rows
 
+    def get_any(self, model_id):
+        """A local or an online model's row (online rows have kind 'cloud'), or None."""
+        if not model_id:
+            return None
+        if str(model_id).startswith("cloud:"):
+            providers = getattr(self, "providers", None)
+            return providers.get(model_id) if providers else None
+        return self.db.get("models", model_id)
+
     def default_model(self):
         chosen = self.db.setting("default_model")
-        if chosen and self.db.get("models", chosen):
+        if chosen == "auto" or (chosen and self.get_any(chosen)):
             return chosen
         rows = self.installed()
         return rows[0]["id"] if rows else None

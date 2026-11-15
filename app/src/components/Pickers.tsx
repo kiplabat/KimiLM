@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Bot, ChevronDown, Cpu, CornerDownRight, Eye, FolderOpen, Gauge, ListPlus, Paperclip, Plug, Plus, Send, Square, Users, X, Lightbulb } from "lucide-react";
+import { Bot, ChevronDown, Cloud, Cpu, CornerDownRight, Eye, FolderOpen, Gauge, ListPlus, Paperclip, Plug, Plus, Send, Sparkles, Square, Users, X, Lightbulb } from "lucide-react";
 import { api, desktop, fmtBytes } from "../api";
 import { useApp } from "../store";
 import { Button, Toggle } from "./ui";
@@ -42,23 +42,52 @@ export function HarnessPicker({ value, onChange }: any) {
 
 export const canSee = (m: any) => !!(m?.settings?.mmproj && m?.settings?.vision !== false);
 
-export function ModelPicker({ value, onChange, allowDefault }: any) {
-  const { boot } = useApp();
+const cloudSees = (m: any) => !!m?.caps?.vision;
+const price = (m: any) => (m?.price?.out !== undefined ? `$${Number(m.price.in).toFixed(2)} / $${Number(m.price.out).toFixed(2)} per 1M` : "price unknown");
+
+export function ModelPicker({ value, onChange, allowDefault, chatId }: any) {
+  const { boot, toast } = useApp() as any;
   const models = boot?.models || [];
-  const current = models.find((m: any) => m.id === value) || (allowDefault ? null : models.find((m: any) => m.id === boot?.default_model));
+  const online = (boot?.cloud_models || []).filter((m: any) => m.enabled);
+  const privacy = boot?.online?.privacy;
+  const [chatOnline, setChatOnline] = useState<boolean | null>(null);
+  useEffect(() => { if (chatId && privacy === "local_unless_on") api.get(`/chats/${chatId}/online`).then((r) => setChatOnline(r.allowed)).catch(() => {}); }, [chatId, privacy]);
+  const chosen = value || (allowDefault ? "" : boot?.default_model);
+  const local = models.find((m: any) => m.id === chosen);
+  const cloud = online.find((m: any) => m.id === chosen) || (boot?.cloud_models || []).find((m: any) => m.id === chosen);
+  const label = chosen === "auto" ? "Auto" : local ? local.name : cloud ? cloud.name : (allowDefault ? "Same as the chat" : models.length || online.length ? "Auto" : "No model yet");
+  const icon = chosen === "auto" ? <Sparkles size={14} /> : cloud ? <Cloud size={14} /> : canSee(local) ? <Eye size={14} /> : <Cpu size={14} />;
   return (
-    <Popover label={current ? current.name : (allowDefault ? "Same as the chat" : "No model yet")} icon={canSee(current) ? <Eye size={14} /> : <Cpu size={14} />}
-      title="Model (runs on this computer). The eye marks models that can see images and videos.">
+    <Popover label={label} icon={icon} title="Model: Auto, one on this computer, or an online one. The eye marks models that can see images and videos.">
       {(close: any) => (
         <div className="menu">
-          {models.length === 0 && <div className="menu-item" onClick={() => (location.hash = "/models/discover")}>Download a model…</div>}
           {allowDefault && <div className={`menu-item${!value ? " selected" : ""}`} onClick={() => { onChange(""); close(); }}><div className="menu-title">Same as the chat</div></div>}
+          <div className={`menu-item${chosen === "auto" ? " selected" : ""}`} onClick={() => { onChange("auto"); close(); }}>
+            <div className="menu-title"><Sparkles size={13} className="accent" /> Auto</div>
+            <div className="menu-sub">KimiLM picks per request: the strongest model for planning and hard reasoning, a local model for routine work.</div>
+          </div>
+          <div className="menu-group">On this computer · free, private</div>
+          {models.length === 0 && <div className="menu-item" onClick={() => (location.hash = "/models/discover")}>Download a model…</div>}
           {models.map((m: any) => (
-            <div key={m.id} className={`menu-item${current?.id === m.id ? " selected" : ""}`} onClick={() => { onChange(m.id); close(); }}>
+            <div key={m.id} className={`menu-item${chosen === m.id ? " selected" : ""}`} onClick={() => { onChange(m.id); close(); }}>
               <div className="menu-title">{m.name} {canSee(m) && <Eye size={13} className="accent" />}</div>
               <div className="menu-sub">{m.quant} · {fmtBytes(m.size)} · {(m.settings?.compute || "auto").toUpperCase()}{canSee(m) ? " · sees images" : ""}{m.id === boot.default_model ? " · default" : ""}</div>
             </div>
           ))}
+          <div className="menu-group">Online · billed per use</div>
+          {online.length === 0 && <div className="menu-item" onClick={() => { location.hash = "/models/online"; close(); }}><div className="menu-sub">Add GPT, Claude, Gemini and more with an API key…</div></div>}
+          {online.map((m: any) => (
+            <div key={m.id} className={`menu-item${chosen === m.id ? " selected" : ""}${m.ready ? "" : " dim"}`} onClick={() => { onChange(m.id); close(); }}>
+              <div className="menu-title"><Cloud size={13} /> {m.name} {cloudSees(m) && <Eye size={13} className="accent" />}</div>
+              <div className="menu-sub">{m.provider_name} · {m.role === "strategist" ? "strategist" : m.role} · {price(m)}{m.ready ? "" : " · needs its key"}{m.id === boot.default_model ? " · default" : ""}</div>
+            </div>
+          ))}
+          {privacy === "local_unless_on" && chatId && chatOnline !== null && (
+            <div className="menu-item pad">
+              <Toggle checked={chatOnline} label="Allow online models in this chat" onChange={async (v: boolean) => {
+                try { await api.put(`/chats/${chatId}/online`, { allowed: v }); setChatOnline(v); } catch (e: any) { toast(e.message, "error"); } }} />
+            </div>
+          )}
         </div>
       )}
     </Popover>
@@ -117,7 +146,7 @@ export function TeamPicker({ team, onChange }: any) {
   return (
     <Popover label={on ? `Team of ${team.length}` : "Team"} icon={<Users size={14} />} title="Send the next message to a team of agents that work in parallel">
       <div className="menu pad team-builder">
-        <div className="menu-sub">Agents work at the same time, each in its own chat, then a lead combines their results. Leave a task empty and the lead splits the work. Agents on different models run truly in parallel when memory allows.</div>
+        <div className="menu-sub">Agents work at the same time, each in its own chat, then a lead combines their results. Leave a task empty and the lead splits the work. Agents on different models run truly in parallel when memory allows; online models always can.</div>
         {(team || []).map((a: any, i: number) => (
           <div key={i} className="team-agent">
             <div className="row gap-s">
@@ -130,7 +159,14 @@ export function TeamPicker({ team, onChange }: any) {
               </select>
               <select className="input" value={a.model || ""} onChange={(e) => update(i, { model: e.target.value })} title="Model">
                 <option value="">Same model as the chat</option>
-                {(boot?.models || []).map((m: any) => <option key={m.id} value={m.id}>{m.name}{canSee(m) ? " (sees images)" : ""}</option>)}
+                <optgroup label="By role (picked for you)">
+                  <option value="role:worker">Worker — on this computer when possible</option>
+                  <option value="role:strategist">Strategist — the strongest model</option>
+                  <option value="role:vision">Vision — can see images</option>
+                </optgroup>
+                <optgroup label="On this computer">{(boot?.models || []).map((m: any) => <option key={m.id} value={m.id}>{m.name}{canSee(m) ? " (sees images)" : ""}</option>)}</optgroup>
+                {(boot?.cloud_models || []).some((m: any) => m.enabled) && <optgroup label="Online">
+                  {(boot?.cloud_models || []).filter((m: any) => m.enabled).map((m: any) => <option key={m.id} value={m.id}>{m.name} ({m.provider_name})</option>)}</optgroup>}
               </select>
             </div>
             <textarea className="input" rows={2} placeholder="Task (optional — the lead decides)" value={a.task} onChange={(e) => update(i, { task: e.target.value })} />

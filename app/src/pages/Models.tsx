@@ -3,6 +3,7 @@ import { Cpu, Download, Eye, Gauge, HardDrive, MemoryStick, Play, RotateCcw, Sea
 import { api, desktop, enc, fmtBytes } from "../api";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, ConfirmButton, Field, FolderInput, PageHeader, Progress, Spinner, Tabs, Toggle, fitBadge } from "../components/ui";
+import Online from "./Online";
 
 const CTX = [2048, 4096, 8192, 16384, 32768, 65536];
 
@@ -116,6 +117,11 @@ function Installed() {
               <Field label="Simultaneous replies" help="For agents in parallel; uses more memory.">
                 <select className="input narrow" value={s.parallel || 1} onChange={(e) => set(m.id, { parallel: Number(e.target.value) })}>
                   {[1, 2, 3, 4].map((n) => <option key={n} value={n}>{n}</option>)}
+                </select>
+              </Field>
+              <Field label="Role for Auto" help="Workers do routine parts; a strategist leads hard work (online models usually lead).">
+                <select className="input narrow" value={s.role || "worker"} onChange={(e) => set(m.id, { role: e.target.value })}>
+                  <option value="worker">Worker</option><option value="strategist">Strategist</option><option value="both">Both</option><option value="off">Not used by Auto</option>
                 </select>
               </Field>
               <Field label="Vision (images & video)">
@@ -443,9 +449,10 @@ export default function Models({ tab }: { tab?: string }) {
   const t = tab || "installed";
   return (
     <div className="page">
-      <PageHeader title="Models" subtitle="Models run on this computer only. Download the ones it can handle, choose CPU or GPU, and pick a model per chat, project or scheduled task." />
-      <Tabs value={t} onChange={(v: string) => go("models", v)} tabs={[{ id: "installed", label: "Installed" }, { id: "discover", label: "Discover" }, { id: "hardware", label: "Hardware & GPU" }]} />
+      <PageHeader title="Models" subtitle="Local models run on this computer and cost nothing; online models (GPT, Claude, Gemini and more) join them for hard reasoning. Pick a model, or Auto, per chat, project or scheduled task." />
+      <Tabs value={t} onChange={(v: string) => go("models", v)} tabs={[{ id: "installed", label: "On this computer" }, { id: "online", label: "Online" }, { id: "discover", label: "Discover" }, { id: "hardware", label: "Hardware & GPU" }]} />
       {t === "installed" && <Installed />}
+      {t === "online" && <Online />}
       {t === "discover" && <Discover />}
       {t === "hardware" && <Hardware />}
     </div>

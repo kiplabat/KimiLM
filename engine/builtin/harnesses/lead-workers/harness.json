@@ -1,0 +1,15 @@
+{
+  "name": "Lead and local workers",
+  "description": "The strongest model (often online) plans and splits the task, models on this computer do the parts at the same time, then the lead checks the results, sends fixes once if needed, and writes the answer.",
+  "type": "loop",
+  "mode": "team",
+  "lead_role": "strategist",
+  "worker_role": "worker",
+  "review": true,
+  "connectors": true,
+  "temperature": 0.3,
+  "memory": true,
+  "learn": true,
+  "max_reply_tokens": 6000,
+  "icon": "team"
+}

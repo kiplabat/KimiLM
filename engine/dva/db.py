@@ -52,6 +52,14 @@ CREATE TABLE IF NOT EXISTS item_state (
   kind TEXT, id TEXT, enabled INTEGER DEFAULT 1, PRIMARY KEY (kind, id));
 CREATE TABLE IF NOT EXISTS downloads (
   id TEXT PRIMARY KEY, spec_json TEXT DEFAULT '{}', state TEXT, error TEXT, created TEXT, updated TEXT);
+CREATE TABLE IF NOT EXISTS cloud_models (
+  id TEXT PRIMARY KEY, provider TEXT NOT NULL, remote_id TEXT NOT NULL, name TEXT, enabled INTEGER DEFAULT 1,
+  caps_json TEXT DEFAULT '{}', price_json TEXT DEFAULT '{}', settings_json TEXT DEFAULT '{}', added TEXT, last_used TEXT);
+CREATE TABLE IF NOT EXISTS usage (
+  id TEXT PRIMARY KEY, created TEXT, month TEXT, model_id TEXT, provider TEXT, chat_id TEXT, job_id TEXT, purpose TEXT,
+  input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0, cost REAL DEFAULT 0, estimated INTEGER DEFAULT 0);
+CREATE INDEX IF NOT EXISTS usage_month ON usage(month);
+CREATE INDEX IF NOT EXISTS usage_chat ON usage(chat_id);
 """
 
 # Columns added after the first release: (table, column, definition). Applied once, on start.

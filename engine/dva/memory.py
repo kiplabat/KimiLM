@@ -142,13 +142,22 @@ class Memory:
             self.pending.pop(chat_id, None)
 
     def _learning_model(self, chat):
+        """Learning runs on a model on this computer when there is one (it costs nothing and nothing leaves);
+        a model chosen in Settings wins."""
         chosen = self.db.setting("learning_model") or ""
-        if chosen and self.db.get("models", chosen):
+        if chosen and self.app.models.get_any(chosen):
             return chosen
         current = self.app.runtime.current
-        if current:
+        if current and not str(current["model_id"]).startswith("cloud:"):
             return current["model_id"]
-        return chat.get("model") or self.app.models.default_model()
+        model = chat.get("model")
+        if model and model != "auto" and not str(model).startswith("cloud:") and self.db.get("models", model):
+            return model
+        local, _ = self.app.router.pick("worker", prefer_local=True)
+        if local:
+            return local
+        model = model or self.app.models.default_model()
+        return None if model == "auto" else model
 
     async def learn(self, chat_id):
         chat = self.db.get("chats", chat_id)
@@ -195,6 +204,8 @@ class Memory:
         model_id = self._learning_model(chat)
         if not model_id:
             return []
+        from .cloud import USAGE
+        USAGE.set({"chat_id": chat_id, "purpose": "memory"})
         async with self.app.runtime.lease(model_id):
             try:
                 out = await self.app.llm.json([{"role": "system", "content": system},

@@ -31,19 +31,29 @@ from datetime import datetime
 from pathlib import Path
 
 from . import media, run_script as launcher
+from .cloud import USAGE, CloudError
 from .db import new_id, now
 from .llm import LLMError, estimate_tokens
 from .mcp import tool_key
+from .providers import is_cloud
+from .runtime import RuntimeError_
 from .tools import GROUPS, Tool, ToolContext, ToolDenied, ToolError, builtin_tools
 
 TOOL_RESULT_LIMIT = 6000
+ROLES = ("worker", "strategist", "vision")
+ROLE_HELP = ("worker = a model on this computer for routine, well-defined parts; strategist = the strongest model "
+             "(often online) for planning and hard reasoning; vision = a model that can see images and video.")
+REVIEW_SCHEMA = {"type": "object", "required": ["done"], "properties": {
+    "done": {"type": "boolean"},
+    "followups": {"type": "array", "maxItems": 3, "items": {"type": "object", "required": ["name", "task"], "properties": {
+        "name": {"type": "string", "maxLength": 40}, "task": {"type": "string", "maxLength": 900},
+        "role": {"enum": list(ROLES)}}}}}}
 PLAN_SCHEMA_STEP = {"type": "object", "required": ["title"], "properties": {
     "title": {"type": "string", "maxLength": 90}, "detail": {"type": "string", "maxLength": 300}}}
 TEXT_TOOLCALL = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
 URL_RE = re.compile(r"https?://[^\s)>\]]+")
 
-BASE_PROMPT = """You are KimiLM, an assistant that runs entirely on the user's own computer using a local \
-model ({model}). Nothing the user shares leaves this computer unless a tool sends it (web pages, connectors).
+BASE_PROMPT = """You are KimiLM, an assistant on the user's own computer. {where}
 Today is {today}. The computer runs {os}.
 Be direct and practical. Use Markdown. Never invent file contents, numbers or sources: read, fetch or compute them."""
 
@@ -53,6 +63,18 @@ Never repeat a tool call you already made; if something did not work twice, try 
 what you have. If a search says NO RELEVANT RESULTS, do not search for the same thing again.
 Changes (writing files, running code, scheduling, connector actions that change things) are shown to the user for \
 approval by the app; if one is declined, do not retry it — explain or choose another way."""
+
+
+_PRIVATE_TOOLS = None
+
+
+def private_tool_names():
+    """Tools whose results can contain the user's files (file reads, images, Python output)."""
+    global _PRIVATE_TOOLS
+    if _PRIVATE_TOOLS is None:
+        from .tools import builtin_tools
+        _PRIVATE_TOOLS = {t.name for t in builtin_tools() if t.group in ("files", "vision", "python")}
+    return _PRIVATE_TOOLS
 
 
 class TurnStopped(Exception):
@@ -180,6 +202,12 @@ class Turn:
             # the user put a team together in the composer: the team lead runs this turn
             self.harness = app.harnesses.get("team-lead") or {**self.harness, "mode": "team", "name": "Team"}
         self.model_id = self.chat.get("model") or (self.project or {}).get("default_model") or app.models.default_model()
+        self.auto = self.model_id in (None, "", "auto")   # the router picks the model per request
+        self.route_reason = ""
+        self.route_role = None
+        self.private = set()         # private material in this turn's messages (memory, attachments, files)
+        self.cloud_ok = set()        # … that the user let an online model see in this turn
+        self._last_native = None     # provider state of the last online reply (signatures, reasoning)
         self.limits = dict(self.chat.get("settings") or {})
         self.message_id = new_id("msg_")
         self.steps = []
@@ -215,13 +243,88 @@ class Turn:
     async def hold_model(self):
         if self._lease is None:
             self._lease = self.app.runtime.lease(self.model_id, on_wait=self.status)
-            self.server = await self._lease.__aenter__()
+            try:
+                self.server = await self._lease.__aenter__()
+            except RuntimeError_ as exc:
+                self._lease = None
+                if is_cloud(self.model_id) and self.auto:
+                    return await self.switch_to_local(str(exc).split(". ")[0].lower())
+                if is_cloud(self.model_id):
+                    raise TurnStopped(str(exc))
+                raise
+            if self.ctx is not None:
+                self.ctx.model_id = self.model_id
 
     async def drop_model(self):
         lease, self._lease = self._lease, None
         self.server = None
         if lease is not None:
             await lease.__aexit__(None, None, None)
+
+    # ------------------------------------------------------------------ online models (2.3.0)
+    def _needs_vision(self):
+        row = self.db.one("SELECT meta_json FROM messages WHERE chat_id=? AND role='user' ORDER BY created DESC, "
+                          "rowid DESC LIMIT 1", (self.chat["id"],))
+        return any(media.kind_of(a.get("path", "")) for a in ((row or {}).get("meta") or {}).get("attachments", []))
+
+    def resolve_auto(self):
+        """Auto: the router picks the model for this request (a strategist for hard work, a local worker else)."""
+        mid, reason, _role = self.app.router.auto(self.chat, self.project, self.harness, self.last_user_text(),
+                                                  self._needs_vision())
+        if mid:
+            self.model_id, self.route_reason, self.route_role = mid, reason, _role
+        else:
+            self.model_id = None
+
+    def local_model_id(self):
+        """A model on this computer (pipelines and learning run locally)."""
+        if self.model_id and self.model_id != "auto" and not is_cloud(self.model_id):
+            return self.model_id
+        mid, _ = self.app.router.pick("worker", chat=self.chat, project=self.project, prefer_local=True)
+        return mid if mid and not is_cloud(mid) else None
+
+    PRIVATE_LABELS = {"memory": "your memory notes", "attachments": "the files you attached",
+                      "files": "what it read from files and folders on this computer"}
+
+    async def before_model_call(self, messages):
+        """Before anything goes to an online model: the monthly budget (Auto falls back to local models) and the
+        privacy check (asks before your memory, attachments or file contents are sent, unless allowed)."""
+        if not is_cloud(self.model_id):
+            return
+        if self.auto and self.app.providers.over_budget():
+            return await self.switch_to_local("this month's online budget is used up")
+        need = set(self.private)
+        for m in messages:
+            c = m.get("content")
+            if m.get("role") == "user" and (
+                    (isinstance(c, list) and any(p.get("type") == "image_url" for p in c)) or
+                    (isinstance(c, str) and "[Attached " in c)):
+                need.add("attachments")
+        need -= self.cloud_ok
+        if not need or self.db.setting("cloud_privacy", "ask") == "auto":
+            return
+        row = self.app.models.get_any(self.model_id) or {}
+        tool = Tool("send_to_online_model", "", {}, None, "online", changes=True, label="Send to an online model")
+        what = ", ".join(self.PRIVATE_LABELS[c] for c in sorted(need))
+        description = (f"Send this to {row.get('name') or self.model_id} (online, {row.get('provider_name') or ''})? "
+                       f"It would see {what}. 'Always in this chat' stops asking here; 'Keep it on this computer' "
+                       "continues with a local model instead.")
+        if await self.approve(tool, {"model": row.get("name"), "would_see": sorted(need)}, description,
+                              ignore_auto=True):
+            self.cloud_ok |= need
+            return
+        await self.switch_to_local("you chose to keep it on this computer")
+
+    async def switch_to_local(self, reason):
+        mid, name = self.app.router.pick("vision" if self.vision else "worker", chat=self.chat, project=self.project,
+                                         prefer_local=True)
+        if not mid or is_cloud(mid):
+            raise TurnStopped(f"Not sent to the online model ({reason}), and there is no model on this computer to "
+                              "use instead. Download one in Models.")
+        await self.drop_model()
+        self.model_id = mid
+        self.note(f"Continuing with {name} because {reason}.")
+        await self.hold_model()
 
     # ------------------------------------------------------------------ events
     def emit(self, type_, **data):
@@ -237,15 +340,15 @@ class Turn:
         self.emit("note", text=text)
 
     # ------------------------------------------------------------------ approvals
-    async def approve(self, tool, args, description):
+    async def approve(self, tool, args, description, ignore_auto=False):
         if not tool.changes:
             return True
-        if self.auto_approve or tool.name in self.allowed_always:
+        if (self.auto_approve and not ignore_auto) or tool.name in self.allowed_always:
             return True
         approval_id = new_id("ap_")
         fut = asyncio.get_running_loop().create_future()
         self.app.approvals[approval_id] = {"future": fut, "chat_id": self.chat["id"], "job_id": self.job["id"],
-                                           "tool": tool.name, "description": description,
+                                           "tool": tool.name, "label": tool.label or tool.name, "description": description,
                                            "parent_chat_id": self.chat.get("parent_chat_id"),
                                            "agent": self.chat.get("agent_name")}
         self.emit("approval", approval_id=approval_id, tool=tool.name, label=tool.label or tool.name,
@@ -373,8 +476,10 @@ class Turn:
             if not isinstance(tasks, list) or not tasks:
                 raise ToolError("Give a list of tasks")
             agents = [{"name": str(t.get("name") or f"Agent {i}")[:40], "task": str(t.get("task") or "")[:1500],
-                       "harness": t.get("harness") if t.get("harness") in harness_ids else "agent"}
+                       "harness": t.get("harness") if t.get("harness") in harness_ids else "agent",
+                       "role": t.get("role") if t.get("role") in ROLES else None}
                       for i, t in enumerate(tasks[:int(self.db.setting("max_parallel_agents", 4))], 1)]
+            self.assign_models(agents)
             await self.drop_model()        # free this model's memory slot while the agents work
             try:
                 results = await self.run_agents(agents, overall=self.last_user_text())
@@ -386,13 +491,19 @@ class Turn:
                     {"type": "object", "required": ["tasks"], "properties": {"tasks": {"type": "array", "maxItems": 6,
                      "items": {"type": "object", "required": ["name", "task"], "properties": {
                          "name": {"type": "string"}, "task": {"type": "string"},
-                         "harness": {"enum": harness_ids}}}}}},
+                         "harness": {"enum": harness_ids},
+                         "role": {"enum": list(ROLES), "description": ROLE_HELP}}}}}},
                     delegate, "agents", label="Start agents",
                     summary=lambda a: "Start agents: " + ", ".join(t.get("name", "?") for t in a.get("tasks") or []))
 
     def system_prompt(self, tools):
-        model = self.db.get("models", self.model_id) if self.model_id else None
-        parts = [BASE_PROMPT.format(model=(model or {}).get("name") or self.model_id or "local model",
+        model = self.app.models.get_any(self.model_id) if self.model_id else None
+        name = (model or {}).get("name") or self.model_id or "local model"
+        where = (f"This reply comes from {name}, an online model the user chose for this work; KimiLM's tools "
+                 "run on the user's computer." if is_cloud(self.model_id) else
+                 f"This reply comes from a local model ({name}): nothing the user shares leaves this computer "
+                 "unless a tool sends it (web pages, connectors).")
+        parts = [BASE_PROMPT.format(where=where,
                                     today=datetime.now().strftime("%A %d %B %Y"),  # date only: a changing prefix defeats prompt caching
                                     os=f"{platform.system()} {platform.release()}")]
         if self.chat.get("parent_chat_id"):
@@ -412,6 +523,7 @@ class Turn:
         if self.harness.get("memory", True):
             mem = self.app.memory.context(self.chat, self.project, self.harness["id"])
             if mem:
+                self.private.add("memory")
                 parts.append(mem + "\nUse these when relevant; the user can edit them on the Memory page.")
         if "load_skill" in self.tool_map:
             index = self.app.skills.index()
@@ -536,13 +648,20 @@ class Turn:
     # ------------------------------------------------------------------ running
     async def run(self):
         started = time.monotonic()
+        USAGE.set({"chat_id": self.chat["id"], "job_id": self.job["id"],
+                   "purpose": "agent" if self.chat.get("parent_chat_id") else
+                   ("schedule" if self.chat.get("origin") == "schedule" else "chat")})
+        if self.harness.get("type") != "pipeline" and self.auto:
+            self.resolve_auto()
         self.emit("assistant_start", harness=self.harness["name"], model=self.model_id,
                   agent=self.chat.get("agent_name"))
+        if self.route_reason:
+            self.note(self.route_reason)
         try:
             if self.harness.get("type") == "pipeline":
                 await self.run_pipeline()
             else:
-                if not self.model_id:
+                if not self.model_id or self.model_id == "auto":
                     raise TurnStopped("No model is installed yet. Open Models and download one (the recommended "
                                       "one is marked).")
                 if self.harness.get("mode") == "team":
@@ -555,7 +674,7 @@ class Turn:
             await self._safe_drop()
             self.finish(time.monotonic() - started, stopped=True)
             raise
-        except TurnStopped as exc:
+        except (TurnStopped, CloudError) as exc:
             await self._safe_drop()
             self.steps.append({"type": "error", "text": str(exc)})
             self.emit("error", text=str(exc))
@@ -580,7 +699,9 @@ class Turn:
     def finish(self, seconds, stopped=False, error=None):
         self.stats["seconds"] = round(seconds, 1)
         content = "".join(self.text).strip()
+        model = self.app.models.get_any(self.model_id) if self.model_id and self.model_id != "auto" else None
         meta = {"steps": self.steps, "model": self.model_id, "harness": self.harness["id"],
+                "model_name": (model or {}).get("name"), "online": is_cloud(self.model_id), "auto": self.auto,
                 "harness_name": self.harness["name"], "stats": self.stats,
                 "reasoning": "".join(self.reasoning)[-20000:], "skills_loaded": sorted(self.ctx.loaded_skills) if self.ctx else [],
                 "stopped": stopped, "error": error, "job_id": self.job["id"]}
@@ -630,22 +751,31 @@ class Turn:
     async def stream_text(self, messages, tools, final=True, max_tokens=None):
         thinking = bool(self.chat.get("thinking")) or bool(self.harness.get("thinking"))
         buffer = []
+        await self.before_model_call(messages)
         self.stats["model_calls"] += 1
         self.status("Thinking…" if self.stats["model_calls"] == 1 else "Working…")
         end = None
-        async for kind, value in self.app.llm.stream(messages, tools=[t.schema() for t in tools] if tools else None,
-                                                     max_tokens=int(max_tokens or self.max_reply),
-                                                     temperature=self.temperature, thinking=thinking,
-                                                     server=self.server):
-            if kind == "token":
-                buffer.append(value)
-                self.emit("token", text=value)
-            elif kind == "reasoning":
-                self.reasoning.append(value)
-                self.emit("reasoning", text=value)
-            elif kind == "end":
-                end = value
+        thinking = thinking or (self.route_role == "strategist" and is_cloud(self.model_id))
+        try:
+            async for kind, value in self.app.llm.stream(messages, tools=[t.schema() for t in tools] if tools else None,
+                                                         max_tokens=int(max_tokens or self.max_reply),
+                                                         temperature=self.temperature, thinking=thinking,
+                                                         server=self.server):
+                if kind == "token":
+                    buffer.append(value)
+                    self.emit("token", text=value)
+                elif kind == "reasoning":
+                    self.reasoning.append(value)
+                    self.emit("reasoning", text=value)
+                elif kind == "end":
+                    end = value
+        except CloudError as exc:
+            if not (self.auto and is_cloud(self.model_id)) or buffer:
+                raise
+            await self.switch_to_local(f"the online model failed ({str(exc)[:160]})")
+            return await self.stream_text(messages, tools, final=final, max_tokens=max_tokens)
         self._count(end)
+        self._last_native = end.get("native")
         text = "".join(buffer)
         calls = end["tool_calls"]
         if not calls and tools and "<tool_call>" in text:  # model wrote the call as text
@@ -671,14 +801,25 @@ class Turn:
 
     def _count(self, end):
         timings = (end or {}).get("timings") or {}
+        if timings.get("online"):
+            self.stats["cost"] = round(float(self.stats.get("cost") or 0) + float(timings.get("cost") or 0), 6)
+            if timings.get("cost_estimated"):
+                self.stats["cost_estimated"] = True
         self.stats["prompt_tokens"] += int(timings.get("prompt_n") or 0)
         self.stats["output_tokens"] += int(timings.get("predicted_n") or 0)
         if timings.get("predicted_per_second"):
             self.stats["tokens_per_second"] = round(timings["predicted_per_second"], 1)
 
     async def complete(self, messages, **kw):
+        await self.before_model_call(messages)
         self.stats["model_calls"] += 1
-        out = await self.app.llm.complete(messages, server=self.server, **kw)
+        try:
+            out = await self.app.llm.complete(messages, server=self.server, **kw)
+        except CloudError as exc:
+            if not (self.auto and is_cloud(self.model_id)):
+                raise
+            await self.switch_to_local(f"the online model failed ({str(exc)[:160]})")
+            out = await self.app.llm.complete(messages, server=self.server, **kw)
         self._count(out)
         return out
 
@@ -701,9 +842,14 @@ class Turn:
                 if call["name"] != "use_connector_tool" and not await self.approve(
                         tool, call["arguments"], tool.describe_call(call["arguments"])):
                     raise ToolDenied("The user declined this action.")
+                if tool.group == "vision" and is_cloud(self.model_id):
+                    self.private.add("files")        # the tool sends the picture itself: ask first
+                    await self.before_model_call([])
                 self.app.jobs.progress(self.job["id"], f"{tool.label or tool.name}")
                 result = await tool.func(self.ctx, **(call["arguments"] or {}))
                 ok = True
+                if tool.group in ("files", "vision", "python"):
+                    self.private.add("files")
             except ToolDenied as exc:
                 result, ok = str(exc), False
                 step["declined"] = True
@@ -750,7 +896,7 @@ class Turn:
                     messages.insert(len(messages) - 1, {"role": "assistant", "content": text or "(working)"})
                     continue
                 return
-            messages.append({"role": "assistant", "content": text or "",
+            messages.append({"role": "assistant", "content": text or "", "_native": self._last_native,
                              "tool_calls": [{"id": c["id"], "type": "function",
                                              "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}}
                                             for c in calls]})
@@ -1001,6 +1147,55 @@ class Turn:
         await self.stream_text(messages, None)
 
     # ------------------------------------------------------------------ teams (agents in parallel)
+    def assign_models(self, agents):
+        """Agents without a model get one by role: workers on this computer when possible, strategists on the
+        strongest model. With a local lead and no roles, agents share the chat's model as before."""
+        default_role = self.harness.get("worker_role") or ("worker" if (self.auto or is_cloud(self.model_id)) else None)
+        for a in agents:
+            if str(a.get("model") or "").startswith("role:"):      # the team builder's "by role" choices
+                a["role"], a["model"] = a["model"][5:], None
+            if a.get("model") == "auto":
+                a["model"] = None
+            if a.get("model"):
+                continue
+            role = a.get("role") or default_role
+            if not role:
+                continue
+            mid, _name = self.app.router.pick(role, chat=self.chat, project=self.project)
+            if mid:
+                a["model"] = mid
+
+    @staticmethod
+    def _joined(results, budget):
+        return "\n\n".join(f"### {r['name']} — {r['status']}\nTask: {r['task']}\n\n{r['content'][:budget]}"
+                           for r in results)
+
+    async def review_round(self, messages, joined, question):
+        """The lead checks the workers' results once and sends up to three fixes back to workers."""
+        self.status("The lead is checking the results…")
+        try:
+            check = (await self.complete(messages + [{"role": "user", "content": (
+                f"Your team's results:\n\n{joined}\n\nCheck them against my request. If something is missing, wrong or "
+                "too weak to rely on, give up to 3 follow-up tasks (self-contained, with the details a worker needs) "
+                f"to fix it; otherwise set done to true. Roles: {ROLE_HELP} JSON only.")}],
+                schema=REVIEW_SCHEMA, max_tokens=1000, temperature=0.2))["json"]
+        except LLMError:
+            return []
+        fixes = [f for f in check.get("followups") or [] if (f.get("task") or "").strip()][:3]
+        if check.get("done") or not fixes:
+            self.note("The lead checked the results: nothing to redo.")
+            return []
+        self.note(f"The lead asked for {len(fixes)} fix{'es' if len(fixes) > 1 else ''}: "
+                  + "; ".join(f.get("name") or "?" for f in fixes))
+        agents = [{"name": (f.get("name") or f"Fix {i}")[:40], "task": f["task"][:1500], "harness": "agent",
+                   "role": f.get("role") or "worker"} for i, f in enumerate(fixes, 1)]
+        self.assign_models(agents)
+        await self.drop_model()
+        try:
+            return await self.run_agents(agents, overall=question)
+        finally:
+            await self.hold_model()
+
     def team_harnesses(self):
         return [h for h in self.app.harnesses.all() if h.get("type") == "loop" and h.get("mode") != "team"
                 and h.get("enabled", True)]
@@ -1020,7 +1215,7 @@ class Turn:
             item = {"type": "object", "required": ["name", "task"], "properties": {
                 "name": {"enum": names} if spec else {"type": "string", "maxLength": 40},
                 "task": {"type": "string", "maxLength": 900},
-                "harness": {"enum": harness_ids}}}
+                "harness": {"enum": harness_ids}, "role": {"enum": list(ROLES)}}}
             count = len(spec) if spec else None
             schema = {"type": "object", "required": ["agents"], "properties": {"agents": {
                 "type": "array", "items": item, "minItems": count or 1, "maxItems": count or max_agents}}}
@@ -1032,7 +1227,7 @@ class Turn:
                     "You lead a team of agents that work at the same time on separate parts of my request. Split it "
                     f"into independent tasks, one per agent. {hint} Each task must be self-contained (include the "
                     f"details the agent needs) and should not depend on another agent's result. Harnesses: {options}. "
-                    "JSON only.")}], schema=schema, max_tokens=1200, temperature=0.2))["json"]["agents"]
+                    f"Roles: {ROLE_HELP} JSON only.")}], schema=schema, max_tokens=1200, temperature=0.2))["json"]["agents"]
             except LLMError:
                 planned = [{"name": n, "task": question, "harness": "agent"} for n in (names or ["Agent 1"])]
             by_name = {p["name"]: p for p in planned}
@@ -1041,15 +1236,21 @@ class Turn:
                     p = by_name.get(a.get("name")) or {}
                     a["task"] = (a.get("task") or "").strip() or p.get("task") or question
                     a["harness"] = a.get("harness") or p.get("harness") or "agent"
+                    a["role"] = a.get("role") or p.get("role")
             else:
                 spec = planned
+        self.assign_models(spec)
         await self.drop_model()     # do not hold memory while the agents work
         results = await self.run_agents(spec, overall=question)
         await self.hold_model()
+        budget = max(1500, int((self.server.plan["ctx"] - self.max_reply - 2500) * 3 / max(1, len(results) + 3)))
+        joined = self._joined(results, budget)
+        if self.harness.get("review"):
+            more = await self.review_round(messages, joined, question)
+            if more:
+                results += more
+                joined = self._joined(results, budget)
         self.status("Combining the agents' results…")
-        budget = max(1500, int((self.server.plan["ctx"] - self.max_reply - 2500) * 3 / max(1, len(results))))
-        joined = "\n\n".join(f"### {r['name']} — {r['status']}\nTask: {r['task']}\n\n{r['content'][:budget]}"
-                             for r in results)
         messages.append({"role": "user", "content": f"Your team has finished. Their results:\n\n{joined}\n\nCombine "
                          "them into one answer to my request. Keep facts, numbers, sources and file paths; point out "
                          "disagreements between agents and anything that failed or is missing."})
@@ -1066,7 +1267,7 @@ class Turn:
         rows = []
         for i, a in enumerate(agents):
             model = a.get("model") or self.model_id
-            if model and not self.db.get("models", model):
+            if model and not self.app.models.get_any(model):
                 model = self.model_id
             row = {"name": a.get("name") or f"Agent {i + 1}", "task": a.get("task") or overall,
                    "harness": a.get("harness") or "agent", "model": model, "limits": a.get("limits") or {},
@@ -1077,8 +1278,8 @@ class Turn:
         for r in rows:
             shared[r["model"]] = shared.get(r["model"], 0) + 1
         for model, n in shared.items():
-            m = self.db.get("models", model) or {}
-            if n > 1 and int((m.get("settings") or {}).get("parallel") or 1) < n:
+            m = self.app.models.get_any(model) or {}
+            if n > 1 and not is_cloud(model) and int((m.get("settings") or {}).get("parallel") or 1) < n:
                 self.note(f"{n} agents use {m.get('name') or model}; with its current 'Simultaneous replies' setting "
                           f"({int((m.get('settings') or {}).get('parallel') or 1)}) they take turns. Raise it in Models → "
                           "settings to run them truly at the same time (needs more memory).")
@@ -1117,6 +1318,9 @@ class Turn:
                 msg = self.db.one("SELECT content, meta_json FROM messages WHERE chat_id=? AND role='assistant' "
                                   "ORDER BY created DESC, rowid DESC LIMIT 1", (chat["id"],))
                 r["content"] = (msg or {}).get("content") or ((msg or {}).get("meta") or {}).get("error") or "(no result)"
+                if any(s.get("type") == "tool" and s.get("name") in private_tool_names()
+                       for s in ((msg or {}).get("meta") or {}).get("steps", [])):
+                    self.private.add("files")      # its result may quote your files: ask before it goes online
                 r["status"] = "done" if status == "done" and not ((msg or {}).get("meta") or {}).get("error") else \
                     ("stopped" if status == "cancelled" else "failed")
                 publish()
@@ -1154,9 +1358,10 @@ class Turn:
         for key, spec in props.items():
             if url and ("url" in key or spec.get("format") == "uri"):
                 values[key] = url.group(0)
-        if self.harness.get("input_prompt") and self.model_id and props:
+        local = self.local_model_id()
+        if self.harness.get("input_prompt") and local and props:
             try:
-                async with self.app.runtime.lease(self.model_id, on_wait=self.status) as server:
+                async with self.app.runtime.lease(local, on_wait=self.status) as server:
                     self.status("Reading your request…")
                     got = await self.app.llm.json([
                         {"role": "system", "content": self.harness["input_prompt"]},
@@ -1244,11 +1449,12 @@ class Turn:
 
         async def with_model():
             if "model" in (h.get("needs") or []):
-                if not self.model_id:
-                    raise TurnStopped("This pipeline needs a model; download one in Models first.")
-                async with self.app.runtime.lease(self.model_id, on_wait=self.status) as server:
+                local = self.local_model_id()      # pipelines run on a model on this computer
+                if not local:
+                    raise TurnStopped("This pipeline needs a model on this computer; download one in Models first.")
+                async with self.app.runtime.lease(local, on_wait=self.status) as server:
                     base_env.update({"DV_LLM_API": "openai", "LLM_BASE_URL": server.base_url,
-                                     "LLM_API_KEY": server.api_key, "LLM_MODEL": self.model_id})
+                                     "LLM_API_KEY": server.api_key, "LLM_MODEL": local})
                     return await execute()
             return await execute()
 
@@ -1260,9 +1466,10 @@ class Turn:
         self.text = [summary]
         self.steps.append({"type": "pipeline_end", "code": code, "result": result, "log_tail": log_tail[-60:]})
         self.emit("pipeline_end", code=code, result=result)
-        if self.model_id and h.get("learn", True):
+        learner = self.local_model_id()
+        if learner and h.get("learn", True):
             outcome = f"exit code {code}\n{summary}\n" + "\n".join(log_tail[-40:])
-            self.app.spawn(self.app.memory.reflect(h["id"], h["name"], outcome, self.model_id))
+            self.app.spawn(self.app.memory.reflect(h["id"], h["name"], outcome, learner))
 
 
 def focus(text, terms, limit):

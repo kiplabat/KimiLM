@@ -1,8 +1,13 @@
 # KimiLM — desktop app (Windows first)
 
 A desktop app for local AI agents: chat, projects, memory, skills, plugins, connectors (MCP), harnesses and
-scheduled tasks. **Models run only on this computer** (llama.cpp, CPU or GPU). Plugins are optional; Datavera is
-one of them (it runs the command-line agent in the repository root, which keeps working on its own).
+scheduled tasks. Models run **on this computer** (llama.cpp, CPU or GPU) and, from 2.3.0, **optionally online**
+(OpenAI, Anthropic, Google, OpenRouter, Moonshot/Kimi, DeepSeek, Mistral, Groq, xAI or any OpenAI-style endpoint,
+with the user's own API keys). **Auto** sends planning and hard reasoning to the strongest model and routine work to
+a local one; the "Lead and local workers" harness lets an online strategist plan and check while local agents do the
+parts in parallel. Online use has a monthly budget (warnings at 50 % and 80 %, then local only) and asks before files,
+attachments or memory leave the computer. Plugins are optional; Datavera is one of them (it runs the command-line
+agent in the repository root, which keeps working on its own).
 
 KimiLM was called **Datavera Agent** up to 2.1.x. Version 2.2.0 renamed it; see "Upgrading from Datavera Agent".
 
@@ -93,3 +98,7 @@ signing certificate is added (`win.certificateFile` / Azure Trusted Signing in `
 - Vision is tested with stand-in models only; real image quality depends on the model (Qwen3.5 and Gemma 3 have
   vision parts; most others do not). Videos are read as 3–8 sampled frames, not continuous video.
 - Agents on the same model take turns unless that model's "Simultaneous replies" is raised (needs more memory).
+- Online models: costs are estimates from token counts and catalogue prices (OpenRouter's public list, refreshed
+  daily, or prices typed in by the user); the provider's bill is the final word. Tested against stand-in servers
+  that speak each provider's API; check each provider with a real key (Models → Online → Test) before relying on it.
+  ChatGPT/Claude/Gemini subscriptions cannot be used; providers need API keys with billing.
