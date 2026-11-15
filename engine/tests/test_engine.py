@@ -533,3 +533,19 @@ def test_loop_guard_rules():
     for i in range(3):
         g.record("read_file", {"path": str(i)}, False, "Error: x")
     assert "nothing new" in g.should_stop()
+
+
+def test_scripts_can_import_their_neighbours_like_the_installed_app(tmp_path):
+    """The installer's embedded Python leaves a script's folder off sys.path (python._pth). Emulated with -P:
+    a plain run fails, the engine's launcher works."""
+    folder = tmp_path / "plugin"
+    folder.mkdir()
+    (folder / "helper.py").write_text("VALUE = 42\n")
+    (folder / "main.py").write_text("import sys\nfrom helper import VALUE\nprint('ok', VALUE, sys.argv[1:])\n")
+    env = {**os.environ, "PYTHONPATH": str(ENGINE)}
+    plain = subprocess.run([sys.executable, "-P", str(folder / "main.py")], capture_output=True, text=True,
+                           cwd=str(tmp_path), env=env)
+    assert "No module named 'helper'" in plain.stderr
+    launched = subprocess.run([sys.executable, "-P", "-m", "dva.run_script", str(folder / "main.py"), "x"],
+                              capture_output=True, text=True, cwd=str(tmp_path), env=env)
+    assert launched.stdout.strip() == "ok 42 ['x']", launched.stderr

@@ -25,13 +25,12 @@ import json
 import os
 import platform
 import re
-import sys
 import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from . import media
+from . import media, run_script as launcher
 from .db import new_id, now
 from .llm import LLMError, estimate_tokens
 from .mcp import tool_key
@@ -1207,7 +1206,7 @@ class Turn:
                 self.status("Starting the browser helper…")
                 base_env["DVA_BROWSER_MCP_URL"] = await self.app.services.browser()
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-u", str(entry), *args, cwd=str(entry.parent), env=base_env,
+                *launcher.command(entry, args), cwd=str(entry.parent), env=launcher.environment(base_env),
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
                 creationflags=0x08000000 if os.name == "nt" else 0)
             try:
