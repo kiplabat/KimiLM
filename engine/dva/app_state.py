@@ -3,6 +3,7 @@ import asyncio
 import time
 from datetime import datetime
 
+from .cloud import Cloud
 from .db import DB, new_id, now
 from .events import EventBus
 from .harness import Harnesses
@@ -14,6 +15,8 @@ from .migration import rewrite_moved_paths
 from .models import Models
 from .paths import Paths
 from .plugins import Plugins
+from .providers import Providers
+from .router import Router
 from .runtime import Runtime
 from .scheduler import Scheduler
 from .secrets import Secrets
@@ -27,6 +30,7 @@ DEFAULT_SETTINGS = {
     "unload_after_minutes": 20, "memory_enabled": True, "learn_enabled": True, "learn_delay_seconds": 45,
     "allow_python": True, "approval_timeout_minutes": 360, "max_native_tools": 28, "python_timeout_seconds": 180,
     "max_loaded_models": 3, "browser_search": True, "max_parallel_agents": 4, "turn_time_limit_minutes": 30,
+    "cloud_privacy": "ask", "cloud_budget_monthly": 10.0, "cloud_max_parallel": 4,
 }
 CHAT_LIMIT_KEYS = ("max_reply_tokens", "max_steps", "time_limit_minutes", "temperature", "max_searches",
                    "max_tool_calls")
@@ -53,6 +57,10 @@ class App:
         self.harnesses = Harnesses(self.paths, self.db, self.plugins)
         self.connectors = Connectors(self.db, self.secrets, self.plugins, self.bus)
         self.models = Models(self.paths, self.db, self.bus, self.runtime)
+        self.providers = Providers(self.db, self.secrets, self.bus, self.log)
+        self.runtime.cloud = Cloud(self.providers, self.db)
+        self.models.providers = self.providers
+        self.router = Router(self)
         self.memory = Memory(self)
         self.jobs = Jobs(self)
         self.scheduler = Scheduler(self)

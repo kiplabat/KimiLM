@@ -11,6 +11,9 @@ Python 3.12, FastAPI on `127.0.0.1` (token-protected), SQLite, llama.cpp. Starte
 | `migration.py` | After the data folder moved from Datavera Agent: rewrites stored paths once (`migrated-from.json`) |
 | `app_state.py` | Wires the services; on start, queued follow-ups left from a closed app become "Not sent (the app was closed)"; `start_turn()` saves the user message and starts the turn as a task; `post_message()` handles follow-ups while a chat is busy (`queue` → run right after, `steer` → handed to the running agent at its next step; after Stop they stay unsent); per-chat limits (`chats.settings`) |
 | `runner.py` | One chat turn: builds the prompt (harness + project instructions + memory + skills index + summary), runs the harness (chat / agent / planner / research / team loop, or a pipeline), streams events, saves one assistant message with ordered `meta.steps`. `LoopGuard` stops loops in every tool-using turn: exact and near-duplicate calls are refused (searches: ≥60 % word overlap), per-tool caps (web_search 6 by default), a "change approach" note after 3 unproductive results, a forced write-up after 6 (or 5 refused repeats, or the time limit). After a successful change (file written, code run, connector action) earlier reads, listings and runs may be repeated, since their answer can differ; web calls stay blocked |
+| `providers.py` | Online providers (OpenAI, Anthropic, Google, OpenRouter, Moonshot, DeepSeek, Mistral, Groq, xAI, custom OpenAI-style endpoints): keys in the credential store, model lists with capabilities, chosen models (`cloud_models`: role, strength, effort, price), prices (OpenRouter catalogue, cached a day, or typed in), metering into `usage`, monthly budget with 50/80/100 % warnings |
+| `cloud.py` | Online model calls, ids `cloud:<provider>:<model>`: three adapters — OpenAI Responses (stateless, encrypted reasoning passed back), Anthropic Messages (thinking blocks + signatures kept across tool calls, prompt caching, schema answers via a forced tool), chat completions (Gemini thought signatures, DeepSeek/Kimi reasoning echo, OpenRouter reasoning details). Provider state rides on assistant messages as `_native` and is stripped for local models. Retries 429/5xx; drops a rejected parameter and retries once |
+| `router.py` | Auto: a complexity score (planning/strategy/review words up, routine words down, length, heavy harnesses) picks a strategist (strongest online or local) or a worker (local first); roles strategist / worker / both / off per model; respects privacy mode, budget and per-chat switches |
 | `llm.py` | OpenAI-compatible client for llama-server: streaming, native tool calls, JSON-schema answers, reasoning split. Calls go to the server leased by the current task (context variable) unless `server=` is given |
 | `runtime.py` | llama.cpp builds (bundled CPU; Vulkan/CUDA downloaded from the pinned release), **several `llama-server`s at once** (one per model, up to `max_loaded_models`, memory-checked; idle ones unloaded LRU-first), model *leases*, "simultaneous replies" (`-np`, context × slots), vision projector (`--mmproj`, `--no-mmproj-offload` on CPU; falls back to no vision if it does not load), idle unload, CPU/GPU plans |
 | `models.py` | Recommended catalogue, **browse ranked for this computer** (HF `expand[]=gguf` parameter counts → size at Q4, fit, rough speed; trusted publishers filter), Hugging Face search and file listing with a recommended quant, downloads with phases, stall detection (45 s), 8 retries with backoff, readable errors, persisted across restarts (paused → Resume), vision parts (mmproj F16 preferred) with the model or added later, GGUF import (sibling or Ollama projector picked up), fit estimates, speed test |
@@ -83,6 +86,11 @@ The installer copies the pipeline files into `pipeline/`; in development they ar
   unless the chat or scheduled task turns on auto-approve. Unanswered approvals decline after a timeout.
 - Memory refuses key/password/card-number-like text. Secrets never return to the UI after saving.
 - `run_python` is not sandboxed (it is the user's own computer); it is off-able in Settings and always asks.
+- Online models (`cloud_privacy`): **ask** (default) — before an online model first sees memory notes, attachments
+  or anything read from files, folders, images or Python output, the turn asks (`send_to_online_model`, never
+  auto-approved); "Keep it on this computer" switches the turn to a local model. **local_unless_on** — online only in
+  chats switched on. **auto** — no prompt. Pipelines and memory learning always use local models. API keys live in
+  the OS credential store and are never returned to the UI.
 
 ## Tests
 
@@ -90,6 +98,8 @@ The installer copies the pipeline files into `pipeline/`; in development they ar
 cd engine
 .\.venv\Scripts\python.exe -m pytest -q tests\test_engine.py
 ```
-Uses `tests/fake_llama_server.py` (scripted llama-server stand-in) and `tests/fake_mcp_server.py`. To also test a
+Uses `tests/fake_llama_server.py` (scripted llama-server stand-in), `tests/fake_mcp_server.py` and
+`tests/fake_cloud_server.py` (OpenAI Responses, Anthropic Messages and Gemini-style chat stand-ins for
+`tests/test_online.py`; run everything with `-m pytest -q tests`). To also test a
 real llama-server: set `DVA_TEST_LLAMA_SERVER` (path to llama-server) and `DVA_TEST_GGUF` (any small GGUF;
 `tests/make_tiny_model.py` builds a random-weight one from llama.cpp's vocab files).

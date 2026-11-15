@@ -79,11 +79,16 @@ def create_app(data_dir=None, resources_dir=None, token=None):
     async def bootstrap():
         a = A()
         settings = {r["key"]: r["value"] for r in a.db.all("SELECT * FROM settings")
-                    if not r["key"].startswith(("chat_allow:", "chat_auto_approve:", "connector_approval:"))}
+                    if not r["key"].startswith(("chat_allow:", "chat_auto_approve:", "connector_approval:",
+                                                "chat_online:", "cloud_price_list", "cloud_budget_warned"))}
         return {"version": VERSION, "settings": settings, "data_dir": str(a.paths.data),
                 "models_dir": str(a.paths.models_dir({"models_dir": a.db.setting("models_dir")})),
                 "secrets_backend": a.secrets.backend, "secrets_secure": a.secrets.secure,
                 "models": a.models.installed(), "default_model": a.models.default_model(),
+                "cloud_models": a.providers.models(),
+                "online": {"spent": round(a.providers.spent(), 4), "budget": a.providers.budget(),
+                           "privacy": a.db.setting("cloud_privacy", "ask"),
+                           "ready": any(p["ready"] for p in a.providers.list())},
                 "runtime": {"installed": list(a.runtime.backends()), "status": a.runtime.status, "tag": a.runtime.tag,
                             "loaded": a.runtime.loaded()},
                 "harnesses": [{k: h.get(k) for k in ("id", "name", "description", "type", "mode", "enabled", "source", "error")}
@@ -131,6 +136,118 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         asyncio.get_running_loop().call_later(0.3, lambda: os._exit(0))
         await A().stop()
         return {"ok": True}
+
+    # ------------------------------------------------------------------ online models (2.3.0)
+    def _online_settings(a):
+        return {"cloud_privacy": a.db.setting("cloud_privacy", "ask"),
+                "cloud_budget_monthly": a.providers.budget(),
+                "cloud_enabled": a.db.setting("cloud_enabled", True) is not False,
+                "cloud_max_parallel": a.db.setting("cloud_max_parallel", 4),
+                "cloud_unknown_price": a.db.setting("cloud_unknown_price") or {"in": 5.0, "out": 25.0}}
+
+    @api.get("/api/online")
+    async def online_overview():
+        a = A()
+        return {"providers": a.providers.list(), "models": a.providers.models(), "usage": a.providers.usage_summary(),
+                "settings": _online_settings(a), "roster": a.router.roster()}
+
+    @api.put("/api/online/settings")
+    async def online_settings(request: Request):
+        a = A()
+        data = await body(request)
+        if "cloud_privacy" in data and data["cloud_privacy"] not in ("ask", "local_unless_on", "auto"):
+            raise ValueError("cloud_privacy must be ask, local_unless_on or auto")
+        if "cloud_budget_monthly" in data:
+            data["cloud_budget_monthly"] = max(0.0, float(data["cloud_budget_monthly"] or 0))
+        if "cloud_max_parallel" in data:
+            data["cloud_max_parallel"] = max(1, min(16, int(data["cloud_max_parallel"] or 4)))
+        for key in ("cloud_privacy", "cloud_budget_monthly", "cloud_enabled", "cloud_max_parallel",
+                    "cloud_unknown_price"):
+            if key in data:
+                a.db.set_setting(key, data[key])
+        a.bus.publish("settings_changed")
+        return _online_settings(a)
+
+    @api.put("/api/online/providers/{pid}/key")
+    async def online_key(pid: str, request: Request):
+        a = A()
+        data = await body(request)
+        a.providers.set_key(pid, (data.get("key") or "").strip())
+        if not data.get("key"):
+            return {"ok": True}
+        result = await a.providers.test(pid)
+        added = []
+        if not a.db.one("SELECT 1 AS x FROM cloud_models WHERE provider=?", (pid,)):
+            for m in await a.providers.suggested(pid):
+                added.append(a.providers.add_model(pid, m)["name"])
+        return {**result, "added": added}
+
+    @api.post("/api/online/providers/{pid}/test")
+    async def online_test(pid: str):
+        return await A().providers.test(pid)
+
+    @api.put("/api/online/providers/{pid}")
+    async def online_provider_update(pid: str, request: Request):
+        a = A()
+        a.providers.update(pid, await body(request))
+        return {"ok": True}
+
+    @api.delete("/api/online/providers/{pid}")
+    async def online_provider_remove(pid: str):
+        A().providers.remove(pid)
+        return {"ok": True}
+
+    @api.post("/api/online/custom")
+    async def online_custom(request: Request):
+        data = await body(request)
+        if not (data.get("base") or "").startswith(("http://", "https://")):
+            raise ValueError("The address must start with http:// or https:// (e.g. http://localhost:1234/v1)")
+        pid = A().providers.add_custom(data.get("name") or "Custom endpoint", data["base"], data.get("key"))
+        return {"id": pid}
+
+    @api.get("/api/online/providers/{pid}/models")
+    async def online_provider_models(pid: str, q: str = ""):
+        a = A()
+        listing = await a.providers.fetch_models(pid)
+        have = {r["remote_id"] for r in a.db.all("SELECT remote_id FROM cloud_models WHERE provider=?", (pid,))}
+        words = [w for w in q.lower().split() if w]
+        rows = [{**m, "added": m["remote_id"] in have} for m in listing
+                if all(w in (m["remote_id"] + " " + m["name"]).lower() for w in words)]
+        return {"models": rows[:400], "total": len(listing)}
+
+    @api.post("/api/online/models")
+    async def online_model_add(request: Request):
+        data = await body(request)
+        return await A().providers.add_by_id(data["provider"], data["remote_id"])
+
+    @api.put("/api/online/models/{model_id:path}")
+    async def online_model_update(model_id: str, request: Request):
+        return A().providers.update_model(model_id, await body(request))
+
+    @api.delete("/api/online/models/{model_id:path}")
+    async def online_model_delete(model_id: str):
+        a = A()
+        if a.db.setting("default_model") == model_id:
+            a.db.set_setting("default_model", "auto")
+        a.providers.delete_model(model_id)
+        return {"ok": True}
+
+    @api.get("/api/online/usage")
+    async def online_usage(month: str = ""):
+        return A().providers.usage_summary(month or None)
+
+    @api.put("/api/chats/{chat_id}/online")
+    async def chat_online(chat_id: str, request: Request):
+        a = A()
+        data = await body(request)
+        a.db.set_setting(f"chat_online:{chat_id}", bool(data.get("allowed")))
+        return {"ok": True, "allowed": bool(data.get("allowed")), "cost": a.providers.chat_cost(chat_id)}
+
+    @api.get("/api/chats/{chat_id}/online")
+    async def chat_online_get(chat_id: str):
+        a = A()
+        return {"allowed": bool(a.db.setting(f"chat_online:{chat_id}", False)), "cost": a.providers.chat_cost(chat_id),
+                "privacy": a.db.setting("cloud_privacy", "ask")}
 
     # ------------------------------------------------------------------ runtime + models
     @api.get("/api/runtime")
@@ -344,11 +461,11 @@ def create_app(data_dir=None, resources_dir=None, token=None):
             raise KeyError(chat_id)
         chat["messages"] = a.db.all("SELECT * FROM messages WHERE chat_id=? ORDER BY created, rowid", (chat_id,))
         chat["running_job"] = a.jobs.running_for_chat(chat_id)
-        chat["pending_approvals"] = [{"approval_id": k, **{x: v[x] for x in ("tool", "description")}}
+        chat["pending_approvals"] = [{"approval_id": k, **{x: v.get(x) for x in ("tool", "label", "description")}}
                                      for k, v in a.approvals.items() if v["chat_id"] == chat_id]
         chat["auto_approve"] = bool(a.db.setting(f"chat_auto_approve:{chat_id}", False))
         chat["pending_approvals"] += [{"approval_id": k, "agent": v.get("agent"), "agent_chat_id": v["chat_id"],
-                                       **{x: v[x] for x in ("tool", "description")}}
+                                       **{x: v.get(x) for x in ("tool", "label", "description")}}
                                       for k, v in a.approvals.items() if v.get("parent_chat_id") == chat_id]
         chat["memories"] = a.memory.list("chat", chat_id)
         chat["workspace"] = str(a.paths.workspace(chat_id))

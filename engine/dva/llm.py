@@ -12,15 +12,25 @@ class LLMError(RuntimeError):
 
 class LLM:
     """Calls go to the model server leased by the current task (see Runtime.lease), so several agents can use
-    different models at the same time. Pass server= to choose one explicitly."""
+    different models at the same time. Pass server= to choose one explicitly. An online model's lease (cloud.py)
+    answers through its own adapter with the same results."""
     def __init__(self, runtime):
         self.runtime = runtime
 
-    def _server(self, server):
+    def _pick(self, server):
         server = server or self.runtime.active()
         if server is None:
             raise LLMError("No model is loaded")
+        return server
+
+    def _server(self, server):
+        server = self._pick(server)
         return server.base_url, server.headers
+
+    @staticmethod
+    def _local(messages):
+        """Engine-only keys ('_native' state of online models, '_id'…) never go to llama-server."""
+        return [{k: v for k, v in m.items() if not k.startswith("_")} for m in messages]
 
     def _body(self, messages, *, tools=None, schema=None, max_tokens=1024, temperature=0.4, thinking=False,
               stream=False, tool_choice=None, stop=None):
@@ -42,6 +52,11 @@ class LLM:
     async def complete(self, messages, *, schema=None, tools=None, max_tokens=1024, temperature=0.2,
                        thinking=False, timeout=900, server=None):
         """One non-streamed call. With a schema, returns the parsed object in result['json'] (or raises)."""
+        picked = self._pick(server)
+        if getattr(picked, "kind", None) == "cloud":
+            return await picked.adapter.complete(messages, schema=schema, tools=tools, max_tokens=max_tokens,
+                                                 temperature=temperature, thinking=thinking, timeout=timeout)
+        messages = self._local(messages)
         body = self._body(messages, tools=tools, schema=schema, max_tokens=max_tokens, temperature=temperature,
                           thinking=thinking)
         base, headers = self._server(server)
@@ -78,6 +93,14 @@ class LLM:
     async def stream(self, messages, *, tools=None, max_tokens=2048, temperature=0.4, thinking=False, timeout=1800,
                      tool_choice=None, server=None):
         """Yields ('reasoning', text), ('token', text), then ('end', {...tool_calls, timings, finish_reason})."""
+        picked = self._pick(server)
+        if getattr(picked, "kind", None) == "cloud":
+            async for item in picked.adapter.stream(messages, tools=tools, max_tokens=max_tokens,
+                                                    temperature=temperature, thinking=thinking, timeout=timeout,
+                                                    tool_choice=tool_choice):
+                yield item
+            return
+        messages = self._local(messages)
         body = self._body(messages, tools=tools, max_tokens=max_tokens, temperature=temperature, thinking=thinking,
                           stream=True, tool_choice=tool_choice)
         base, headers = self._server(server)

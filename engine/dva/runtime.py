@@ -99,6 +99,7 @@ class Runtime:
         self.log_path = paths.data / "logs" / "llama-server.log"
         self._devices_cache = {}
         self._recommended = None
+        self.cloud = None            # online models (cloud.Cloud), wired by the app
 
     # ------------------------------------------------------------------ backends
     @property
@@ -438,7 +439,12 @@ class Runtime:
     @asynccontextmanager
     async def lease(self, model_id, compute=None, on_wait=None):
         """Use a model for the duration of a block; yields its Server. Loads it if needed (alongside the models
-        already loaded when memory allows), otherwise waits for a busy model to finish."""
+        already loaded when memory allows), otherwise waits for a busy model to finish. Online models
+        ("cloud:…") are leased from cloud.Cloud: nothing to load."""
+        if self.cloud is not None and str(model_id or "").startswith("cloud:"):
+            async with self.cloud.lease(model_id, on_wait=on_wait) as server:
+                yield server
+            return
         model = self.db.get("models", model_id)
         if not model:
             raise RuntimeError_(f"Model {model_id!r} is not installed. Download it in Models.")

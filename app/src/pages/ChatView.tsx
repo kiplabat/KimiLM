@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
-  AlertTriangle, Ban, Brain, Check, CheckCircle2, ChevronDown, ChevronRight, Circle, Clock, Copy, CornerDownRight,
+  AlertTriangle, Ban, Brain, Check, CheckCircle2, ChevronDown, ChevronRight, Circle, Clock, Cloud, Copy, CornerDownRight,
   ExternalLink, FileText, FolderOpen, Loader2, MoreHorizontal, Paperclip, Pin, RotateCcw, Send, ShieldCheck, Sparkles,
   Trash2, Users, X, XCircle,
 } from "lucide-react";
@@ -25,13 +25,23 @@ function ToolCard({ step, approval, onDecide }: any) {
       </div>
       {approval && (
         <div className="approval">
-          <div className="approval-title"><ShieldCheck size={15} /> {approval.agent ? <>Agent <b>{approval.agent}</b> asks: allow this?</> : "Allow this?"}</div>
-          <pre className="approval-desc">{approval.description}</pre>
-          <div className="row gap-s">
-            <Button kind="primary" small onClick={() => onDecide(approval.approval_id, true, false)}>Allow</Button>
-            <Button small onClick={() => onDecide(approval.approval_id, true, true)}>Always allow in this chat</Button>
-            <Button kind="ghost" small onClick={() => onDecide(approval.approval_id, false, false)}>Decline</Button>
-          </div>
+          {approval.tool === "send_to_online_model" ? <>
+            <div className="approval-title"><Cloud size={15} /> {approval.agent ? <>Agent <b>{approval.agent}</b>: send this to an online model?</> : "Send this to an online model?"}</div>
+            <pre className="approval-desc">{approval.description}</pre>
+            <div className="row gap-s">
+              <Button kind="primary" small onClick={() => onDecide(approval.approval_id, true, false)}>Allow</Button>
+              <Button small onClick={() => onDecide(approval.approval_id, true, true)}>Always in this chat</Button>
+              <Button kind="ghost" small onClick={() => onDecide(approval.approval_id, false, false)}>Keep it on this computer</Button>
+            </div>
+          </> : <>
+            <div className="approval-title"><ShieldCheck size={15} /> {approval.agent ? <>Agent <b>{approval.agent}</b> asks: allow this?</> : "Allow this?"}</div>
+            <pre className="approval-desc">{approval.description}</pre>
+            <div className="row gap-s">
+              <Button kind="primary" small onClick={() => onDecide(approval.approval_id, true, false)}>Allow</Button>
+              <Button small onClick={() => onDecide(approval.approval_id, true, true)}>Always allow in this chat</Button>
+              <Button kind="ghost" small onClick={() => onDecide(approval.approval_id, false, false)}>Decline</Button>
+            </div>
+          </>}
         </div>
       )}
       {open && (
@@ -157,7 +167,8 @@ function AssistantMessage({ msg, isLast, onRetry }: any) {
       {meta.stopped && <div className="note">Stopped.</div>}
       <div className="msg-foot">
         <span>{meta.harness_name || meta.harness}</span>
-        {meta.model && <span>· {meta.model}</span>}
+        {meta.model && <span title={meta.auto ? "Chosen by Auto" : undefined}>· {meta.online ? <Cloud size={11} /> : null} {meta.model_name || meta.model}{meta.auto ? " (Auto)" : ""}</span>}
+        {stats.cost ? <span title={stats.cost_estimated ? "Estimated: this model's price is not known" : "Online model cost (estimate from tokens and price)"}>· {stats.cost_estimated ? "~" : ""}${stats.cost < 0.01 ? stats.cost.toFixed(4) : stats.cost.toFixed(2)}</span> : null}
         {stats.seconds ? <span>· {stats.seconds}s</span> : null}
         {stats.tokens_per_second ? <span>· {stats.tokens_per_second} tok/s</span> : null}
         <button className="icon-btn" title="Copy" onClick={() => navigator.clipboard.writeText(msg.content || "")}><Copy size={13} /></button>
@@ -393,7 +404,7 @@ export default function ChatView({ chatId }: { chatId: string }) {
             onStop={() => api.post(`/chats/${chatId}/stop`)}
             options={<>
               <HarnessPicker value={chat.harness} onChange={(v: string) => patch({ harness: v })} />
-              <ModelPicker value={chat.model} onChange={(v: string) => patch({ model: v })} />
+              <ModelPicker value={chat.model} chatId={chat.id} onChange={(v: string) => patch({ model: v })} />
               <LimitsPicker value={chat.settings || {}} onChange={(v: any) => patch({ settings: v })} />
               {!chat.parent_chat_id && <TeamPicker team={team} onChange={setTeam} />}
               <ConnectorPicker value={chat.connectors || []} onChange={(v: string[]) => patch({ connectors: v })} />
