@@ -431,15 +431,17 @@ def test_stop_keeps_queued_messages_unsent(engine):
 def test_team_runs_agents_in_parallel(engine):
     c = engine["client"]
     chat = c.post("/api/chats", json={"harness": "chat"}).json()
-    team = [{"name": "Alpha", "harness": "chat", "task": "say hello"},
+    team = [{"name": "Alpha", "harness": "chat", "task": "say hello", "model": "role:worker"},
             {"name": "Beta", "harness": "chat", "task": "say goodbye", "limits": {"max_reply_tokens": 300}}]
     job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "greet in two ways", "team": team}).json()
     assert wait_job(c, job["job_id"], timeout=90)["status"] == "done"
     full = c.get(f"/api/chats/{chat['id']}").json()
     assert {a["agent_name"] for a in full["agents"]} == {"Alpha", "Beta"}
     msg = last_assistant(c, chat["id"])
-    team_step = next(s for s in msg["meta"]["steps"] if s["type"] == "team")
-    assert all(a["status"] == "done" and a["content"] for a in team_step["agents"])
+    team_step = next(s for s in msg["meta"]["steps"] if s["type"] == "orchestra")
+    assert all(t["status"] == "done" and t["output"] for t in team_step["tasks"]), team_step
+    assert {t["agent"] for t in team_step["tasks"]} == {"Alpha", "Beta"}
+    assert all(not str(t["model"]).startswith("role:") and t["model_name"] for t in team_step["tasks"]), team_step
     beta = next(a for a in full["agents"] if a["agent_name"] == "Beta")
     assert c.get(f"/api/chats/{beta['id']}").json()["settings"]["max_reply_tokens"] == 300
     listed = {r["id"] for r in c.get("/api/chats").json()["chats"]}
@@ -651,3 +653,210 @@ def test_keys_saved_under_the_old_name_are_found(monkeypatch):
         assert not s.has("plugin:datavera:api_key"), "deleting removes both"
     finally:
         keyring.set_keyring(before)
+
+
+# ---------------------------------------------------------------- 2.4.0: the planner runs agents as a task graph
+def team_of(msg):
+    return next(s for s in msg["meta"]["steps"] if s["type"] == "orchestra")
+
+
+def first_user_text(c, chat_id):
+    return next(m for m in c.get(f"/api/chats/{chat_id}").json()["messages"] if m["role"] == "user")["content"]
+
+
+def test_planner_runs_a_task_graph(engine):
+    c = engine["client"]
+    chat = c.post("/api/chats", json={"harness": "agent"}).json()
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={
+        "text": "As a team: collect some greetings, then summarise them for me in one line."}).json()
+    assert wait_job(c, job["job_id"], timeout=120, approve="allow")["status"] == "done"
+    team = team_of(last_assistant(c, chat["id"]))
+    tasks = {t["id"]: t for t in team["tasks"]}
+    assert set(tasks) == {"t1", "t2"} and all(t["status"] == "done" for t in tasks.values()), team
+    assert tasks["t2"]["depends_on"] == ["t1"]
+    brief = first_user_text(c, tasks["t2"]["chat_id"])
+    assert "Results you build on" in brief and "### t1 Collect" in brief      # t2 started with t1's result
+    assert "team" in brief.lower() and team["folder"] in brief                 # and the shared team folder
+    assert any("Planned 2 tasks" in line["text"] for line in team["log"])
+    assert c.get(f"/api/chats/{tasks['t1']['chat_id']}").json()["parent_chat_id"] == chat["id"]
+
+
+def test_planner_sends_work_back_to_the_same_agent(engine):
+    c = engine["client"]
+    chat = c.post("/api/chats", json={"harness": "agent"}).json()
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={
+        "text": "As a team (retry-me): collect some greetings, then summarise them in one line."}).json()
+    assert wait_job(c, job["job_id"], timeout=120, approve="allow")["status"] == "done"
+    t1 = next(t for t in team_of(last_assistant(c, chat["id"]))["tasks"] if t["id"] == "t1")
+    assert t1["attempts"] == 2 and t1["status"] == "done"
+    users = [m["content"] for m in c.get(f"/api/chats/{t1['chat_id']}").json()["messages"] if m["role"] == "user"]
+    assert len(users) == 2 and users[1].startswith("The planner reviewed your result")   # same chat, same context
+
+
+def test_agents_can_ask_the_planner(engine):
+    c = engine["client"]
+    chat = c.post("/api/chats", json={"harness": "agent"}).json()
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={
+        "text": "As a team, ask the planner when unsure: collect greetings, then summarise them."}).json()
+    assert wait_job(c, job["job_id"], timeout=120, approve="allow")["status"] == "done"
+    t1 = next(t for t in team_of(last_assistant(c, chat["id"]))["tasks"] if t["id"] == "t1")
+    assert "use English" in t1["output"], t1
+
+
+def test_planner_keeps_simple_work_with_one_agent(engine):
+    c = engine["client"]
+    chat = c.post("/api/chats", json={"harness": "agent"}).json()
+    text = ("Please collect the greetings from the notes, analyse which ones sound friendliest, and write a short "
+            "report that compares them.")
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": text}).json()
+    assert wait_job(c, job["job_id"], timeout=60, approve="allow")["status"] == "done"
+    msg = last_assistant(c, chat["id"])
+    assert not any(s["type"] == "orchestra" for s in msg["meta"]["steps"])
+    assert c.get(f"/api/chats/{chat['id']}").json()["agents"] == []
+    c.put("/api/settings", json={"team_mode": "off"})
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "As a team: collect greetings, then summarise."}).json()
+    assert wait_job(c, job["job_id"], timeout=60, approve="allow")["status"] == "done"
+    assert not any(s["type"] == "orchestra" for s in last_assistant(c, chat["id"])["meta"]["steps"])
+    c.put("/api/settings", json={"team_mode": "auto"})
+
+
+def test_pause_and_resume_an_agent(engine):
+    c = engine["client"]
+    chat = c.post("/api/chats", json={"harness": "agent"}).json()
+    c.put(f"/api/chats/{chat['id']}", json={"auto_approve": True})
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "slowly list files please"}).json()
+    time.sleep(0.5)
+    assert c.post(f"/api/chats/{chat['id']}/pause", json={"reason": "checking something"}).json()["paused"]
+    time.sleep(2.5)
+    assert c.get(f"/api/jobs/{job['job_id']}").json()["status"] == "running"
+    assert c.get(f"/api/chats/{chat['id']}").json()["paused"]
+    c.post(f"/api/chats/{chat['id']}/resume")
+    assert wait_job(c, job["job_id"], timeout=60)["status"] == "done"
+    notes = [s["text"] for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "note"]
+    assert "Paused: checking something." in notes and "Resumed." in notes
+
+
+def test_code_errors_point_at_the_line_and_commands_run(tmp_path):
+    import asyncio
+    sys.path.insert(0, str(ENGINE))
+    from dva.tools import python_exec
+    from dva.tools import ToolContext
+
+    class DB:
+        def setting(self, key, default=None):
+            return default
+
+    class App:
+        db = DB()
+    ctx = ToolContext(app=App(), chat={"id": "c"}, project=None, workspace=tmp_path, folders=[str(tmp_path)],
+                      readonly=[], emit=lambda *a, **k: None, approve=None)
+    out = asyncio.run(python_exec.run_python(ctx, "x = 1\ny = 2\nprint(x / (y - 2))\n"))
+    assert out.startswith("FAILED") and ">>    3  print(x / (y - 2))" in out and "ZeroDivisionError" in out
+    out = asyncio.run(python_exec.run_python(ctx, "import not_a_real_module\n"))
+    assert "not installed in the app's Python" in out
+    cmd = "Write-Output hello" if os.name == "nt" else "echo hello && echo made > made.txt"
+    out = asyncio.run(python_exec.run_command(ctx, cmd))
+    assert out.startswith("exit code 0") and "hello" in out
+    if os.name != "nt":
+        assert "made.txt" in out
+    assert asyncio.run(python_exec.run_command(ctx, "exit 3")).startswith("FAILED (exit code 3)")
+
+
+# ---------------------------------------------------------------- 2.4.0: memory — past chats, knowledge, notes, isolation
+def say(c, chat_id, text, timeout=60):
+    job = c.post(f"/api/chats/{chat_id}/messages", json={"text": text}).json()
+    assert wait_job(c, job["job_id"], timeout=timeout, approve="allow")["status"] == "done"
+    return last_assistant(c, chat_id)
+
+
+def test_past_chats_are_searchable_with_isolated_projects_kept_apart(engine):
+    c = engine["client"]
+    old = c.post("/api/chats", json={"harness": "chat"}).json()
+    say(c, old["id"], "Our solar tender in Kisumu closes on the last Friday of March.")
+    secret = c.post("/api/projects", json={"name": "Private work"}).json()
+    c.put(f"/api/projects/{secret['id']}", json={"memory_mode": "isolated"})
+    inside = c.post("/api/chats", json={"harness": "chat", "project_id": secret["id"]}).json()
+    say(c, inside["id"], "The Zanzibar expansion plan stays confidential until June.")
+    # the sidebar search (the user's own) sees everything
+    found = c.get("/api/search", params={"q": "Kisumu tender"}).json()["results"]
+    assert found and found[0]["id"] == old["id"] and "Kisumu" in found[0]["matches"][0]["snippet"]
+    assert c.get("/api/search", params={"q": "Zanzibar"}).json()["results"][0]["id"] == inside["id"]
+    # an agent outside the isolated project finds the Kisumu chat but not the Zanzibar one
+    agent = c.post("/api/chats", json={"harness": "agent"}).json()
+    msg = say(c, agent["id"], "search earlier chats for Kisumu tender")
+    assert old["id"] in msg["content"]
+    msg = say(c, agent["id"], "search earlier chats for Zanzibar expansion")
+    assert "No earlier chat matches" in msg["content"]
+    # inside the isolated project it is found, and the global memory is not in the prompt
+    c.post("/api/memory", json={"scope": "global", "text": "Global note that must stay outside isolated projects"})
+    inner = c.post("/api/chats", json={"harness": "agent", "project_id": secret["id"]}).json()
+    assert inside["id"] in say(c, inner["id"], "search earlier chats for Zanzibar expansion")["content"]
+    prompt = say(c, inner["id"], "show system prompt")["content"]
+    assert "Global note that must stay outside" not in prompt and "About the user" not in prompt
+
+
+def test_project_knowledge_files_reach_the_prompt_and_search(engine):
+    c = engine["client"]
+    prj = c.post("/api/projects", json={"name": "Plants"}).json()
+    body = ("Annual report\n\nThe capacity factor of the Garissa solar plant was 23.4 percent in 2024.\n\n" +
+            "\n\n".join(f"Section {i}: maintenance schedules, staffing and procurement notes." for i in range(30)))
+    files = {"file": ("plants.md", body.encode(), "text/markdown")}
+    doc = c.post(f"/api/projects/{prj['id']}/knowledge", files=files).json()
+    for _ in range(50):
+        doc = next(d for d in c.get(f"/api/projects/{prj['id']}/knowledge").json()["docs"] if d["id"] == doc["id"])
+        if doc["status"] != "indexing":
+            break
+        time.sleep(0.1)
+    assert doc["status"] == "ready" and doc["chunks"] >= 2, doc
+    chat = c.post("/api/chats", json={"harness": "agent", "project_id": prj["id"]}).json()
+    prompt = say(c, chat["id"], "show system prompt: what was the capacity factor of the Garissa plant?")["content"]
+    assert "[plants.md]" in prompt and "23.4 percent" in prompt
+    found = say(c, chat["id"], "search knowledge for Garissa capacity factor")["content"]
+    assert "[plants.md]" in found and "Garissa" in found
+    bad = c.post(f"/api/projects/{prj['id']}/knowledge", files={"file": ("x.exe", b"MZ\0\0", "application/octet-stream")})
+    assert bad.status_code == 400
+    c.delete(f"/api/knowledge/{doc['id']}")
+    assert c.get(f"/api/projects/{prj['id']}/knowledge").json()["docs"] == []
+
+
+def test_project_notes_and_relevant_memory(engine):
+    c = engine["client"]
+    prj = c.post("/api/projects", json={"name": "Notes project"}).json()
+    c.put(f"/api/projects/{prj['id']}", json={"notes": "## Status\n- Kick-off done\n"})
+    chat = c.post("/api/chats", json={"harness": "agent", "project_id": prj["id"]}).json()
+    say(c, chat["id"], "note decision: we use PostgreSQL for the field data")
+    notes = c.get(f"/api/projects/{prj['id']}").json()["notes"]
+    assert "## Decisions" in notes and "we use PostgreSQL for the field data" in notes and "Kick-off done" in notes
+    assert "PostgreSQL" in say(c, chat["id"], "show system prompt")["content"]
+    # many notes: the relevant one still reaches the prompt even though it is the oldest
+    c.post("/api/memory", json={"scope": "project", "scope_id": prj["id"], "text": "Writes Kotlin coroutines for the field app"})
+    topics = ["gardening", "astronomy", "cycling", "chess", "pottery", "sailing", "baking", "violin", "hiking",
+              "birdwatching", "origami", "climbing", "fencing", "rowing", "knitting", "surfing", "archery", "skiing",
+              "judo", "calligraphy", "beekeeping", "kayaking", "juggling", "woodwork", "tennis", "rugby"]
+    for t in topics:
+        c.post("/api/memory", json={"scope": "project", "scope_id": prj["id"], "text": f"Enjoys {t} on most {t} weekends"})
+    prompt = say(c, chat["id"], "show system prompt: how should I structure kotlin coroutines here?")["content"]
+    assert "Kotlin coroutines" in prompt
+
+
+def test_search_by_meaning_with_the_search_model(engine):
+    c = engine["client"]
+    model = engine["tmp"] / "embed.gguf"
+    tiny_gguf(model, name="qwen3-embedding")
+    c.put("/api/settings", json={"embedding_model_path": str(model)})
+    status = c.get("/api/search/status").json()
+    assert status["model"]["path"] == str(model)
+    prj = c.post("/api/projects", json={"name": "Vectors"}).json()
+    files = {"file": ("grid.txt", b"Mini-grids in rural Turkana reach 4,000 households.\n\nTariffs are flat.", "text/plain")}
+    doc = c.post(f"/api/projects/{prj['id']}/knowledge", files=files).json()
+    for _ in range(100):
+        stats = c.get("/api/search/status").json()["index"]
+        if stats["passages_with_meaning"] >= 1:
+            break
+        time.sleep(0.2)
+    assert stats["passages_with_meaning"] >= 1, stats
+    chat = c.post("/api/chats", json={"harness": "agent", "project_id": prj["id"]}).json()
+    assert "Turkana" in say(c, chat["id"], "search knowledge for households turkana minigrids")["content"]
+    assert c.get("/api/search/status").json()["model"]["running"]
+    c.put("/api/settings", json={"embedding_model_path": ""})
+    c.delete(f"/api/knowledge/{doc['id']}")

@@ -6,8 +6,15 @@ scheduled tasks. Models run **on this computer** (llama.cpp, CPU or GPU) and, fr
 with the user's own API keys). **Auto** sends planning and hard reasoning to the strongest model and routine work to
 a local one; the "Lead and local workers" harness lets an online strategist plan and check while local agents do the
 parts in parallel. Online use has a monthly budget (warnings at 50 % and 80 %, then local only) and asks before files,
-attachments or memory leave the computer. Plugins are optional; Datavera is one of them (it runs the command-line
-agent in the repository root, which keeps working on its own).
+attachments or memory leave the computer.
+
+From 2.4.0, **teams are run by a planner**: it turns a multi-step request into tasks, starts each agent when the
+results it needs are ready, reads every result (accept, send back with feedback, message, pause, add work) and
+writes the answer — automatically in chats, projects and scheduled tasks when a request looks multi-step. Agents can
+run commands (tests, git, build tools) and fix their own code. **Memory** covers past chats (search by words, and by
+meaning with the optional search model), project knowledge files, living project notes, and per-project isolation.
+Plugins are optional; Datavera is one of them (it runs the command-line agent in the repository root, which keeps
+working on its own).
 
 KimiLM was called **Datavera Agent** up to 2.1.x. Version 2.2.0 renamed it; see "Upgrading from Datavera Agent".
 
@@ -102,3 +109,6 @@ signing certificate is added (`win.certificateFile` / Azure Trusted Signing in `
   daily, or prices typed in by the user); the provider's bill is the final word. Tested against stand-in servers
   that speak each provider's API; check each provider with a real key (Models → Online → Test) before relying on it.
   ChatGPT/Claude/Gemini subscriptions cannot be used; providers need API keys with billing.
+- Teams: the planner's quality decides the team's quality; small local planners make simpler plans. Tested with
+  stand-in models. A team of local agents on one model with "Simultaneous replies" 1 runs its tasks one at a time.
+- Knowledge files: scanned PDFs (no text layer) are not read; images inside documents are ignored.

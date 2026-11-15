@@ -11,6 +11,9 @@ Python 3.12, FastAPI on `127.0.0.1` (token-protected), SQLite, llama.cpp. Starte
 | `migration.py` | After the data folder moved from Datavera Agent: rewrites stored paths once (`migrated-from.json`) |
 | `app_state.py` | Wires the services; on start, queued follow-ups left from a closed app become "Not sent (the app was closed)"; `start_turn()` saves the user message and starts the turn as a task; `post_message()` handles follow-ups while a chat is busy (`queue` → run right after, `steer` → handed to the running agent at its next step; after Stop they stay unsent); per-chat limits (`chats.settings`) |
 | `runner.py` | One chat turn: builds the prompt (harness + project instructions + memory + skills index + summary), runs the harness (chat / agent / planner / research / team loop, or a pipeline), streams events, saves one assistant message with ordered `meta.steps`. `LoopGuard` stops loops in every tool-using turn: exact and near-duplicate calls are refused (searches: ≥60 % word overlap), per-tool caps (web_search 6 by default), a "change approach" note after 3 unproductive results, a forced write-up after 6 (or 5 refused repeats, or the time limit). After a successful change (file written, code run, connector action) earlier reads, listings and runs may be repeated, since their answer can differ; web calls stay blocked |
+| `orchestrator.py` | Teams (2.4.0): the planner turns a request into a task graph (goal, done_when, depends_on, role, harness, agent); a scheduler in code starts each task when the tasks it depends on are accepted (respecting agent slots and each model's simultaneous replies), passes their results and a shared team folder to it, and batches finished results into one planner call that accepts, retries with feedback in the same agent chat, messages or pauses running agents, cancels, rewrites or adds tasks, answers questions, or finishes. Agents get `team_board`, `wait_for` and `ask_lead`. Chats, projects and schedules hand multi-step requests to it automatically (`team_mode`: auto / always / off); team harnesses, the team builder and `delegate` always use it. `pause_chat` / `resume_chat` pause any agent loop at its next step (the model is released while paused) |
+| `knowledge.py` | Search (2.4.0): project knowledge files (extracted, split into ~1,200-character passages with page/slide/sheet labels, FTS5-indexed), past chats (FTS5 over messages via triggers) and memory relevance; hybrid keyword (BM25) + meaning (cosine) ranking by reciprocal-rank fusion; memory isolation per project; background vector pass while idle |
+| `embed.py` | The search model (2.4.0): Qwen3-Embedding-0.6B Q8_0 in its own CPU llama-server (`--embeddings --pooling last`), downloaded on request, started on demand, stopped after 5 idle minutes; vectors stored at 512 dims, float16 |
 | `providers.py` | Online providers (OpenAI, Anthropic, Google, OpenRouter, Moonshot, DeepSeek, Mistral, Groq, xAI, custom OpenAI-style endpoints): keys in the credential store, model lists with capabilities, chosen models (`cloud_models`: role, strength, effort, price), prices (OpenRouter catalogue, cached a day, or typed in), metering into `usage`, monthly budget with 50/80/100 % warnings |
 | `cloud.py` | Online model calls, ids `cloud:<provider>:<model>`: three adapters — OpenAI Responses (stateless, encrypted reasoning passed back), Anthropic Messages (thinking blocks + signatures kept across tool calls, prompt caching, schema answers via a forced tool), chat completions (Gemini thought signatures, DeepSeek/Kimi reasoning echo, OpenRouter reasoning details). Provider state rides on assistant messages as `_native` and is stripped for local models. Retries 429/5xx; drops a rejected parameter and retries once |
 | `router.py` | Auto: a complexity score (planning/strategy/review words up, routine words down, length, heavy harnesses) picks a strategist (strongest online or local) or a worker (local first); roles strategist / worker / both / off per model; respects privacy mode, budget and per-chat switches |
@@ -23,7 +26,7 @@ Python 3.12, FastAPI on `127.0.0.1` (token-protected), SQLite, llama.cpp. Starte
 | `tools/` | Built-in tools: files (sandboxed to granted folders + workspace; deletes go to `.trash`, edits keep `.backups`; reads PDF, Word, PowerPoint, Excel), web (DuckDuckGo html/lite, Mojeek, Bing with redirect decoding; results scored against the query's words so generic bot-check pages are dropped; real-browser fallback; explicit "NO RELEVANT RESULTS"; PDF pages read as text), `run_python`, memory, skills, schedules/harnesses, vision (`look_at_image`, `look_at_video`), `delegate` (helper agents in parallel) |
 | `mcp.py` | Connectors: one long-lived MCP session per connector in its own task; tool lists cached; approval by `readOnlyHint` (or name) |
 | `skills.py` / `harness.py` / `plugins.py` | Folders with `SKILL.md` / `harness.json` / `plugin.json`; built-in, plugin and user sources; upload/create/copy/export |
-| `memory.py` | Scopes global / project / chat / harness; idle learning pass; task lessons; skill-improvement suggestions; chat summaries |
+| `memory.py` | Scopes global / project / chat / harness; idle learning pass; task lessons; skill-improvement suggestions; chat summaries; 2.4.0: notes chosen by relevance to the request (pinned first), project notes (dated lines under Decisions / Status / Open questions), isolated projects never read or write global notes |
 | `jobs.py` / `scheduler.py` | Tasks (every turn, pipeline, scheduled run, plugin action) and cron schedules with plain-English input |
 | `services.py` | Starts the Playwright MCP browser helper for pipelines and the browser search fallback |
 | `secrets.py` | OS credential store (Windows Credential Manager) with a private-file fallback |
@@ -85,7 +88,10 @@ The installer copies the pipeline files into `pipeline/`; in development they ar
 - Anything that changes something (writes, Python, schedules, connector tools without `readOnlyHint`) asks first,
   unless the chat or scheduled task turns on auto-approve. Unanswered approvals decline after a timeout.
 - Memory refuses key/password/card-number-like text. Secrets never return to the UI after saving.
-- `run_python` is not sandboxed (it is the user's own computer); it is off-able in Settings and always asks.
+- `run_python` and `run_command` (PowerShell on Windows, no input, timeout) are not sandboxed (it is the user's own
+  computer); they are off-able in Settings ("run code") and always ask unless the chat auto-approves.
+- Memory isolation: a project with memory_mode "isolated" sees only its own chats, notes, files and memory; its chats
+  never appear in other chats' searches (the user's own sidebar search still finds them).
 - Online models (`cloud_privacy`): **ask** (default) — before an online model first sees memory notes, attachments
   or anything read from files, folders, images or Python output, the turn asks (`send_to_online_model`, never
   auto-approved); "Keep it on this computer" switches the turn to a local model. **local_unless_on** — online only in
@@ -100,6 +106,7 @@ cd engine
 ```
 Uses `tests/fake_llama_server.py` (scripted llama-server stand-in), `tests/fake_mcp_server.py` and
 `tests/fake_cloud_server.py` (OpenAI Responses, Anthropic Messages and Gemini-style chat stand-ins for
-`tests/test_online.py`; run everything with `-m pytest -q tests`). To also test a
+`tests/test_online.py`; run everything with `-m pytest -q tests`). The llama stand-in also plays the planner
+(plans with dependencies, a retry, answers to questions) and serves word-hash embeddings for the search tests. To also test a
 real llama-server: set `DVA_TEST_LLAMA_SERVER` (path to llama-server) and `DVA_TEST_GGUF` (any small GGUF;
 `tests/make_tiny_model.py` builds a random-weight one from llama.cpp's vocab files).

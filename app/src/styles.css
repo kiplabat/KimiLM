@@ -281,3 +281,30 @@ label.menu-item { flex-direction: row; }
 .data-table th { text-align: left; font-weight: 600; color: var(--text-soft); border-bottom: 1px solid var(--line); padding: 6px 8px; }
 .data-table td { border-bottom: 1px solid var(--line); padding: 6px 8px; }
 .data-table tr:last-child td { border-bottom: 0; }
+
+/* Teams run by the planner (2.4.0) */
+.gap-xs { gap: 3px; }
+.orch { border: 1px solid var(--line); border-radius: 12px; padding: 10px; display: flex; flex-direction: column; gap: 8px; background: var(--surface); margin: 6px 0; }
+.orch-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.orch-lanes { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 2px; }
+.orch-lane { display: flex; flex-direction: column; gap: 8px; min-width: 220px; flex: 1 1 0; }
+.orch-lane-title { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-soft); }
+.orch-task { border: 1px solid var(--line); border-left-width: 3px; border-radius: 10px; padding: 8px 10px; display: flex; flex-direction: column; gap: 3px; background: var(--surface-2); min-width: 0; }
+.orch-task.st-running, .orch-task.st-review { border-left-color: var(--coral); }
+.orch-task.st-done { border-left-color: var(--sage); }
+.orch-task.st-failed { border-left-color: var(--danger); }
+.orch-task.st-paused { border-left-color: #A85F00; }
+.orch-task.st-cancelled { opacity: .6; }
+.orch-note { color: var(--text-soft); font-style: italic; }
+.orch-output .md { margin-top: 4px; max-height: 260px; overflow: auto; }
+.orch-log { font-size: 12px; display: flex; flex-direction: column; gap: 3px; border-top: 1px solid var(--line); padding-top: 6px; max-height: 220px; overflow: auto; }
+
+/* Memory wave 2 (2.4.0): knowledge files, notes, search */
+.kb-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+.kb-row:last-of-type { border-bottom: 0; }
+.notes-view { max-height: 320px; overflow: auto; font-size: 13px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12.5px; }
+.side-hit { flex-direction: column; align-items: stretch; gap: 2px; }
+.side-hit .ellipsis { flex: none; }
+.side-snippet { font-size: 11.5px; color: var(--text-soft); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.side-snippet mark { background: rgba(255, 92, 58, .18); color: inherit; border-radius: 3px; padding: 0 1px; }

@@ -1,6 +1,6 @@
 {
   "name": "Lead and local workers",
-  "description": "The strongest model (often online) plans and splits the task, models on this computer do the parts at the same time, then the lead checks the results, sends fixes once if needed, and writes the answer.",
+  "description": "The strongest model (often online) plans the work as tasks, models on this computer do them — each starting when the results it needs are ready — and the planner reads every result, sends work back until it is right, and writes the answer.",
   "type": "loop",
   "mode": "team",
   "lead_role": "strategist",

@@ -6,8 +6,10 @@ Loop harnesses (mode):
   planner   short plan → each step with tools → final answer
   research  fixed stages run by code (plan searches → search → rank → read → download files → extract facts →
             cited report). The model only answers small questions, so it cannot loop.
-  team      a lead splits the task between agents that run in parallel (each its own chat, model and limits),
-            then combines their results.
+  team      a planner runs agents as a task graph (orchestrator.py): agents start when the results they need
+            are accepted, the planner reads every result and accepts, retries, messages, pauses or adds work, then
+            writes the answer. "agent" and "planner" turns hand multi-step requests to it automatically
+            (Settings → Teams), and the delegate tool uses it too.
 Pipeline harnesses: a Python program run as a task; its output streams into the chat.
 
 Every tool-using turn has a loop guard: repeated or near-identical calls are refused (the model is told why), tools
@@ -35,6 +37,7 @@ from .cloud import USAGE, CloudError
 from .db import new_id, now
 from .llm import LLMError, estimate_tokens
 from .mcp import tool_key
+from .orchestrator import Orchestra, looks_multistep, team_tools
 from .providers import is_cloud
 from .runtime import RuntimeError_
 from .tools import GROUPS, Tool, ToolContext, ToolDenied, ToolError, builtin_tools
@@ -43,11 +46,6 @@ TOOL_RESULT_LIMIT = 6000
 ROLES = ("worker", "strategist", "vision")
 ROLE_HELP = ("worker = a model on this computer for routine, well-defined parts; strategist = the strongest model "
              "(often online) for planning and hard reasoning; vision = a model that can see images and video.")
-REVIEW_SCHEMA = {"type": "object", "required": ["done"], "properties": {
-    "done": {"type": "boolean"},
-    "followups": {"type": "array", "maxItems": 3, "items": {"type": "object", "required": ["name", "task"], "properties": {
-        "name": {"type": "string", "maxLength": 40}, "task": {"type": "string", "maxLength": 900},
-        "role": {"enum": list(ROLES)}}}}}}
 PLAN_SCHEMA_STEP = {"type": "object", "required": ["title"], "properties": {
     "title": {"type": "string", "maxLength": 90}, "detail": {"type": "string", "maxLength": 300}}}
 TEXT_TOOLCALL = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
@@ -60,12 +58,15 @@ Be direct and practical. Use Markdown. Never invent file contents, numbers or so
 AGENT_RULES = """You can use tools. Use one when it helps; otherwise just answer. After tool results, continue until \
 the task is done, then give a clear final answer (what you did, what you found, where files are).
 Never repeat a tool call you already made; if something did not work twice, try a different approach or answer with \
-what you have. If a search says NO RELEVANT RESULTS, do not search for the same thing again.
+what you have. When code or a command fails, read the error, fix the cause and run it again; check results before \
+you rely on them. If a search says NO RELEVANT RESULTS, do not search for the same thing again.
 Changes (writing files, running code, scheduling, connector actions that change things) are shown to the user for \
 approval by the app; if one is declined, do not retry it — explain or choose another way."""
 
 
 _PRIVATE_TOOLS = None
+PRIVATE_MEMORY_TOOLS = {"search_chats": "chats", "read_chat": "chats", "search_knowledge": "knowledge",
+                        "search_memory": "memory"}
 
 
 def private_tool_names():
@@ -73,7 +74,8 @@ def private_tool_names():
     global _PRIVATE_TOOLS
     if _PRIVATE_TOOLS is None:
         from .tools import builtin_tools
-        _PRIVATE_TOOLS = {t.name for t in builtin_tools() if t.group in ("files", "vision", "python")}
+        _PRIVATE_TOOLS = {t.name for t in builtin_tools() if t.group in ("files", "vision", "python")} | \
+            set(PRIVATE_MEMORY_TOOLS)
     return _PRIVATE_TOOLS
 
 
@@ -284,7 +286,9 @@ class Turn:
         return mid if mid and not is_cloud(mid) else None
 
     PRIVATE_LABELS = {"memory": "your memory notes", "attachments": "the files you attached",
-                      "files": "what it read from files and folders on this computer"}
+                      "files": "what it read from files and folders on this computer",
+                      "knowledge": "passages from the project's knowledge files",
+                      "notes": "the project's notes", "chats": "text from your earlier chats"}
 
     async def before_model_call(self, messages):
         """Before anything goes to an online model: the monthly budget (Auto falls back to local models) and the
@@ -408,6 +412,9 @@ class Turn:
         tools = [t for t in builtin_tools() if t.group in groups]
         if "agents" in groups:
             tools.append(self._delegate_tool())
+        team = self.app.team_of_chat.get(self.chat["id"])
+        if team:                                   # this chat is an agent in a running team
+            tools += team_tools(team[0], team[1], self)
         connector_ids = list(self.chat.get("connectors") or []) or list((self.project or {}).get("connectors") or [])
         connector_tools = []
         if self.harness.get("connectors", True) and connector_ids:
@@ -473,24 +480,36 @@ class Turn:
                        and h.get("mode") not in ("team",) and h.get("enabled", True)]
 
         async def delegate(ctx, tasks):
+            """Runs through the orchestrator: tasks that need others' results wait for them, and this agent (as the
+            planner) reads every result before accepting it, so helpers never run uncoordinated."""
             if not isinstance(tasks, list) or not tasks:
                 raise ToolError("Give a list of tasks")
-            agents = [{"name": str(t.get("name") or f"Agent {i}")[:40], "task": str(t.get("task") or "")[:1500],
-                       "harness": t.get("harness") if t.get("harness") in harness_ids else "agent",
-                       "role": t.get("role") if t.get("role") in ROLES else None}
-                      for i, t in enumerate(tasks[:int(self.db.setting("max_parallel_agents", 4))], 1)]
-            self.assign_models(agents)
-            await self.drop_model()        # free this model's memory slot while the agents work
+            items = [{"id": str(t.get("id") or f"t{i}"), "name": str(t.get("name") or f"Agent {i}")[:40],
+                      "goal": str(t.get("task") or "")[:1500], "done_when": str(t.get("done_when") or "")[:300],
+                      "depends_on": t.get("depends_on") or [],
+                      "harness": t.get("harness") if t.get("harness") in harness_ids else "agent",
+                      "role": t.get("role") if t.get("role") in ROLES else None}
+                     for i, t in enumerate(tasks[:int(self.db.setting("max_team_tasks", 8))], 1)]
+            orch = Orchestra(self, overall=self.last_user_text())
+            if not orch.preset(items):
+                raise ToolError("Each task needs a 'task' text")
+            system = (getattr(self, "loop_messages", None) or [{"role": "system", "content": ""}])[0]
             try:
-                results = await self.run_agents(agents, overall=self.last_user_text())
+                done = await orch.drive([system, {"role": "user", "content": self.last_user_text()}])
             finally:
                 await self.hold_model()
-            return "\n\n".join(f"## {r['name']} ({r['status']})\n{r['content'][:2500]}" for r in results)
-        return Tool("delegate", "Hand independent parts of the task to other agents that work at the same time, "
-                    "each in its own chat. Use only for parts that do not depend on each other. Returns their results.",
-                    {"type": "object", "required": ["tasks"], "properties": {"tasks": {"type": "array", "maxItems": 6,
+            budget = max(1500, 9000 // max(1, len(orch.tasks)))
+            return (f"{len(done)} of {len(orch.tasks)} tasks accepted.\n\n" + orch.results_text(budget) +
+                    f"\n\nShared team folder: {orch.dir}")
+        return Tool("delegate", "Hand parts of the task to other agents, each in its own chat. Tasks without "
+                    "depends_on run at the same time; a task with depends_on starts when those tasks' results are "
+                    "ready and receives them. You read every result before it is accepted. Returns their results.",
+                    {"type": "object", "required": ["tasks"], "properties": {"tasks": {"type": "array", "maxItems": 8,
                      "items": {"type": "object", "required": ["name", "task"], "properties": {
+                         "id": {"type": "string", "description": "short id such as t1, used in depends_on"},
                          "name": {"type": "string"}, "task": {"type": "string"},
+                         "done_when": {"type": "string", "description": "how to tell the result is good enough"},
+                         "depends_on": {"type": "array", "items": {"type": "string"}},
                          "harness": {"enum": harness_ids},
                          "role": {"enum": list(ROLES), "description": ROLE_HELP}}}}}},
                     delegate, "agents", label="Start agents",
@@ -507,9 +526,11 @@ class Turn:
                                     today=datetime.now().strftime("%A %d %B %Y"),  # date only: a changing prefix defeats prompt caching
                                     os=f"{platform.system()} {platform.release()}")]
         if self.chat.get("parent_chat_id"):
-            parts.append(f"You are “{self.chat.get('agent_name') or 'an agent'}”, one member of a team working in "
-                         "parallel. Do only your part, then reply with a clear, self-contained result (facts, numbers, "
-                         "file paths) that the team lead can combine with the others' results.")
+            parts.append(f"You are “{self.chat.get('agent_name') or 'an agent'}”, one agent in a team run by a "
+                         "planner. Do only your task, then reply with a clear, self-contained result (facts, numbers, "
+                         "file paths) that the planner can check and combine with the other agents' results."
+                         + (" You can read the team board, wait for a teammate's result, or ask the planner."
+                            if "team_board" in self.tool_map else ""))
         if tools:
             parts.append(AGENT_RULES)
             folders = self.folders()
@@ -520,11 +541,21 @@ class Turn:
             parts.append(self.harness["system_prompt"].strip())
         if self.project and (self.project.get("instructions") or "").strip():
             parts.append(f"Project “{self.project['name']}” instructions:\n{self.project['instructions'].strip()}")
-        if self.harness.get("memory", True):
-            mem = self.app.memory.context(self.chat, self.project, self.harness["id"])
-            if mem:
-                self.private.add("memory")
-                parts.append(mem + "\nUse these when relevant; the user can edit them on the Memory page.")
+        recall = getattr(self, "recall_blocks", {})
+        if recall.get("memory"):
+            self.private.add("memory")
+            parts.append(recall["memory"] + "\nUse these when relevant; the user can edit them on the Memory page.")
+        if recall.get("notes"):
+            self.private.add("notes")
+            parts.append(recall["notes"])
+        if recall.get("knowledge"):
+            self.private.add("knowledge")
+            parts.append(recall["knowledge"])
+        if "search_chats" in self.tool_map:
+            parts.append("When I refer to something from an earlier conversation, look it up with search_chats and "
+                         "read_chat instead of guessing." + (" This project has knowledge files: use "
+                                                             "search_knowledge to look things up in them."
+                                                             if recall.get("has_docs") else ""))
         if "load_skill" in self.tool_map:
             index = self.app.skills.index()
             if index:
@@ -620,7 +651,9 @@ class Turn:
         if total <= budget * 0.85 or len(messages) <= 3:
             if total > budget:  # one huge message: trim it
                 last = messages[-1]
-                last["content"] = last["content"][: max(2000, int(budget * 3.2))] + "\n…(trimmed to fit the model's memory)"
+                limit = max(2000, int(budget * 3.2))
+                if isinstance(last["content"], str) and len(last["content"]) > limit:   # only when something is cut
+                    last["content"] = last["content"][:limit] + "\n…(trimmed to fit the model's memory)"
             return messages
         keep = messages[-3:]
         older = messages[:-3]
@@ -665,7 +698,7 @@ class Turn:
                     raise TurnStopped("No model is installed yet. Open Models and download one (the recommended "
                                       "one is marked).")
                 if self.harness.get("mode") == "team":
-                    await self.run_team()
+                    await self.run_orchestra()
                 else:
                     await self.hold_model()
                     await self.run_loop()
@@ -724,7 +757,33 @@ class Turn:
                                harness=self.harness)
         return self.ctx
 
+    async def recall(self):
+        """Memory, project notes and knowledge passages for this request (chosen by relevance, so it is async)."""
+        blocks = {}
+        query = self.last_user_text()
+        if self.harness.get("memory", True):
+            try:
+                blocks["memory"] = await self.app.memory.context(self.chat, self.project, self.harness["id"], query)
+            except Exception as exc:
+                self.app.log(f"memory context: {type(exc).__name__}: {exc}")
+            if self.project and self.app.memory.enabled(self.project):
+                notes = (self.project.get("notes") or "").strip()
+                if notes:
+                    blocks["notes"] = (f"Project notes (kept by the user and you; add decisions and status with "
+                                       f"update_project_notes):\n{notes[-4000:]}")
+                blocks["has_docs"] = bool(self.db.one("SELECT 1 FROM kb_docs WHERE project_id=? AND status='ready'",
+                                                      (self.project["id"],)))
+                if blocks["has_docs"] and query:
+                    try:
+                        blocks["knowledge"], n = await self.app.knowledge.knowledge_block(self.project, query)
+                        if n:
+                            self.status(f"Found {n} matching passage{'s' if n > 1 else ''} in the project's files")
+                    except Exception as exc:
+                        self.app.log(f"knowledge passages: {type(exc).__name__}: {exc}")
+        self.recall_blocks = blocks
+
     async def base_messages(self, tools):
+        await self.recall()
         system = self.system_prompt(tools)
         history = self.history()
         history = await self.fit_history(system, tools, history)
@@ -737,6 +796,12 @@ class Turn:
         mode = self.harness.get("mode", "agent")
         tools = await self.build_tools() if mode != "research" else []
         messages = await self.base_messages(tools)
+        if mode in ("agent", "planner") and tools and self.wants_team():
+            orch = Orchestra(self)
+            if await orch.plan(messages, allow_direct=self.db.setting("team_mode", "auto") != "always"):
+                await orch.drive(messages)
+                return await orch.final(messages)
+            self.status("Working…")
         if mode == "research":
             await self.run_research(messages)
         elif mode == "chat" or not tools:
@@ -850,6 +915,8 @@ class Turn:
                 ok = True
                 if tool.group in ("files", "vision", "python"):
                     self.private.add("files")
+                if call["name"] in PRIVATE_MEMORY_TOOLS:
+                    self.private.add(PRIVATE_MEMORY_TOOLS[call["name"]])
             except ToolDenied as exc:
                 result, ok = str(exc), False
                 step["declined"] = True
@@ -869,9 +936,51 @@ class Turn:
             result = result[:TOOL_RESULT_LIMIT] + f"\n…(trimmed; {len(result) - TOOL_RESULT_LIMIT:,} more characters)"
         return result
 
+    def wants_team(self):
+        """Should the planner look at this request? Cheap filter first; the planner can still say 'direct'."""
+        if self.chat.get("parent_chat_id") or "delegate" not in self.tool_map or \
+                (self.job.get("payload") or {}).get("no_team"):
+            return False
+        mode = self.db.setting("team_mode", "auto")
+        return mode == "always" or (mode == "auto" and looks_multistep(self.last_user_text()))
+
+    async def wait_if_paused(self):
+        """Paused by the user or the planner: give the model back and wait (the time does not count)."""
+        p = self.app.pauses.get(self.chat["id"])
+        if not p or p["event"].is_set():
+            return
+        reason = p.get("reason") or "paused"
+        began = time.monotonic()
+        self.note(f"Paused: {reason}.")
+        self.status(f"Paused: {reason}")
+        await self.drop_model()
+        await p["event"].wait()
+        self.guard.deadline += time.monotonic() - began
+        self.note("Resumed.")
+        await self.hold_model()
+
+    async def run_orchestra(self):
+        """Team harnesses and the composer's team builder: the planner always runs a team."""
+        spec = [dict(a) for a in (self.job.get("payload", {}).get("team") or []) if a.get("name")]
+        await self.hold_model()
+        self.new_ctx()
+        messages = await self.base_messages([])
+        orch = Orchestra(self, roster=spec or None)
+        if spec and all((a.get("task") or "").strip() for a in spec):
+            orch.preset([{"id": f"t{i}", "name": a["name"], "agent": a["name"], "goal": a["task"],
+                          "harness": a.get("harness"), "model": a.get("model"), "limits": a.get("limits"),
+                          "role": a.get("role")} for i, a in enumerate(spec, 1)])
+            orch.logline(f"Your team: {len(orch.tasks)} agents with their own tasks.")
+        else:
+            await orch.plan(messages, allow_direct=False)
+        await orch.drive(messages)
+        await orch.final(messages)
+
     async def agent_loop(self, messages, tools, max_steps):
         use_json = self.harness.get("tool_mode") == "json"
+        self.loop_messages = messages
         for step in range(max_steps):
+            await self.wait_if_paused()
             self.take_steer(messages)
             reason = self.guard.should_stop()
             if reason:
@@ -1165,186 +1274,9 @@ class Turn:
             if mid:
                 a["model"] = mid
 
-    @staticmethod
-    def _joined(results, budget):
-        return "\n\n".join(f"### {r['name']} — {r['status']}\nTask: {r['task']}\n\n{r['content'][:budget]}"
-                           for r in results)
-
-    async def review_round(self, messages, joined, question):
-        """The lead checks the workers' results once and sends up to three fixes back to workers."""
-        self.status("The lead is checking the results…")
-        try:
-            check = (await self.complete(messages + [{"role": "user", "content": (
-                f"Your team's results:\n\n{joined}\n\nCheck them against my request. If something is missing, wrong or "
-                "too weak to rely on, give up to 3 follow-up tasks (self-contained, with the details a worker needs) "
-                f"to fix it; otherwise set done to true. Roles: {ROLE_HELP} JSON only.")}],
-                schema=REVIEW_SCHEMA, max_tokens=1000, temperature=0.2))["json"]
-        except LLMError:
-            return []
-        fixes = [f for f in check.get("followups") or [] if (f.get("task") or "").strip()][:3]
-        if check.get("done") or not fixes:
-            self.note("The lead checked the results: nothing to redo.")
-            return []
-        self.note(f"The lead asked for {len(fixes)} fix{'es' if len(fixes) > 1 else ''}: "
-                  + "; ".join(f.get("name") or "?" for f in fixes))
-        agents = [{"name": (f.get("name") or f"Fix {i}")[:40], "task": f["task"][:1500], "harness": "agent",
-                   "role": f.get("role") or "worker"} for i, f in enumerate(fixes, 1)]
-        self.assign_models(agents)
-        await self.drop_model()
-        try:
-            return await self.run_agents(agents, overall=question)
-        finally:
-            await self.hold_model()
-
     def team_harnesses(self):
         return [h for h in self.app.harnesses.all() if h.get("type") == "loop" and h.get("mode") != "team"
                 and h.get("enabled", True)]
-
-    async def run_team(self):
-        spec = list(self.job.get("payload", {}).get("team") or [])
-        max_agents = int(self.db.setting("max_parallel_agents", 4))
-        harness_ids = [h["id"] for h in self.team_harnesses()]
-        question = self.last_user_text()
-        await self.hold_model()
-        self.new_ctx()
-        messages = await self.base_messages([])
-        missing = [a for a in spec if not (a.get("task") or "").strip()]
-        if not spec or missing:
-            self.status("Splitting the work between agents…")
-            names = [a.get("name") or f"Agent {i}" for i, a in enumerate(spec, 1)]
-            item = {"type": "object", "required": ["name", "task"], "properties": {
-                "name": {"enum": names} if spec else {"type": "string", "maxLength": 40},
-                "task": {"type": "string", "maxLength": 900},
-                "harness": {"enum": harness_ids}, "role": {"enum": list(ROLES)}}}
-            count = len(spec) if spec else None
-            schema = {"type": "object", "required": ["agents"], "properties": {"agents": {
-                "type": "array", "items": item, "minItems": count or 1, "maxItems": count or max_agents}}}
-            hint = ("Agents: " + ", ".join(f"{a.get('name')} (harness {a.get('harness') or 'agent'})" for a in spec)
-                    if spec else f"Use 2 to {max_agents} agents.")
-            options = "; ".join(f"{h['id']}: {h.get('description', '')[:80]}" for h in self.team_harnesses())
-            try:
-                planned = (await self.complete(messages + [{"role": "user", "content": (
-                    "You lead a team of agents that work at the same time on separate parts of my request. Split it "
-                    f"into independent tasks, one per agent. {hint} Each task must be self-contained (include the "
-                    f"details the agent needs) and should not depend on another agent's result. Harnesses: {options}. "
-                    f"Roles: {ROLE_HELP} JSON only.")}], schema=schema, max_tokens=1200, temperature=0.2))["json"]["agents"]
-            except LLMError:
-                planned = [{"name": n, "task": question, "harness": "agent"} for n in (names or ["Agent 1"])]
-            by_name = {p["name"]: p for p in planned}
-            if spec:
-                for a in spec:
-                    p = by_name.get(a.get("name")) or {}
-                    a["task"] = (a.get("task") or "").strip() or p.get("task") or question
-                    a["harness"] = a.get("harness") or p.get("harness") or "agent"
-                    a["role"] = a.get("role") or p.get("role")
-            else:
-                spec = planned
-        self.assign_models(spec)
-        await self.drop_model()     # do not hold memory while the agents work
-        results = await self.run_agents(spec, overall=question)
-        await self.hold_model()
-        budget = max(1500, int((self.server.plan["ctx"] - self.max_reply - 2500) * 3 / max(1, len(results) + 3)))
-        joined = self._joined(results, budget)
-        if self.harness.get("review"):
-            more = await self.review_round(messages, joined, question)
-            if more:
-                results += more
-                joined = self._joined(results, budget)
-        self.status("Combining the agents' results…")
-        messages.append({"role": "user", "content": f"Your team has finished. Their results:\n\n{joined}\n\nCombine "
-                         "them into one answer to my request. Keep facts, numbers, sources and file paths; point out "
-                         "disagreements between agents and anything that failed or is missing."})
-        self.text = []
-        await self.stream_text(messages, None)
-
-    async def run_agents(self, agents, overall=""):
-        """Start agents as child chats (in parallel, up to the configured number at a time) and wait for them."""
-        parent = self.chat
-        max_parallel = int(self.db.setting("max_parallel_agents", 4))
-        team_step = {"type": "team", "agents": []}
-        self.steps.append(team_step)
-        sem = asyncio.Semaphore(max_parallel)
-        rows = []
-        for i, a in enumerate(agents):
-            model = a.get("model") or self.model_id
-            if model and not self.app.models.get_any(model):
-                model = self.model_id
-            row = {"name": a.get("name") or f"Agent {i + 1}", "task": a.get("task") or overall,
-                   "harness": a.get("harness") or "agent", "model": model, "limits": a.get("limits") or {},
-                   "status": "waiting", "chat_id": None, "job_id": None, "progress": "", "content": ""}
-            rows.append(row)
-        team_step["agents"] = rows
-        shared = {}
-        for r in rows:
-            shared[r["model"]] = shared.get(r["model"], 0) + 1
-        for model, n in shared.items():
-            m = self.app.models.get_any(model) or {}
-            if n > 1 and not is_cloud(model) and int((m.get("settings") or {}).get("parallel") or 1) < n:
-                self.note(f"{n} agents use {m.get('name') or model}; with its current 'Simultaneous replies' setting "
-                          f"({int((m.get('settings') or {}).get('parallel') or 1)}) they take turns. Raise it in Models → "
-                          "settings to run them truly at the same time (needs more memory).")
-
-        def publish():
-            for r in rows:
-                if r["job_id"] and r["status"] in ("running", "waiting_approval"):
-                    r["progress"] = self.app.jobs.live.get(r["job_id"], r["progress"])
-            self.emit("team", agents=[{k: r[k] for k in ("name", "task", "harness", "model", "status", "chat_id",
-                                                           "progress")} for r in rows])
-
-        async def one(r):
-            async with sem:
-                from .app_state import clean_limits
-                chat = self.app.create_chat(project_id=parent.get("project_id"), title=f"{r['name']}: {r['task'][:60]}",
-                                            model=r["model"], harness=r["harness"], connectors=parent.get("connectors"),
-                                            folders=self.folders(), origin="agent", settings=clean_limits(r["limits"]),
-                                            parent_chat_id=parent["id"], agent_name=r["name"])
-                r["chat_id"] = chat["id"]
-                text = (f"Overall request (for context): {overall[:1500]}\n\nYour task: {r['task']}" if overall and
-                        overall.strip() != r["task"].strip() else r["task"])
-                job = self.app.start_turn(chat["id"], text, kind="agent", payload={"auto_approve": self.auto_approve})
-                r["job_id"], r["status"] = job["id"], "running"
-                publish()
-                task = self.app.jobs.tasks.get(job["id"])
-                if task:
-                    try:
-                        await asyncio.shield(task)
-                    except asyncio.CancelledError:
-                        if not task.done():
-                            self.app.jobs.cancel(job["id"])
-                        raise
-                    except Exception:
-                        pass
-                status = (self.db.get("jobs", job["id"]) or {}).get("status") or "done"
-                msg = self.db.one("SELECT content, meta_json FROM messages WHERE chat_id=? AND role='assistant' "
-                                  "ORDER BY created DESC, rowid DESC LIMIT 1", (chat["id"],))
-                r["content"] = (msg or {}).get("content") or ((msg or {}).get("meta") or {}).get("error") or "(no result)"
-                if any(s.get("type") == "tool" and s.get("name") in private_tool_names()
-                       for s in ((msg or {}).get("meta") or {}).get("steps", [])):
-                    self.private.add("files")      # its result may quote your files: ask before it goes online
-                r["status"] = "done" if status == "done" and not ((msg or {}).get("meta") or {}).get("error") else \
-                    ("stopped" if status == "cancelled" else "failed")
-                publish()
-
-        self.status(f"{len(rows)} agents are working…")
-        publish()
-        tasks = [asyncio.create_task(one(r)) for r in rows]
-        try:
-            while not all(t.done() for t in tasks):
-                await asyncio.wait(tasks, timeout=1.5)
-                publish()
-                done = sum(r["status"] in ("done", "failed", "stopped") for r in rows)
-                self.status(f"Agents: {done}/{len(rows)} finished")
-        except asyncio.CancelledError:
-            for t in tasks:
-                t.cancel()
-            for r in rows:
-                if r["job_id"]:
-                    self.app.jobs.cancel(r["job_id"])
-            raise
-        for t in tasks:
-            if not t.cancelled() and t.exception():
-                self.note(f"An agent could not start: {t.exception()}")
-        return rows
 
     # ------------------------------------------------------------------ pipelines
     async def pipeline_inputs(self, user_text):

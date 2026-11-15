@@ -2,11 +2,12 @@
 
 type "loop"      the model works in a loop with tools. mode = chat (no tools) | agent (tools, step limit) |
                  planner (writes a short plan, then does each step, then reports) | research (fixed research
-                 stages run by the app: search, read, download, notes, cited report) | team (a lead splits the work
-                 between agents that run in parallel, then combines their results). A team harness may set
-                 lead_role "strategist" (the lead is the strongest model, often online), worker_role (the role
-                 agents get a model by: "worker" runs them on this computer when possible) and review (the lead
-                 checks the results once and sends up to three fixes back to workers).
+                 stages run by the app: search, read, download, notes, cited report) | team (a planner runs agents
+                 as a task graph — see orchestrator.py: each agent starts when the results it needs are accepted,
+                 and the planner reads every result and accepts it, sends it back, or changes the plan). A team
+                 harness may set lead_role "strategist" (the planner is the strongest model, often online) and
+                 worker_role (the role agents get a model by: "worker" runs them on this computer when possible).
+                 review is kept for older harness files: the planner always reads every result now.
 type "pipeline"  a fixed sequence of steps written in Python (like the Datavera dataset publisher). The model is
                  asked only bounded questions inside it; the engine runs it as a task and streams its progress.
 

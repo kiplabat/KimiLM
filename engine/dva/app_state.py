@@ -5,9 +5,11 @@ from datetime import datetime
 
 from .cloud import Cloud
 from .db import DB, new_id, now
+from .embed import Embedder
 from .events import EventBus
 from .harness import Harnesses
 from .jobs import Jobs
+from .knowledge import Knowledge
 from .llm import LLM
 from .mcp import Connectors
 from .memory import Memory
@@ -31,6 +33,7 @@ DEFAULT_SETTINGS = {
     "allow_python": True, "approval_timeout_minutes": 360, "max_native_tools": 28, "python_timeout_seconds": 180,
     "max_loaded_models": 3, "browser_search": True, "max_parallel_agents": 4, "turn_time_limit_minutes": 30,
     "cloud_privacy": "ask", "cloud_budget_monthly": 10.0, "cloud_max_parallel": 4,
+    "team_mode": "auto", "max_team_tasks": 8, "team_time_limit_minutes": 120,
 }
 CHAT_LIMIT_KEYS = ("max_reply_tokens", "max_steps", "time_limit_minutes", "temperature", "max_searches",
                    "max_tool_calls")
@@ -62,10 +65,15 @@ class App:
         self.models.providers = self.providers
         self.router = Router(self)
         self.memory = Memory(self)
+        self.embedder = Embedder(self)
+        self.knowledge = Knowledge(self)
         self.jobs = Jobs(self)
         self.scheduler = Scheduler(self)
         self.services = Services(self)
         self.approvals = {}
+        self.pauses = {}          # chat id -> {"event", "reason"}: paused agent loops (orchestrator.pause_chat)
+        self.orchestras = {}      # chat id -> running Orchestra (a team led from that chat)
+        self.team_of_chat = {}    # agent chat id -> (Orchestra, task id)
         self._bg = []
         for key, value in DEFAULT_SETTINGS.items():
             if self.db.setting(key) is None:
@@ -97,7 +105,8 @@ class App:
 
     async def start(self):
         self.bus.loop = asyncio.get_running_loop()
-        self._bg = [asyncio.create_task(self.scheduler.loop()), asyncio.create_task(self.runtime.idle_watch())]
+        self._bg = [asyncio.create_task(self.scheduler.loop()), asyncio.create_task(self.runtime.idle_watch()),
+                    asyncio.create_task(self.knowledge.loop())]
         self.log(f"engine started; data {self.paths.data}; secrets backend {self.secrets.backend}")
 
     async def stop(self):
@@ -106,6 +115,7 @@ class App:
         await self.jobs.shutdown()
         await self.connectors.shutdown()
         await self.services.shutdown()
+        await self.embedder.stop()
         await self.runtime.shutdown()
         self.log("engine stopped")
 

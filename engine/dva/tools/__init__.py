@@ -87,7 +87,7 @@ def builtin_tools():
 GROUPS = {
     "files": "Read, search and write files in the chat's folders",
     "web": "Search the web and read pages",
-    "python": "Run Python code (data analysis, conversions)",
+    "python": "Run Python code and commands (data analysis, tests, git, build tools)",
     "memory": "Remember and recall facts",
     "skills": "Load skills and create new ones",
     "automation": "Create scheduled tasks and harnesses",
