@@ -314,30 +314,43 @@ function LiveTurn({ live, onDecide }: any) {
   );
 }
 
-// The plan of the reply being written (or of the last reply): a planned run's steps, or a Planner harness's plan.
+// Progress is part of every chat (2.7.0): what the reply is doing now, its plan when it has one, and what it used.
+// A planned run shows its steps; a Planner harness its plan; any other reply shows the things it did (tool calls).
 function progressOf(live: any, lastAssistant: any) {
-  const orch = live ? live.orchestra : [...(lastAssistant?.meta?.steps || [])].reverse().find((s: any) => s.type === "orchestra");
+  const steps = live ? live.steps || [] : lastAssistant?.meta?.steps || [];
+  const stats = live ? null : lastAssistant?.meta?.stats;
+  const base = { files: [] as string[], models: [] as any[], log: [] as any[], stats, status: live?.status || "", running: !!live, kind: "activity" };
+  const orch = live ? live.orchestra : [...steps].reverse().find((s: any) => s.type === "orchestra");
   if (orch?.tasks?.length) {
-    const items = orch.tasks.map((t: any) => ({
-      id: t.id, name: t.name, status: t.paused && t.status === "running" ? "paused" : t.status, partial: t.partial,
-      detail: t.status === "running" ? (t.progress || "working") : t.status === "waiting" ? (t.wait_reason || "") : t.note || "",
-      sub: [t.attempts > 1 ? `round ${t.attempts}${t.rounds ? ` of ${t.rounds}` : ""}` : "", taskCost(t)].filter(Boolean).join(" · "),
-      chat_id: t.chat_id,
-    }));
+    const items = orch.tasks.map((t: any) => {
+      const u = t.used || {};
+      return {
+        id: t.id, name: t.name, status: t.paused && t.status === "running" ? "paused" : t.status, partial: t.partial,
+        detail: t.status === "running" ? (t.progress || "working") : t.status === "waiting" ? (t.wait_reason || "") : t.note || "",
+        sub: [t.attempts > 1 ? `round ${t.attempts}${t.rounds ? ` of ${t.rounds}` : ""}` : "", taskCost(t)].filter(Boolean).join(" · "),
+        timeline: u.calls ? `read ${fmtTokens(u.read || 0)} · from cache ${fmtTokens(u.cached || 0)} · wrote ${fmtTokens(u.written || 0)} · ${u.calls} model call${u.calls === 1 ? "" : "s"}${u.tools ? ` · ${u.tools} tool${u.tools === 1 ? "" : "s"}` : ""}` : "",
+        chat_id: t.chat_id,
+      };
+    });
     const files: string[] = Array.from(new Set(orch.tasks.flatMap((t: any) => [...(t.files || []), ...(t.result_file ? [t.result_file] : [])])));
-    return { items, files, models: orch.models || [], folder: orch.folder, totals: orch.totals, log: orch.log || [] };
+    return { ...base, kind: "run", items, files, models: orch.models || [], folder: orch.folder, totals: orch.totals, log: orch.log || [] };
   }
   const plan = live ? live.plan : lastAssistant?.meta?.plan;
   if (plan?.length) {
-    return { items: plan.map((s: any, i: number) => ({ id: String(i + 1), name: s.title, detail: s.detail || "",
-      status: s.state === "done" ? "done" : s.state === "doing" || (live && live.current === i) ? "running" : s.state === "skipped" ? "cancelled" : "waiting" })),
-      files: [], models: [], log: [] };
+    return { ...base, kind: "plan", items: plan.map((s: any, i: number) => ({ id: String(i + 1), name: s.title, detail: s.detail || "",
+      status: s.state === "done" ? "done" : s.state === "doing" || (live && live.current === i) ? "running" : s.state === "skipped" ? "cancelled" : "waiting" })) };
   }
-  return null;
+  const items = steps.filter((s: any) => s.type === "tool" || s.type === "error" || s.type === "pipeline").map((s: any, i: number) => ({
+    id: s.id || String(i), name: s.type === "error" ? "Problem" : s.type === "pipeline" ? `Run ${s.harness}` : (s.label || s.name),
+    detail: s.type === "error" ? s.text : (s.summary || ""),
+    status: s.type === "error" ? "failed" : s.state === "running" ? "running" : s.state === "error" || s.ok === false ? "failed" : s.state === "denied" ? "cancelled" : "done",
+  }));
+  return { ...base, items };
 }
 
 function progressLabel(p: any) {
   const n = p.items.length;
+  if (p.kind === "activity") return p.running ? (n ? `Working · ${n} step${n === 1 ? "" : "s"}` : "Working") : "Progress";
   const settled = p.items.filter((i: any) => ["done", "failed", "cancelled"].includes(i.status)).length;
   const at = p.items.findIndex((i: any) => ["running", "review", "paused"].includes(i.status));
   if (at >= 0) return `Step ${at + 1} of ${n}`;
@@ -345,14 +358,25 @@ function progressLabel(p: any) {
   return `Step ${Math.min(settled + 1, n)} of ${n}`;
 }
 
-function ProgressPanel({ progress, onClose }: any) {
+function ProgressPanel({ progress, openRun, onResume, onDismiss, onClose }: any) {
   const open = (path: string) => desktop ? desktop.openPath(path) : window.open(fileUrl(path));
   const base = (path: string) => path.split(/[\\/]/).pop();
   const lastLog = progress.log?.length ? progress.log[progress.log.length - 1] : null;
+  const st = progress.stats;
+  const total = st ? (st.prompt_tokens || 0) + (st.cached_tokens || 0) : 0;
   return (
     <div className="side-panel progress-panel">
-      <div className="panel-head"><b>Progress</b><button className="icon-btn" title="Close" onClick={onClose}><X size={16} /></button></div>
+      <div className="panel-head"><b>Progress</b>
+        <button className="icon-btn" title="Hide (the Progress button at the top of the chat brings it back)" onClick={onClose}><ChevronRight size={16} /></button></div>
       <div className="panel-list">
+        {progress.running && <div className="progress-now"><Loader2 size={14} className="spin accent" /><span>{progress.status || "Working…"}</span></div>}
+        {openRun && <div className="progress-resume">
+          <div className="small">This run stopped after {openRun.done} of {openRun.total} steps{openRun.next ? <>. Next: <b>{openRun.next}</b></> : null}.</div>
+          <div className="row gap-s"><Button small icon={<Play size={13} />} onClick={onResume}>Continue run</Button><Button small kind="ghost" onClick={onDismiss}>Dismiss</Button></div>
+        </div>}
+        {progress.items.length === 0 && !progress.running && <div className="small muted pad-x progress-empty">
+          Nothing is running. When KimiLM works on a message, its plan and each thing it does appear here.</div>}
+        {progress.items.length > 0 && <div className="small progress-used-title">{progress.kind === "run" ? "Plan" : progress.kind === "plan" ? "Plan" : progress.running ? "What it is doing" : "What the last reply did"}</div>}
         <div className="progress-steps">
           {progress.items.map((it: any) => (
             <div key={it.id} className={`progress-step ps-${it.status}`} onClick={() => it.chat_id && go("chat", it.chat_id)}
@@ -361,12 +385,18 @@ function ProgressPanel({ progress, onClose }: any) {
               <div className="progress-text">
                 <div className="progress-name">{it.name}</div>
                 {it.sub && <div className="small muted">{it.sub}</div>}
+                {it.timeline && <div className="small muted">{it.timeline}</div>}
                 {it.detail && <div className={`small ${it.status === "running" ? "accent" : "muted"} clamp-2`}>{it.partial ? "Incomplete: " : ""}{it.detail}</div>}
               </div>
             </div>
           ))}
         </div>
         {lastLog && <div className="small muted pad-x progress-last">{lastLog.text}</div>}
+        {st && total > 0 && <div className="progress-used">
+          <div className="small progress-used-title">This reply</div>
+          <div className="small muted pad-x">read {fmtTokens(st.prompt_tokens || 0)} · from cache {fmtTokens(st.cached_tokens || 0)} ({Math.round(100 * (st.cached_tokens || 0) / total)}%) · wrote {fmtTokens(st.output_tokens || 0)}</div>
+          <div className="small muted pad-x">{fmtDuration(st.seconds || 0)}{st.tokens_per_second ? ` · ${st.tokens_per_second} tokens a second` : ""}{st.model_calls ? ` · ${st.model_calls} model call${st.model_calls === 1 ? "" : "s"}` : ""}</div>
+        </div>}
         {(progress.models.length > 0 || progress.files.length > 0 || progress.folder) && <div className="progress-used">
           <div className="small progress-used-title">Used in this run</div>
           {progress.totals?.tokens ? <div className="small muted pad-x">{fmtTokens(progress.totals.tokens)} tokens · {fmtDuration(progress.totals.seconds || 0)}</div> : null}
@@ -384,6 +414,14 @@ function ProgressPanel({ progress, onClose }: any) {
       </div>
     </div>
   );
+}
+
+// Progress is open unless you closed it; the choice is remembered for all chats on this computer.
+function progressPref(): boolean {
+  try {
+    const v = window.localStorage.getItem("kimilm.progress");
+    return v === null ? window.innerWidth >= 1000 : v === "1";
+  } catch { return true; }
 }
 
 function FilesPanel({ chatId, onClose }: any) {
@@ -436,7 +474,8 @@ export default function ChatView({ chatId }: { chatId: string }) {
   const [live, setLive] = useState<any>(null);
   const [learned, setLearned] = useState<any[]>([]);
   const [showFiles, setShowFiles] = useState(false);
-  const [showProgress, setShowProgress] = useState(false);
+  const [showProgress, setShowProgressRaw] = useState<boolean>(progressPref);
+  const setShowProgress = (v: boolean) => { setShowProgressRaw(v); try { window.localStorage.setItem("kimilm.progress", v ? "1" : "0"); } catch { /* private mode */ } };
   const [menu, setMenu] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
   const bottom = useRef<HTMLDivElement>(null);
@@ -539,6 +578,8 @@ export default function ChatView({ chatId }: { chatId: string }) {
   if (!chat) return <div className="center-screen"><Spinner /></div>;
   const project = projects.find((p: any) => p.id === chat.project_id);
   const running = !!live || !!chat.running_job;
+  const resumeRun = async () => { try { await api.post(`/chats/${chatId}/run/resume`); load(); } catch (e: any) { toast(e.message, "error"); } };
+  const dismissRun = async () => { try { await api.post(`/chats/${chatId}/run/dismiss`); load(); } catch (e: any) { toast(e.message, "error"); } };
   const lastAssistant = [...chat.messages].reverse().find((m: any) => m.role === "assistant");
   const progress = progressOf(live, lastAssistant);
   const pending = chat.messages.filter((m: any) => m.meta?.pending);
@@ -565,9 +606,10 @@ export default function ChatView({ chatId }: { chatId: string }) {
             {running && (chat.paused
               ? <Button small icon={<Play size={13} />} onClick={() => api.post(`/chats/${chatId}/resume`)} title="Continue from where it paused">Resume</Button>
               : <Button small kind="ghost" icon={<Pause size={13} />} onClick={() => api.post(`/chats/${chatId}/pause`, { reason: "paused by you" })} title="Pause at the next step (a team pauses all its agents); the model is freed while paused">Pause</Button>)}
-            {progress && <button className={`chip progress-chip${showProgress ? " on" : ""}`} title="Show the plan and its progress" onClick={() => { setShowProgress(!showProgress); setShowFiles(false); }}>
-              <ListChecks size={14} /> {progressLabel(progress)}</button>}
-            <button className="icon-btn" title="Chat files" onClick={() => { setShowFiles(!showFiles); setShowProgress(false); }}><Paperclip size={16} /></button>
+            <button className={`chip progress-chip${showProgress && !showFiles ? " on" : ""}`} title={showProgress && !showFiles ? "Hide progress" : "Show progress: the plan, what is being done now, and what was used"}
+              onClick={() => { if (showFiles) { setShowFiles(false); setShowProgress(true); } else setShowProgress(!showProgress); }}>
+              {progress.running ? <Loader2 size={14} className="spin accent" /> : <ListChecks size={14} />} {progressLabel(progress)}</button>
+            <button className="icon-btn" title="Chat files" onClick={() => setShowFiles(!showFiles)}><Paperclip size={16} /></button>
             <div className="popover-wrap">
               <button className="icon-btn" onClick={() => setMenu(!menu)}><MoreHorizontal size={18} /></button>
               {menu && (
@@ -591,6 +633,10 @@ export default function ChatView({ chatId }: { chatId: string }) {
               : <AssistantMessage key={m.id} msg={m} isLast={m.id === lastAssistant?.id && !running}
                   onRetry={async () => { try { await api.post(`/chats/${chatId}/retry`); load(); } catch (e: any) { toast(e.message, "error"); } }} />)}
             {live && <LiveTurn live={live} onDecide={decide} />}
+            {!running && chat.open_run && <div className="run-banner">
+              <span><Workflow size={14} /> This run stopped after {chat.open_run.done} of {chat.open_run.total} steps{chat.open_run.status === "interrupted" ? " (the app was closed or restarted)" : ""}. The accepted steps are kept.</span>
+              <span className="row gap-s"><Button small icon={<Play size={13} />} onClick={resumeRun}>Continue run</Button><Button small kind="ghost" onClick={dismissRun}>Dismiss</Button></span>
+            </div>}
             {pending.map((m: any) => <UserMessage key={m.id} m={m} chatId={chatId} />)}
             {learned.length > 0 && (
               <div className="learned" onClick={() => go("memory")}>
@@ -614,7 +660,7 @@ export default function ChatView({ chatId }: { chatId: string }) {
             </>} />
         </div>
       </div>
-      {showProgress && progress && <ProgressPanel progress={progress} onClose={() => setShowProgress(false)} />}
+      {showProgress && !showFiles && <ProgressPanel progress={progress} openRun={!running ? chat.open_run : null} onResume={resumeRun} onDismiss={dismissRun} onClose={() => setShowProgress(false)} />}
       {showFiles && <FilesPanel chatId={chatId} onClose={() => setShowFiles(false)} />}
     </div>
   );

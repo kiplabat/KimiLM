@@ -706,7 +706,7 @@ class Turn:
             return
         mode = self.harness.get("mode", "agent")
         team_mode = self.db.setting("team_mode", "auto")
-        likely = mode == "team" or (mode in ("agent", "planner") and (
+        likely = mode == "team" or bool((self.job.get("payload") or {}).get("resume_run")) or (mode in ("agent", "planner") and (
             team_mode == "always" or (team_mode == "auto" and looks_multistep(self.last_user_text()))))
         if not likely:
             return
@@ -807,7 +807,7 @@ class Turn:
         self.db.update("chats", self.chat["id"], {"updated": now()})
         self.emit("assistant_end", content=content, meta=meta)
         if not error and not stopped and self.harness.get("learn", True) and self.harness.get("type") != "pipeline" \
-                and not self.chat.get("parent_chat_id"):
+                and not self.chat.get("parent_chat_id") and self.chat.get("origin") != "eval":
             self.app.memory.schedule_learning(self.chat["id"])
 
     def new_ctx(self):
@@ -897,6 +897,8 @@ class Turn:
         mode = self.harness.get("mode", "agent")
         tools = await self.build_tools() if mode != "research" else []
         messages = await self.base_messages(tools)
+        if await self.continue_run(messages):
+            return
         if mode in ("agent", "planner") and tools and self.wants_team():
             orch = Orchestra(self, fit=self.run_fit)
             if await orch.plan(messages, allow_direct=self.db.setting("team_mode", "auto") != "always"):
@@ -1119,12 +1121,29 @@ class Turn:
         self.note("Resumed.")
         await self.hold_model()
 
+    async def continue_run(self, messages):
+        """This turn continues a run that was stopped or cut off (the Resume button, or automatically when the
+        app starts): no new plan, accepted steps are kept, the rest runs. True when it did."""
+        run_id = (self.job.get("payload") or {}).get("resume_run")
+        row = self.db.get("runs", run_id) if run_id else None
+        if not row or not (row.get("state") or {}).get("tasks"):
+            return False
+        orch = Orchestra.restore(self, row, fit=self.run_fit)
+        try:
+            await orch.drive(messages)
+            await orch.final(messages)
+        finally:
+            orch.close()
+        return True
+
     async def run_orchestra(self):
         """Team harnesses and the composer's team builder: the planner always runs a team."""
         spec = [dict(a) for a in (self.job.get("payload", {}).get("team") or []) if a.get("name")]
         await self.hold_model()
         self.new_ctx()
         messages = await self.base_messages([])
+        if await self.continue_run(messages):
+            return
         orch = Orchestra(self, roster=spec or None, fit=self.run_fit)
         if spec and all((a.get("task") or "").strip() for a in spec):
             orch.preset([{"id": f"t{i}", "name": a["name"], "agent": a["name"], "goal": a["task"],

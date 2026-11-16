@@ -1291,3 +1291,116 @@ def test_real_llama_server_restores_a_prompt_snapshot():
     finally:
         c.post("/api/shutdown")
         proc.wait(timeout=20)
+
+
+# ---------------------------------------------------------------- 2.7.0: runs that continue, lean steps, evaluation
+def test_a_stopped_run_continues_from_its_accepted_steps(engine):
+    """Stop a run while its second step works; Resume runs steps 2 and 3 and does not repeat step 1."""
+    c = engine["client"]
+    chat = c.post("/api/chats", json={"harness": "agent"}).json()
+    job = c.post(f"/api/chats/{chat['id']}/messages",
+                 json={"text": "As a team with a forgetful plan (slow-steps): find, summarise, publish."}).json()
+    for _ in range(300):                                  # until the second agent has started
+        if len(c.get(f"/api/chats/{chat['id']}").json()["agents"]) >= 2:
+            break
+        time.sleep(0.05)
+    c.post(f"/api/jobs/{job['job_id']}/cancel")
+    assert wait_job(c, job["job_id"])["status"] == "cancelled"
+    run = c.get(f"/api/chats/{chat['id']}").json()["open_run"]
+    assert run and run["status"] == "stopped" and (run["done"], run["total"]) == (1, 3), run
+    assert run["next"] == "Summarise"
+    first_agents = [a["id"] for a in c.get(f"/api/chats/{chat['id']}").json()["agents"]]
+    again = c.post(f"/api/chats/{chat['id']}/run/resume").json()
+    assert wait_job(c, again["job_id"], timeout=120)["status"] == "done"
+    team = team_of(last_assistant(c, chat["id"]))
+    tasks = {t["id"]: t for t in team["tasks"]}
+    assert all(t["status"] == "done" for t in tasks.values()), tasks
+    assert tasks["t1"]["chat_id"] == first_agents[0] and tasks["t1"]["attempts"] == 1      # not run again
+    assert tasks["t2"]["chat_id"] not in first_agents and tasks["t2"]["attempts"] == 1     # the cut-off try is not counted
+    assert any(line["text"].startswith("Continuing this run: 1 of 3") for line in team["log"])
+    assert "### t1 Find" in first_user_text(c, tasks["t2"]["chat_id"])                     # it got step 1's saved result
+    assert c.get(f"/api/chats/{chat['id']}").json()["open_run"] is None
+    users = [m for m in c.get(f"/api/chats/{chat['id']}").json()["messages"] if m["role"] == "user"]
+    assert len(users) == 1                                                                 # no second request was added
+    assert c.post(f"/api/chats/{chat['id']}/run/resume").status_code == 400                # nothing left to continue
+
+
+def test_a_step_gets_only_the_tools_its_goal_needs(engine):
+    from dva.orchestrator import lean_kit
+    assert lean_kit("Read notes.txt and list the names") == ["files"]
+    assert lean_kit("Search the web for the latest tariff and compute the average with Python") == ["files", "web", "python"]
+    assert lean_kit("Look at the screenshot and describe it") == ["files", "vision"]
+    assert lean_kit("Compute the totals", ["files", "web"]) == ["files"]         # never more than its harness has
+    c = engine["client"]
+    _, status, msg = run_team(c, "As a team with a forgetful plan: find greetings, summarise them, publish.")
+    assert status == "done"
+    tasks = {t["id"]: t for t in team_of(msg)["tasks"]}
+    assert tasks["t1"]["kit"] == ["files"] and "web" in tasks["t3"]["kit"], tasks          # "publish" may need the web
+    # the timeline of each step: what it read, took from the cache and wrote
+    assert all(set(("read", "cached", "written", "calls", "tools")) <= set(t["used"]) for t in tasks.values())
+
+
+def test_the_evaluation_runs_tasks_and_keeps_the_numbers(engine):
+    c = engine["client"]
+    listing = c.get("/api/evals").json()
+    assert len(listing["tasks"]) == 12 and listing["current"] is None
+    started = c.post("/api/evals/run", json={"only": ["calc", "summary"]}).json()
+    assert started["total"] == 2
+    assert c.post("/api/evals/run", json={}).status_code == 400                            # one at a time
+    assert wait_job(c, started["job_id"], timeout=120)["status"] == "done"
+    run = c.get("/api/evals").json()["runs"][0]
+    assert run["id"] == started["id"] and run["status"] == "done" and run["version"]
+    assert sorted(r["id"] for r in run["results"]) == ["calc", "summary"]
+    for r in run["results"]:
+        assert isinstance(r["passed"], bool) and r["seconds"] >= 0 and r["chat_id"] and "read" in r, r
+    assert run["summary"]["ran"] == 2 and run["summary"]["total"] == 2 and 0 <= run["summary"]["passed"] <= 2
+    listed = {x["id"] for x in c.get("/api/chats").json()["chats"]} if isinstance(c.get("/api/chats").json(), dict) \
+        else {x["id"] for x in c.get("/api/chats").json()}
+    assert not ({r["chat_id"] for r in run["results"]} & listed)                           # not in the chat list
+
+
+def test_the_evaluation_checks_judge_files_and_replies(tmp_path):
+    from dva import evals
+    by_id = {t["id"]: t for t in evals.TASKS}
+
+    def folder(task_id):
+        d = tmp_path / task_id
+        d.mkdir()
+        for name, text in by_id[task_id]["files"].items():
+            (d / name).write_text(text, encoding="utf-8")
+        return d
+    assert evals.check_sum(None, "The total is 1,284.")[0] and not evals.check_sum(None, "1,248")[0]
+    d = folder("bug")
+    assert not evals.check_bug(d, "")[0]                                   # the bug is still there
+    (d / "buggy.py").write_text("def mean(values):\n    return sum(values) / len(values)\n", encoding="utf-8")
+    (d / "test_buggy.py").write_text("print('OK')\n", encoding="utf-8")    # a cheated test is replaced by the real one
+    assert evals.check_bug(d, "")[0]
+    d = folder("fizz")
+    (d / "out.txt").write_text("\n".join(["1", "2", "Fizz", "4", "Buzz", "Fizz", "7", "8", "Fizz", "Buzz", "11",
+                                           "Fizz", "13", "14", "FizzBuzz"]) + "\n", encoding="utf-8")
+    assert evals.check_fizz(d, "")[0]
+    d = folder("config")
+    assert not evals.check_config(d, "")[0]
+    (d / "config.ini").write_text(evals.CONFIG.replace("port = 8080", "port = 9090"), encoding="utf-8")
+    assert evals.check_config(d, "")[0]
+    (d / "config.ini").write_text(evals.CONFIG.replace("8080", "9090"), encoding="utf-8")   # changed the note too
+    assert not evals.check_config(d, "")[0]
+    d = folder("sort")
+    assert not evals.check_sorted(d, "")[0]
+    for sub, names in (("data", ("a.csv", "b.csv")), ("notes", ("todo.txt", "ideas.txt"))):
+        (d / sub).mkdir()
+        for n in names:
+            (d / n).rename(d / sub / n)
+    assert evals.check_sorted(d, "")[0]
+    d = folder("invoice")
+    (d / "invoice.json").write_text('{"number": "INV-2031", "date": "2026-03-14", "total": 18450.0}', encoding="utf-8")
+    assert evals.check_invoice(d, "")[0]
+    assert evals.check_diff(None, "Line 7 differs.")[0] and not evals.check_diff(None, "line 17")[0]
+    assert evals.check_summary(None, "Begun in 2019, the programme connected 42% of households.")[0]
+    d = folder("report")
+    (d / "report.md").write_text("| North | 165 |\n| South | 122 |\n| East | 355 |\n", encoding="utf-8")
+    assert evals.check_report(d, "")[0]
+    assert evals.Evals.summary([{"passed": True, "read": 100, "cached": 300, "written": 20, "seconds": 3.2},
+                                {"passed": False}], 12) == {
+        "passed": 1, "ran": 2, "total": 12, "seconds": 3, "read": 100, "cached": 300, "written": 20,
+        "agent_tokens": 0, "cache_percent": 75}

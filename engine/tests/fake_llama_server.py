@@ -218,7 +218,8 @@ def structured(schema, body):
             return {"approach": "team", "reason": "three steps", "final": "all parts", "tasks": [
                 {"id": "t1", "name": "Find", "goal": "say hello" + (" then explode" if "explode-first" in users else ""),
                  "done_when": "a greeting"},
-                {"id": "t2", "name": "Summarise", "goal": "summarise what t1 found", "done_when": "one line"},
+                {"id": "t2", "name": "Summarise", "goal": "summarise what t1 found" + (" slowly" if "slow-steps" in users else ""),
+                 "done_when": "one line"},
                 {"id": "t3", "name": "Publish", "goal": "publish the summary", "done_when": "a report"}]}
         if "team" in allowed and ("direct" not in allowed or "as a team" in users):
             agents = props["tasks"]["items"]["properties"].get("agent", {}).get("enum")
@@ -289,6 +290,9 @@ async def chat(request: Request):
     if "hang-once" in said and HUNG is not None and not HUNG.exists():
         HUNG.write_text("hung once")
         time.sleep(40)                              # a stuck model: no bytes at all
+    if "slowly" in text_of(body["messages"][-1].get("content")).split("Done when")[0].split("Your task")[-1] \
+            and "Your task" in said:
+        time.sleep(4)                               # a step that takes a while (tests stop a run in the middle)
     if "explode" in text_of(body["messages"][-1].get("content")).split("Done when")[0].split("Your task")[-1] \
             and "Your task" in said:
         return JSONResponse({"error": {"message": "the fake model exploded"}}, 500)

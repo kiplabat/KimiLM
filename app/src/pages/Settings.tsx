@@ -1,8 +1,59 @@
 import React, { useEffect, useState } from "react";
 import { FolderOpen } from "lucide-react";
 import { api, desktop } from "../api";
-import { useApp } from "../store";
+import { go, useApp } from "../store";
 import { Badge, Button, Field, FolderInput, PageHeader, Toggle } from "../components/ui";
+
+// The built-in evaluation: twelve small tasks with answers that code checks. It turns "is this setup good?" into
+// numbers that can be compared between models, settings and versions.
+function EvaluationCard() {
+  const { toast } = useApp();
+  const [data, setData] = useState<any>(null);
+  const [open, setOpen] = useState<string | null>(null);
+  const load = () => api.get("/evals").then(setData).catch(() => {});
+  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    if (!data?.current) return;
+    const t = setInterval(load, 3000);
+    return () => clearInterval(t);
+  }, [!!data?.current]);
+  const dur = (sec: number) => sec < 90 ? `${Math.round(sec)} s` : sec < 5400 ? `${Math.round(sec / 60)} min` : `${(sec / 3600).toFixed(1)} h`;
+  const k = (n: number) => n >= 10000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n || 0);
+  const run = async () => { try { await api.post("/evals/run", {}); load(); } catch (e: any) { toast(e.message, "error"); } };
+  return (
+    <div className="card stack-s">
+      <h3>Check this setup</h3>
+      <p className="muted small">Runs {data?.tasks?.length || 12} small tasks (reading and computing, writing and editing files, fixing code, finding things, summarising, one planned run) with your default model and checks each answer in code. No internet, nothing personal, approvals off inside the test folder only. Use it to compare models, settings and versions on this computer. On a slow laptop it can take an hour or more.</p>
+      <div className="row gap-m wrap">
+        {data?.current
+          ? <><span className="small"><b>Running:</b> task {data.current.done + 1} of {data.current.total} · {data.current.task}</span>
+              <Button small kind="ghost" onClick={async () => { await api.post("/evals/stop"); load(); }}>Stop</Button></>
+          : <Button small onClick={run}>Run the evaluation</Button>}
+      </div>
+      {data?.runs?.length > 0 && <div className="eval-runs">
+        <div className="eval-row eval-head small muted"><span>When</span><span>Version</span><span>Model</span><span>Passed</span><span>Time</span><span>Read</span><span>From cache</span><span>Written</span></div>
+        {data.runs.map((r: any) => (
+          <div key={r.id}>
+            <div className="eval-row small" onClick={() => setOpen(open === r.id ? null : r.id)} title="Show each task">
+              <span>{new Date(r.created).toLocaleString()}</span><span>{r.version}</span><span className="ellipsis">{r.model || "default"}</span>
+              <span><b>{r.summary?.passed ?? 0} of {r.summary?.total ?? "?"}</b>{r.status !== "done" ? ` (${r.status})` : ""}</span>
+              <span>{dur(r.summary?.seconds || 0)}</span><span>{k(r.summary?.read)}</span><span>{r.summary?.cache_percent ?? 0}%</span><span>{k(r.summary?.written)}</span>
+            </div>
+            {open === r.id && <div className="eval-tasks">
+              {(r.results || []).map((t: any) => (
+                <div key={t.id} className="eval-task small" onClick={() => t.chat_id && go("chat", t.chat_id)} title="Open the chat of this task">
+                  <span className={t.passed ? "ok" : "bad"}>{t.passed ? "passed" : "failed"}</span>
+                  <span>{t.title}{t.planned ? " (planned run)" : ""}</span>
+                  <span className="muted">{dur(t.seconds || 0)} · {t.tools || 0} tool{t.tools === 1 ? "" : "s"}{!t.passed && t.expected ? ` · expected ${t.expected}` : ""}{t.error ? ` · ${String(t.error).slice(0, 80)}` : ""}</span>
+                </div>
+              ))}
+            </div>}
+          </div>
+        ))}
+      </div>}
+    </div>
+  );
+}
 
 export default function Settings() {
   const { boot, refreshBoot, toast } = useApp();
@@ -52,6 +103,7 @@ export default function Settings() {
           </Field>
         </div>
       </div>
+      <EvaluationCard />
       <div className="card stack-s">
         <h3>Doing less work</h3>
         <p className="muted small">A model on this computer spends most of its time reading. These settings make it read less: what it has read once is kept, and what it is given to read follows how fast this computer reads.</p>
@@ -94,12 +146,24 @@ export default function Settings() {
         <Toggle checked={s.verify_results ?? true} onChange={(v: boolean) => set({ verify_results: v })} label="Check every step's result against its 'done when' before the next step starts" />
         <Toggle checked={s.plan_approval ?? false} onChange={(v: boolean) => set({ plan_approval: v })} label="Ask me before a plan starts (scheduled tasks and auto-approved chats start right away)" />
         <Toggle checked={s.unload_after_run ?? false} onChange={(v: boolean) => set({ unload_after_run: v })} label="Unload the planner's model as well when a run ends (scheduled runs always do)" />
+        <Toggle checked={(s.resume_runs || "ask") === "auto"} onChange={(v: boolean) => set({ resume_runs: v ? "auto" : "ask" })} label="Continue runs that were cut off (app closed, restart, crash) by themselves when the app starts; otherwise the chat offers a Continue button" />
+        <Toggle checked={s.lean_tools ?? true} onChange={(v: boolean) => set({ lean_tools: v })} label="Give each step only the tools its goal calls for (all of them on a fresh attempt)" />
+        <Toggle checked={s.escalate_models ?? true} onChange={(v: boolean) => set({ escalate_models: v })} label="Move a step to a stronger model when it fails the same way twice" />
+        <Field label="Who checks results" help="A smaller model checks in a fraction of the time, but may judge less well. Run the evaluation below with each choice and compare.">
+          <select className="input" value={s.check_model || ""} onChange={(e) => set({ check_model: e.target.value })}>
+            <option value="">The planner's model (recommended)</option>
+            <option value="smallest">The smallest installed model</option>
+          </select>
+        </Field>
         <div className="row gap-m wrap">
           <Field label="Rounds per step" help="Tries before the best attempt is kept. Steps the planner marks as loops get two more.">
             <input className="input narrow" type="number" min={1} max={8} value={s.step_rounds ?? 3} onChange={(e) => set({ step_rounds: Number(e.target.value) })} />
           </Field>
           <Field label="Restart a silent model after (seconds)" help="No new token for this long means the model is stuck: it is restarted and the call is made again.">
             <input className="input narrow" type="number" min={30} value={s.stall_timeout_seconds ?? 180} onChange={(e) => set({ stall_timeout_seconds: Number(e.target.value) })} />
+          </Field>
+          <Field label="Writing time per result (seconds)" help="Steps are asked for a result this long at the computer's writing speed; longer material goes to a file. 0 = no hint.">
+            <input className="input narrow" type="number" min={0} step={30} value={s.writing_budget_seconds ?? 180} onChange={(e) => set({ writing_budget_seconds: Number(e.target.value) })} />
           </Field>
           <Field label="Agents at once" help="Only when steps run side by side.">
             <input className="input narrow" type="number" min={1} max={8} value={s.max_parallel_agents ?? 4} onChange={(e) => set({ max_parallel_agents: Number(e.target.value) })} />

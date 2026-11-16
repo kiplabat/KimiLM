@@ -344,3 +344,18 @@ label.menu-item { flex-direction: row; }
 .progress-last { padding-bottom: 8px; }
 .progress-used { border-top: 1px solid var(--line); margin-top: 4px; padding: 10px 0 8px; }
 .progress-used-title { font-weight: 600; padding: 0 12px 6px; }
+/* 2.7.0: Progress is part of every chat; continuing a run */
+.progress-now { display: flex; gap: 8px; align-items: center; padding: 6px 12px 10px; font-size: 13px; }
+.progress-empty { padding-top: 6px; padding-bottom: 10px; line-height: 1.5; }
+.progress-resume { margin: 2px 12px 12px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; display: flex; flex-direction: column; gap: 8px; background: var(--surface-2); }
+.run-banner { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; margin: 10px 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); font-size: 13.5px; }
+.run-banner > span:first-child { display: inline-flex; gap: 8px; align-items: center; }
+@media (max-width: 900px) { .progress-panel { width: 260px; } }
+.eval-runs { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.eval-row { display: grid; grid-template-columns: 1.5fr .6fr 1.6fr .9fr .7fr .6fr .8fr .7fr; gap: 10px; padding: 8px 12px; align-items: center; cursor: pointer; border-top: 1px solid var(--line); }
+.eval-row.eval-head { cursor: default; border-top: none; background: var(--surface-2); }
+.eval-row:not(.eval-head):hover { background: var(--surface-2); }
+.eval-tasks { padding: 4px 12px 10px 24px; display: flex; flex-direction: column; gap: 2px; }
+.eval-task { display: grid; grid-template-columns: 60px 1.2fr 2fr; gap: 10px; padding: 4px 6px; border-radius: 6px; cursor: pointer; }
+.eval-task:hover { background: var(--surface-2); }
+
