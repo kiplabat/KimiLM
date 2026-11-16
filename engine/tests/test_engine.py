@@ -1157,3 +1157,137 @@ def test_the_forecast_sizes_the_context():
     assert rt.fit("m", 9000) == {"ctx": 12288, "parallel": 1}
     assert rt.fit("m", 500000)["ctx"] == 65536            # never more than the user's own setting
     assert rt.fit("m", 100)["ctx"] == CTX_STEPS[0]
+
+
+# ---------------------------------------------------------------- 2.6.0: doing less work
+def test_a_reloaded_model_gets_its_prompt_back_from_a_snapshot(engine):
+    """The agent's system prompt and tool list are read once and saved. After the model is unloaded and loaded
+    again (which 2.5.0 does as soon as nothing needs it), they come from the file, not from reading."""
+    c = engine["client"]
+    mid = model_id(c)
+    c.post("/api/runtime/snapshots/clear")
+    c.post("/api/runtime/unload", json={})
+    first = c.post("/api/chats", json={"harness": "agent"}).json()
+    say(c, first["id"], "hello there")
+    info = c.get("/api/runtime").json()
+    now_loaded = next(m for m in info["loaded"] if m["model_id"] == mid)
+    assert now_loaded["snapshot"] and now_loaded["snapshot"]["restored"] is False, now_loaded
+    assert info["snapshots"]["files"] >= 1 and info["snapshots"]["saved"] >= 1, info["snapshots"]
+    assert now_loaded["cache_ram_mb"] and 256 <= info["cache_ram_mb"] <= 2048
+    c.post("/api/runtime/unload", json={})                          # a new server process: nothing in memory
+    second = c.post("/api/chats", json={"harness": "agent"}).json()
+    msg = say(c, second["id"], "hello again")
+    info = c.get("/api/runtime").json()
+    now_loaded = next(m for m in info["loaded"] if m["model_id"] == mid)
+    assert now_loaded["snapshot"]["restored"] is True and now_loaded["snapshot"]["tokens"] > 300, now_loaded
+    stats = msg["meta"]["stats"]
+    assert stats["cached_tokens"] > 3 * stats["prompt_tokens"], stats      # almost nothing was read again
+    assert info["snapshots"]["restored"] >= 1 and info["snapshots"]["tokens_restored"] > 300
+    # switching snapshots off stops using them; deleting them works
+    assert c.post("/api/runtime/snapshots/clear").json()["files"] == 0
+
+
+def test_the_date_is_not_in_the_system_prompt(engine):
+    """A date in the system prompt made every model read its whole tool list again each day."""
+    import datetime
+    c = engine["client"]
+    chat = c.post("/api/chats", json={"harness": "chat"}).json()
+    text = say(c, chat["id"], "show system prompt")["content"]
+    system, _, user = text.partition(" || ")
+    year = str(datetime.date.today().year)
+    assert year not in system and "Today is" in user and year in user, text[:600]
+
+
+def test_tool_result_size_follows_reading_speed():
+    from dva.runner import TOOL_RESULT_LIMIT, Turn
+
+    class DB:
+        def __init__(self, budget):
+            self.budget = budget
+
+        def setting(self, key, default=None):
+            return self.budget if key == "reading_budget_seconds" else default
+
+    class Server:
+        def __init__(self, tps):
+            self.read_tps = tps
+
+    def limit(tps, budget=60, model="local-model"):
+        t = Turn.__new__(Turn)
+        t.db, t.server, t.model_id = DB(budget), Server(tps), model
+        return t.result_limit()
+    assert limit(14) == int(14 * 60 * 3.6)                 # the reference laptop: about a minute of reading
+    assert limit(2) == 2500 and limit(2000) == 24000       # floor for very slow, ceiling for fast graphics cards
+    assert limit(0) == TOOL_RESULT_LIMIT and limit(14, budget=0) == TOOL_RESULT_LIMIT
+    assert limit(500, model="cloud:openai:gpt") == TOOL_RESULT_LIMIT
+
+
+def test_fast_cores_are_found_on_mixed_processors(tmp_path):
+    from dva.hardware import _linux_performance_cores
+    # Intel 12th generation style: 4 fast cores with 2 threads each (cpus 0-7), 8 efficient cores (8-15)
+    (tmp_path / "cpu_core").mkdir()
+    (tmp_path / "cpu_atom").mkdir()
+    (tmp_path / "cpu_core" / "cpus").write_text("0-7\n")
+    (tmp_path / "cpu_atom" / "cpus").write_text("8-15\n")
+    for cpu in range(16):
+        d = tmp_path / "system" / "cpu" / f"cpu{cpu}" / "topology"
+        d.mkdir(parents=True)
+        (d / "core_id").write_text(str(cpu // 2 if cpu < 8 else cpu))
+    assert _linux_performance_cores(str(tmp_path)) == 4
+    plain = tmp_path / "plain"
+    (plain / "system" / "cpu").mkdir(parents=True)
+    assert _linux_performance_cores(str(plain)) is None    # all cores alike
+
+
+def test_the_server_is_started_with_a_sized_prompt_cache_and_a_snapshot_folder(tmp_path):
+    rt = _runtime_with(["cpu"], {})
+    rt.cache_ram_mb = lambda: 512
+
+    class Snaps:
+        def enabled(self):
+            return True
+
+        def folder(self, model_id):
+            return tmp_path
+    rt.snapshots = Snaps()
+    model = {"id": "m", "path": "/m.gguf", "size": 4 * 2**30, "settings": {}}
+    plan = rt.plan(model)
+    cmd = " ".join(rt._command(model, plan, 1234))
+    assert "--cache-ram 512" in cmd and f"--slot-save-path {tmp_path}" in cmd
+    with_cache = rt._need_bytes(model, plan)
+    assert with_cache - rt._need_bytes(model, {**plan, "cache_ram": 0}) == 256 * 2**20     # half its limit is counted
+
+
+@pytest.mark.skipif(not os.environ.get("DVA_TEST_LLAMA_SERVER"), reason="real llama-server not configured")
+def test_real_llama_server_restores_a_prompt_snapshot():
+    """Against the real llama.cpp server: a planned run's two prompts (planner and agent) both survive a reload."""
+    tmp = Path(tempfile.mkdtemp(prefix="dva-real-snap-"))
+    port = free_port()
+    env = {**os.environ, "DVA_TOKEN": "t", "DVA_LLAMA_SERVER": os.environ["DVA_TEST_LLAMA_SERVER"],
+           "DVA_SECRETS": "file", "PYTHONPATH": str(ENGINE)}
+    proc = subprocess.Popen([sys.executable, "-m", "dva", "serve", "--port", str(port), "--data-dir", str(tmp)],
+                            cwd=str(ENGINE), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    assert proc.stdout.readline().startswith("DVA_READY")
+    c = httpx.Client(base_url=f"http://127.0.0.1:{port}", headers={"Authorization": "Bearer t"}, timeout=180,
+                     trust_env=False)
+    try:
+        m = c.post("/api/models/import", json={"path": os.environ["DVA_TEST_GGUF"]}).json()
+        c.put(f"/api/models/{m['id']}", json={"compute": "cpu", "ctx": 8192})
+        c.put("/api/settings", json={"max_reply_tokens": 8, "learn_enabled": False, "team_mode": "off"})
+
+        def turn(harness, text):
+            chat = c.post("/api/chats", json={"harness": harness, "model": m["id"]}).json()
+            job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": text}).json()
+            assert wait_job(c, job["job_id"], timeout=170)["status"] in ("done", "failed")
+            return last_assistant(c, chat["id"])["meta"]["stats"]
+        cold = turn("agent", "hi")              # the prefix is read once on its own and saved; the turn reuses it
+        assert cold["cached_tokens"] > 300, cold
+        assert c.get("/api/runtime").json()["snapshots"]["saved"] >= 1
+        c.post("/api/runtime/unload", json={})
+        warm = turn("agent", "hi again")                             # a new server process
+        loaded = c.get("/api/runtime").json()["loaded"][0]
+        assert loaded["snapshot"]["restored"] is True, loaded
+        assert warm["cached_tokens"] > 3 * warm["prompt_tokens"], (cold, warm)   # only the request itself is read
+    finally:
+        c.post("/api/shutdown")
+        proc.wait(timeout=20)

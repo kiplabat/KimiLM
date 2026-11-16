@@ -39,6 +39,10 @@ DEFAULT_SETTINGS = {
     # attempt is kept; fit_context: load a run's models with the context its steps need
     "agent_order": "sequence", "step_rounds": 3, "verify_results": True, "plan_approval": False,
     "fit_context": True, "unload_after_run": False, "stall_timeout_seconds": 180, "first_token_timeout_seconds": 0,
+    # 2.6.0: doing less work. prompt_snapshots: keep what a model read of its instructions and tools on disk;
+    # prompt_cache_mb: memory per loaded model for prompts already read (None = about 5% of memory);
+    # reading_budget_seconds: a tool result is cut to about this much reading at the measured speed (0 = fixed)
+    "prompt_snapshots": True, "snapshot_disk_mb": 4096, "prompt_cache_mb": None, "reading_budget_seconds": 60,
 }
 CHAT_LIMIT_KEYS = ("max_reply_tokens", "max_steps", "time_limit_minutes", "temperature", "max_searches",
                    "max_tool_calls")

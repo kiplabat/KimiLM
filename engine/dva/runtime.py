@@ -71,6 +71,11 @@ class Server:
         self.need_bytes = 0
         self.read_tps = 0.0         # tokens per second measured on this server (reading the prompt / writing)
         self.write_tps = 0.0
+        self.slot_dir = None        # where this server saves prompt snapshots (snapshots.py)
+        self.warm = set()           # snapshots this process already holds (restored, or read and saved)
+        self.served = False         # it has answered a request: its slot holds a prompt worth keeping
+        self.no_snapshots = False
+        self.snapshot = None        # the last snapshot used: {"tokens": n, "restored": bool}
 
     @property
     def base_url(self):
@@ -118,6 +123,8 @@ def is_integrated(name):
 class Runtime:
     def __init__(self, paths, db, bus):
         self.paths, self.db, self.bus = paths, db, bus
+        from .snapshots import Snapshots
+        self.snapshots = Snapshots(paths, db, VERSIONS["llama_cpp_tag"])
         self.api_key = secrets.token_urlsafe(24)
         self.servers = {}            # model_id -> Server
         self.cond = asyncio.Condition()
@@ -278,6 +285,7 @@ class Runtime:
                         for b in installed if b not in ("cpu",)},
             "usable": self.gpu_backends(),
             "installing": self.installing, "status": self.status, "current": self.current, "loaded": self.loaded(),
+            "snapshots": self.snapshots.info(), "cache_ram_mb": self.cache_ram_mb(),
         }
 
     # ------------------------------------------------------------------ choose how to run a model
@@ -329,7 +337,9 @@ class Runtime:
         threads = settings.get("threads") or self.db.setting("threads") or None
         if not threads:
             import psutil
-            threads = psutil.cpu_count(logical=False) or 4
+            from .hardware import performance_cores
+            # one thread per physical core; on processors with fast and slow cores, per fast core
+            threads = performance_cores() or psutil.cpu_count(logical=False) or 4
         ctx = int(settings.get("ctx") or self.db.setting("default_ctx", 8192))
         mmproj = settings.get("mmproj") if settings.get("vision", True) else None
         if mmproj and not Path(mmproj).exists():
@@ -355,6 +365,17 @@ class Runtime:
                 "priority": settings.get("priority") if settings.get("priority") in PRIORITY else "normal",
                 "ubatch": int(settings.get("ubatch") or 0) or None, "spec": spec, "draft": draft,
                 "hybrid": gguf.is_hybrid(meta)}
+        # prompt caches: a stated amount of memory for prompts already read, and snapshots on disk
+        if not note:
+            from .hardware import power
+            state = power()
+            if state.get("saver"):
+                plan["note"] = "Battery saver is on: Windows holds the processor back. Plug in for full speed."
+            elif not state.get("on_ac"):
+                plan["note"] = "Running on battery: most laptops slow the processor. Plug in for full speed."
+        plan["cache_ram"] = self.cache_ram_mb()
+        snaps = getattr(self, "snapshots", None)
+        plan["slot_dir"] = str(snaps.folder(model["id"])) if snaps is not None and snaps.enabled() else None
         if compute == "gpu":
             # where each part runs: layers on the GPU (the rest on the CPU), the context cache, MoE experts,
             # the vision part, and which card
@@ -374,7 +395,11 @@ class Runtime:
         cmd = [plan["exe"], "-m", model["path"], "--host", "127.0.0.1", "--port", str(port),
                "--api-key", self.api_key, "-c", str(plan["ctx"] * plan["parallel"]), "-t", str(plan["threads"]),
                "-np", str(plan["parallel"]), "--jinja", "--reasoning-format", "deepseek", "--no-webui",
-               "--alias", model["id"], "--cache-reuse", "256"]
+               "--alias", model["id"], "--cache-reuse", "256",
+               # the in-memory prompt cache has a stated size (llama.cpp's default allows 8 GB)
+               "--cache-ram", str(int(plan.get("cache_ram") or 0))]
+        if plan.get("slot_dir"):
+            cmd += ["--slot-save-path", plan["slot_dir"]]       # prompt snapshots on disk (snapshots.py)
         if plan["compute"] == "cpu":
             cmd += ["--device", "none", "-ngl", "0"]
         else:
@@ -464,7 +489,8 @@ class Runtime:
                 size += Path(plan["draft"]).stat().st_size
             except OSError:
                 pass
-        return int(size + kv + 0.4 * 2**30)
+        # the in-memory prompt cache fills only as prompts are read: count half of its limit
+        return int(size + kv + 0.4 * 2**30 + int(plan.get("cache_ram") or 0) * 2**20 * 0.5)
 
     def _free_bytes(self):
         import psutil
@@ -493,6 +519,8 @@ class Runtime:
             raise RuntimeError_(self.status["error"]) from exc
         finally:
             log.close()
+        from .hardware import keep_fast
+        server.full_speed = keep_fast(server.proc.pid)     # Windows: no power throttling for the model server
         deadline = time.monotonic() + 600
         async with httpx.AsyncClient(timeout=5, trust_env=False) as http:
             while time.monotonic() < deadline:
@@ -512,6 +540,7 @@ class Runtime:
                 await self._stop_server(server)
                 raise RuntimeError_("The model took more than 10 minutes to load")
         server.loaded_at = time.time()
+        server.slot_dir = Path(plan["slot_dir"]) if plan.get("slot_dir") else None
         bench = model.get("bench") or {}          # speeds from the model's benchmark until this server is measured
         server.read_tps = float(bench.get("prompt_per_second") or 0)
         server.write_tps = float(bench.get("predicted_per_second") or 0)
@@ -550,6 +579,8 @@ class Runtime:
                  "vision": bool(s.plan.get("mmproj")), "memory_mb": s.need_bytes // 2**20,
                  "placement": getattr(s, "placement", {}), "note": s.plan.get("note"),
                  "read_tps": round(s.read_tps, 1), "write_tps": round(s.write_tps, 2),
+                 "snapshot": s.snapshot, "cache_ram_mb": s.plan.get("cache_ram"),
+                 "full_speed": getattr(s, "full_speed", False),
                  "kv_on": s.plan.get("kv_on"), "moe_cpu": s.plan.get("moe_cpu"),
                  "speed": {k: s.plan.get(k) for k in ("threads", "threads_batch", "kv_type", "spec", "priority")}}
                 for s in self.servers.values()]
@@ -716,6 +747,15 @@ class Runtime:
 
     def is_loaded(self, model_id):
         return model_id in self.servers
+
+    def cache_ram_mb(self):
+        """Memory for llama-server's cache of prompts it has read (several prompts stay ready, e.g. the planner's
+        and the agents'). 'prompt_cache_mb' in Settings, or about 5% of the computer's memory (256 MB to 2 GB)."""
+        value = self.db.setting("prompt_cache_mb", None)
+        if value not in (None, "", "auto"):
+            return max(0, int(value))
+        import psutil
+        return int(max(256, min(2048, psutil.virtual_memory().total / 2**20 * 0.05)))
 
     # ------------------------------------------------------------------ memory-first loading (2.5.0)
     def ceiling(self, model_id):

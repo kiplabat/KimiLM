@@ -8,7 +8,10 @@ a read timeout. Streaming lets a watchdog tell them apart:
     the prompt and uses the reading speed measured on this server.
   - stall limit: the longest silence allowed between two tokens once it writes.
 A call that breaks either limit raises LLMTimeout; a server that cannot be reached raises LLMUnreachable; a prompt
-that does not fit raises LLMContextFull. The caller (runner.Turn) restarts the model and tries again."""
+that does not fit raises LLMContextFull. The caller (runner.Turn) restarts the model and tries again.
+
+Before a local call, LLM.prepare gives a freshly loaded model its prompt snapshot back (snapshots.py, 2.6.0): the
+system prompt and tool list are read from a file in about a second instead of being read again by the model."""
 import asyncio
 import json
 
@@ -104,6 +107,69 @@ class LLM:
                 old = float(getattr(server, attr, 0) or 0)
                 setattr(server, attr, value if not old else old * 0.6 + value * 0.4)
 
+    # ------------------------------------------------------------------ prompt snapshots (snapshots.py)
+    async def _slot(self, server, action, name):
+        """Save or restore the server's reply slot (llama-server POST /slots/0?action=…). Returns the reply or None."""
+        try:
+            async with httpx.AsyncClient(timeout=120, trust_env=False) as http:
+                r = await http.post(f"{server.base_url}/slots/0?action={action}", json={"filename": name},
+                                    headers=server.headers)
+            return r.json() if r.status_code == 200 else None
+        except (httpx.HTTPError, ValueError):
+            return None
+
+    async def prepare(self, server, messages, tools, on_status=None):
+        """Make sure the model does not read this request's system prompt and tool list if it ever read them
+        before: restore their snapshot into a freshly loaded model, or read them once now and save one."""
+        snap = getattr(self.runtime, "snapshots", None)
+        if snap is None or not snap.usable(server):
+            return
+        model = self.runtime.db.get("models", server.model_id) or {}
+        name, tokens = snap.key(server, model, messages, tools)
+        if not name or name in server.warm:
+            return
+        server.warm.add(name)
+        path = server.slot_dir / name
+        if path.exists():
+            if server.served:
+                # A restore overwrites what the slot holds. One tiny unrelated request first makes llama-server
+                # move the slot's current prompt into its in-memory cache, so that prompt is not lost
+                # (checked on b12207: without this the other prompt was read again in full).
+                try:
+                    async for _ in self._events(server, self._body(
+                            [{"role": "system", "content": "-"}, {"role": "user", "content": "."}],
+                            max_tokens=1, temperature=0.0, stream=True)):
+                        pass
+                except LLMError:
+                    pass
+            out = await self._slot(server, "restore", name)
+            if out and int(out.get("n_restored") or 0) > 0:
+                snap.touch(path)
+                snap.stats["restored"] += 1
+                snap.stats["tokens_restored"] += int(out["n_restored"])
+                server.snapshot = {"tokens": int(out["n_restored"]), "restored": True}
+                return
+            try:
+                path.unlink()                      # made by another build or damaged: make a new one
+            except OSError:
+                pass
+        if on_status:
+            on_status("Reading the instructions and tools once; they are saved, so this is not repeated…")
+        body = self._body(self._local([messages[0], {"role": "user", "content": "."}]), tools=tools, max_tokens=1,
+                          temperature=0.0, stream=True)
+        try:
+            async for _ in self._events(server, body):
+                pass
+        except LLMError:
+            return                                 # the real call follows and reports any real problem
+        out = await self._slot(server, "save", name)
+        if out and int(out.get("n_saved") or 0) > 0:
+            snap.stats["saved"] += 1
+            server.snapshot = {"tokens": int(out["n_saved"]), "restored": False}
+            snap.prune()
+        else:
+            server.no_snapshots = True             # this model or build cannot save its state: stop trying
+
     async def _events(self, server, body):
         """Stream one local call. Yields ('reasoning', text), ('token', text) and finally ('end', {...})."""
         first, stall = self.limits(server, body)
@@ -151,6 +217,7 @@ class LLM:
                             tool_calls.append({"id": tc.get("id") or f"call_{i}", "name": fn.get("name") or "",
                                                "arguments": args})
                         self._learn(server, data.get("timings") or {})
+                        server.served = True
                         yield "end", {"tool_calls": tool_calls, "timings": data.get("timings") or {},
                                       "usage": data.get("usage") or {}, "finish_reason": choice.get("finish_reason"),
                                       "content": msg.get("content") or "", "reasoning": msg.get("reasoning_content") or ""}
@@ -217,12 +284,13 @@ class LLM:
                 args = {"_unparsed": slot["arguments"]}
             tool_calls.append({"id": slot["id"] or f"call_{i}", "name": slot["name"], "arguments": args})
         self._learn(server, timings)
+        server.served = True
         yield "end", {"tool_calls": tool_calls, "timings": timings, "usage": usage, "finish_reason": finish,
                       "content": "".join(content), "reasoning": "".join(reasoning)}
 
     # ------------------------------------------------------------------ calls
     async def complete(self, messages, *, schema=None, tools=None, max_tokens=1024, temperature=0.2,
-                       thinking=False, timeout=900, server=None):
+                       thinking=False, timeout=900, server=None, on_status=None):
         """One call, returned whole. With a schema, returns the parsed object in result['json'] (or raises).
         Local models are streamed underneath, so the watchdog sees a stuck model (timeout applies to online
         models, which have their own adapters)."""
@@ -230,6 +298,7 @@ class LLM:
         if getattr(picked, "kind", None) == "cloud":
             return await picked.adapter.complete(messages, schema=schema, tools=tools, max_tokens=max_tokens,
                                                  temperature=temperature, thinking=thinking, timeout=timeout)
+        await self.prepare(picked, messages, tools, on_status)
         body = self._body(self._local(messages), tools=tools, schema=schema, max_tokens=max_tokens,
                           temperature=temperature, thinking=thinking, stream=True)
         end = {}
@@ -265,7 +334,7 @@ class LLM:
         raise last
 
     async def stream(self, messages, *, tools=None, max_tokens=2048, temperature=0.4, thinking=False, timeout=1800,
-                     tool_choice=None, server=None):
+                     tool_choice=None, server=None, on_status=None):
         """Yields ('reasoning', text), ('token', text), then ('end', {...tool_calls, timings, finish_reason})."""
         picked = self._pick(server)
         if getattr(picked, "kind", None) == "cloud":
@@ -274,6 +343,7 @@ class LLM:
                                                     tool_choice=tool_choice):
                 yield item
             return
+        await self.prepare(picked, messages, tools, on_status)
         body = self._body(self._local(messages), tools=tools, max_tokens=max_tokens, temperature=temperature,
                           thinking=thinking, stream=True, tool_choice=tool_choice)
         async for item in self._events(picked, body):

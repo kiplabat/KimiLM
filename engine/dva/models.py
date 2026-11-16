@@ -833,10 +833,12 @@ class Models:
             why.append("Integrated graphics share the computer's memory and were slower than the CPU on a typical "
                        "laptop, so the CPU does the work (measure it with Find the fastest setup)."
                        if devices else "No graphics card with its own memory: the CPU does the work.")
-        cores, logical = int(hw.get("cores") or 4), int(hw.get("threads") or 4)
+        fast = int(hw.get("performance_cores") or 0)        # processors with fast and slow cores: use the fast ones
+        cores, logical = fast or int(hw.get("cores") or 4), int(hw.get("threads") or 4)
         out["threads"] = int(measured.get("threads") or cores)
         why.append(f"{out['threads']} threads for writing" + (" (measured fastest)" if measured.get("threads") else
-                                                              f" — one per physical core ({cores})") + ".")
+                                                              (f" — one per fast core ({cores}); the efficient cores would hold them back"
+                                                               if fast else f" — one per physical core ({cores})")) + ".")
         if logical > out["threads"]:
             out["threads_batch"] = logical
             why.append(f"{logical} threads for reading prompts (reading gains from every thread).")
@@ -985,7 +987,7 @@ class Models:
         model = self.db.get("models", model_id)
         meta = self.runtime._meta(model)
         hw = self.hardware()
-        cores, logical = int(hw.get("cores") or 4), int(hw.get("threads") or 4)
+        cores, logical = int(hw.get("performance_cores") or hw.get("cores") or 4), int(hw.get("threads") or 4)
         base = {"threads": cores, "threads_batch": logical if logical > cores else None, "flash_attn": "on",
                 "priority": "medium", "spec": "none"}
 

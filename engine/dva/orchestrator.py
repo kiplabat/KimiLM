@@ -486,8 +486,10 @@ class Orchestra:
             tokens += sum(min(self.dep_budget(t) // 3, 1500) for _ in t["depends_on"])
         else:
             tokens, exact = await fc.count(brief, model)
+        snaps = self.app.runtime.snapshots       # a saved snapshot means the system prompt and tools are not read
+        saved = not is_cloud(model) and snaps.enabled() and any(snaps.folder(model).glob("*.bin"))
         f = fc.step(self.harness_of(t), model, tokens, self.reply_limit(t), exact=exact,
-                    cached_fixed=(model, t.get("harness")) in self.warm)
+                    cached_fixed=saved or (model, t.get("harness")) in self.warm)
         t["forecast"] = f
         t["brief_tokens"] = tokens
         if self.fit is not None and not is_cloud(model):

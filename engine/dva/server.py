@@ -288,6 +288,14 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         await A().runtime.unload((data or {}).get("model_id"))
         return {"ok": True}
 
+    @api.post("/api/runtime/snapshots/clear")
+    async def snapshots_clear():
+        """Delete the saved prompt snapshots (they are made again the next time a prompt is read)."""
+        removed = await asyncio.to_thread(A().runtime.snapshots.clear)
+        for s in A().runtime.servers.values():
+            s.warm.clear()
+        return {"removed": removed, **A().runtime.snapshots.info()}
+
     @api.get("/api/runtime/log")
     async def runtime_log():
         return {"log": A().runtime.log_tail(120)}

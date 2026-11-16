@@ -124,8 +124,125 @@ def power():
     except Exception:
         battery = None
     if battery is None:
-        return {"on_ac": True, "battery_percent": None}
-    return {"on_ac": bool(battery.power_plugged), "battery_percent": round(battery.percent)}
+        return {"on_ac": True, "battery_percent": None, "saver": False}
+    return {"on_ac": bool(battery.power_plugged), "battery_percent": round(battery.percent), "saver": _battery_saver()}
+
+
+def _battery_saver():
+    """Windows battery saver is on (the processor is held back hard while it is)."""
+    if platform.system() != "Windows":
+        return False
+    try:
+        import ctypes
+
+        class Status(ctypes.Structure):
+            _fields_ = [("ACLineStatus", ctypes.c_byte), ("BatteryFlag", ctypes.c_byte),
+                        ("BatteryLifePercent", ctypes.c_byte), ("SystemStatusFlag", ctypes.c_byte),
+                        ("BatteryLifeTime", ctypes.c_ulong), ("BatteryFullLifeTime", ctypes.c_ulong)]
+        st = Status()
+        return bool(ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(st))) and st.SystemStatusFlag == 1
+    except Exception:
+        return False
+
+
+def performance_cores():
+    """Number of fast ("performance") cores on a processor that mixes fast and efficient cores (Intel 12th
+    generation and later, Apple silicon, ARM big.LITTLE); None when all cores are alike or it cannot be told.
+    Model threads belong on the fast cores: a thread on a slow core holds the others back."""
+    system = platform.system()
+    try:
+        if system == "Windows":
+            return _windows_performance_cores()
+        if system == "Darwin":
+            out = _run(["sysctl", "-n", "hw.perflevel0.physicalcpu", "hw.perflevel1.physicalcpu"])
+            nums = [int(x) for x in (out or "").split() if x.isdigit()]
+            return nums[0] if len(nums) == 2 and nums[1] > 0 else None
+        if system == "Linux":
+            return _linux_performance_cores()
+    except Exception:
+        return None
+    return None
+
+
+def _linux_performance_cores(root="/sys/devices"):
+    from pathlib import Path
+    base = Path(root)
+
+    def cpus(text):
+        out = []
+        for part in text.strip().split(","):
+            if "-" in part:
+                a, b = part.split("-")
+                out += list(range(int(a), int(b) + 1))
+            elif part:
+                out.append(int(part))
+        return out
+    fast = None
+    if (base / "cpu_core" / "cpus").exists() and (base / "cpu_atom" / "cpus").exists():      # Intel hybrid
+        fast = cpus((base / "cpu_core" / "cpus").read_text())
+    else:                                                                                  # ARM: by capacity
+        caps = {}
+        for f in (base / "system" / "cpu").glob("cpu[0-9]*/cpu_capacity"):
+            caps[int(f.parent.name[3:])] = int(f.read_text().strip() or 0)
+        if len(set(caps.values())) > 1:
+            fast = [c for c, v in caps.items() if v == max(caps.values())]
+    if not fast:
+        return None
+    cores = set()
+    for c in fast:
+        f = base / "system" / "cpu" / f"cpu{c}" / "topology" / "core_id"
+        cores.add(f.read_text().strip() if f.exists() else str(c))
+    return len(cores) or None
+
+
+def _windows_performance_cores():
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.windll.kernel32
+    size = wintypes.DWORD(0)
+    kernel32.GetLogicalProcessorInformationEx(0, None, ctypes.byref(size))       # 0 = RelationProcessorCore
+    buf = (ctypes.c_ubyte * size.value)()
+    if not kernel32.GetLogicalProcessorInformationEx(0, buf, ctypes.byref(size)):
+        return None
+    raw, classes, at = bytes(buf), [], 0
+    while at + 8 <= size.value:
+        length = int.from_bytes(raw[at + 4:at + 8], "little")
+        if length <= 0:
+            break
+        classes.append(raw[at + 9])         # PROCESSOR_RELATIONSHIP.EfficiencyClass (after Flags)
+        at += length
+    if len(set(classes)) < 2:
+        return None
+    return sum(1 for c in classes if c == max(classes)) or None
+
+
+def keep_fast(pid):
+    """Tell Windows this process does foreground work. Windows guesses how important a process is: one without
+    a window, or whose app is minimised or covered, is run at a low speed to save power ("power throttling").
+    A model server has no window, and long runs happen exactly when the app is in the background, so it asks
+    for full speed explicitly (SetProcessInformation, ProcessPowerThrottling with the state bit cleared).
+    Returns True when the request was accepted; does nothing on other systems."""
+    if platform.system() != "Windows":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class State(ctypes.Structure):
+            _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG), ("StateMask", wintypes.ULONG)]
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        handle = kernel32.OpenProcess(0x0200, False, int(pid))                 # PROCESS_SET_INFORMATION
+        if not handle:
+            return False
+        try:
+            state = State(1, 0x1, 0)        # control execution speed; state 0 = never throttle
+            return bool(kernel32.SetProcessInformation(wintypes.HANDLE(handle), 4, ctypes.byref(state),
+                                                       ctypes.sizeof(state)))   # 4 = ProcessPowerThrottling
+        finally:
+            kernel32.CloseHandle(wintypes.HANDLE(handle))
+    except Exception:
+        return False
 
 
 def snapshot():
@@ -138,6 +255,7 @@ def snapshot():
     return {
         "os": f"{platform.system()} {platform.release()}", "machine": platform.machine(),
         "cpu": cpu_name(), "cores": psutil.cpu_count(logical=False) or 1, "threads": psutil.cpu_count() or 1,
+        "performance_cores": performance_cores(),
         "ram_mb": int(vm.total / 2**20), "ram_free_mb": int(vm.available / 2**20),
         "disk_free_mb": int(disk_free / 2**20) if disk_free else None,
         "gpus": cards, "power": power(), "recommended_backend": recommend_backend(cards),

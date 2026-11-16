@@ -8,6 +8,8 @@ export default function Settings() {
   const { boot, refreshBoot, toast } = useApp();
   const s = boot.settings;
   const [shell, setShell] = useState<any>(null);
+  const [speed, setSpeed] = useState<any>(null);
+  useEffect(() => { api.get("/runtime").then(setSpeed).catch(() => {}); }, []);
   const [modelsDir, setModelsDir] = useState(s.models_dir || "");
   const [hf, setHf] = useState("");
   useEffect(() => { desktop?.getShellPrefs().then(setShell); }, []);
@@ -47,6 +49,28 @@ export default function Settings() {
           </Field>
           <Field label="Time limit per reply (minutes)" help="Agents stop and report what they found.">
             <input className="input narrow" type="number" min={1} value={s.turn_time_limit_minutes ?? 30} onChange={(e) => set({ turn_time_limit_minutes: Number(e.target.value) })} />
+          </Field>
+        </div>
+      </div>
+      <div className="card stack-s">
+        <h3>Doing less work</h3>
+        <p className="muted small">A model on this computer spends most of its time reading. These settings make it read less: what it has read once is kept, and what it is given to read follows how fast this computer reads.</p>
+        <Toggle checked={s.prompt_snapshots ?? true} onChange={(v: boolean) => set({ prompt_snapshots: v })} label="Keep what a model has read of its instructions and tools on disk, so a freshly loaded model does not read them again" />
+        <p className="muted small">Snapshots are used when a model runs with one reply at a time. Planned runs always do; for ordinary chats set the model's Simultaneous replies to 1 (Models), which also saves memory.</p>
+        {speed?.snapshots && <div className="row gap-m wrap small muted">
+          <span>{speed.snapshots.files} snapshot{speed.snapshots.files === 1 ? "" : "s"} · {speed.snapshots.size_mb} MB on disk
+            {speed.snapshots.restored ? ` · used ${speed.snapshots.restored} time${speed.snapshots.restored === 1 ? "" : "s"} since the app started (${speed.snapshots.tokens_restored.toLocaleString()} tokens not read again)` : ""}</span>
+          <Button small disabled={!speed.snapshots.files} onClick={async () => { try { await api.post("/runtime/snapshots/clear"); setSpeed(await api.get("/runtime")); } catch (e: any) { toast(e.message, "error"); } }}>Delete snapshots</Button>
+        </div>}
+        <div className="row gap-m wrap">
+          <Field label="Disk space for snapshots (MB)" help="The oldest are deleted first.">
+            <input className="input narrow" type="number" min={0} step={512} value={s.snapshot_disk_mb ?? 4096} onChange={(e) => set({ snapshot_disk_mb: Number(e.target.value) })} />
+          </Field>
+          <Field label="Memory for prompts already read (MB)" help={`Per loaded model, so the planner's and the agents' prompts all stay ready. Empty = automatic${speed?.cache_ram_mb ? ` (${speed.cache_ram_mb} MB on this computer)` : ""}. Applies the next time a model is loaded.`}>
+            <input className="input narrow" type="number" min={0} step={128} placeholder="auto" value={s.prompt_cache_mb ?? ""} onChange={(e) => set({ prompt_cache_mb: e.target.value === "" ? null : Number(e.target.value) })} />
+          </Field>
+          <Field label="Reading time per tool result (seconds)" help="How much of a web page, file or command output a model is given follows its measured reading speed: about this many seconds of reading. 0 = always 6,000 characters.">
+            <input className="input narrow" type="number" min={0} step={10} value={s.reading_budget_seconds ?? 60} onChange={(e) => set({ reading_budget_seconds: Number(e.target.value) })} />
           </Field>
         </div>
       </div>
