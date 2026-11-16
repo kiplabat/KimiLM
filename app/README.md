@@ -114,3 +114,6 @@ signing certificate is added (`win.certificateFile` / Azure Trusted Signing in `
 - Knowledge files: scanned PDFs (no text layer) are not read; images inside documents are ignored.
 - GPU placement (2.4.1): integrated graphics share the computer's memory and bandwidth, so moving layers there frees
   no memory and is often no faster; "Find the fastest setup" measures it with a short context.
+- Speed (2.4.2): each model card has a suggested configuration ("Use suggested configuration"; everything stays
+  adjustable). Measurements use a short context and a stand-in prompt; speculative decoding is only suggested when
+  it measured faster on this computer. Replies show how much of the prompt came from the model's cache.

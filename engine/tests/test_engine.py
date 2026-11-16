@@ -51,7 +51,7 @@ def engine():
         wrapper.chmod(0o755)
     port = free_port()
     token = "test-token"
-    env = {**os.environ, "DVA_TOKEN": token, "DVA_LLAMA_SERVER": str(wrapper), "DVA_SECRETS": "file",
+    env = {**os.environ, "DVA_TEST_CPU": "6x12", "DVA_TOKEN": token, "DVA_LLAMA_SERVER": str(wrapper), "DVA_SECRETS": "file",
            "PYTHONPATH": str(ENGINE), "OLLAMA_MODELS": str(tmp / "ollama"), "HF_HOME": str(tmp / "hf")}
     log = tmp / "engine-output.log"
     proc = subprocess.Popen([sys.executable, "-m", "dva", "serve", "--port", str(port), "--data-dir", str(tmp / "data")],
@@ -922,16 +922,49 @@ def test_find_the_fastest_setup(engine):
     assert loaded["placement"]["devices"]["CPU"]["model_mb"] == 215 and loaded["placement"]["devices"]["Vulkan0"]["kv_mb"] == 64
     c.post("/api/runtime/unload", json={"model_id": model_id})
     assert c.post(f"/api/models/{model_id}/tune").json()["state"] == "running"
-    for _ in range(300):
+    for _ in range(600):
         st = c.get(f"/api/models/{model_id}/tune").json()
         if st["state"] != "running":
             break
         time.sleep(0.2)
-    assert st["state"] == "done", st
+    assert st["state"] == "done", (st.get("error"), [(r["label"], r.get("error")) for r in st["results"]])
     labels = [r["label"] for r in st["results"]]
-    assert labels[:2] == ["CPU only", "Everything on the GPU"] and all(not r.get("error") for r in st["results"])
+    assert labels[:2] == ["CPU only", "Everything on the GPU"] and all(not r.get("error") for r in st["results"]), st
+    # the stand-in is fastest on the CPU with 6 threads, and twice as fast on repeated text with ngram drafting
+    assert st["best"] == "CPU only" and st["suggested"]["threads"] == 6 and st["suggested"]["spec"] == "ngram", st
+    assert {"Threads", "Speed-ups", "Follow-ups"} <= {r["stage"] for r in st["results"]}
+    assert st["reuse"]["percent"] >= 50, st["reuse"]                  # the follow-up came mostly from the cache
     model = next(m for m in c.get("/api/models").json()["models"] if m["id"] == model_id)
-    assert model["bench"]["tune"]["best"] == st["best"]
-    best = next(r for r in st["results"] if r["label"] == st["best"])
-    assert model["settings"]["compute"] == best["settings"]["compute"]
-    c.put(f"/api/models/{model_id}", json={"compute": "auto", "gpu_layers": None})
+    assert model["settings"]["compute"] == "gpu"                      # measuring never changes settings by itself
+    sug = model["suggested"]
+    assert sug["measured"] and sug["settings"]["compute"] == "cpu" and "compute" in sug["differs"]
+    assert sug["settings"]["threads_batch"] == 12 and sug["settings"]["priority"] == "medium"
+    # Use suggested configuration, then adjust one thing by hand
+    applied = c.post(f"/api/models/{model_id}/suggested").json()
+    assert applied["differs"] == [], applied
+    c.put(f"/api/models/{model_id}", json={"threads": 5})
+    assert c.get(f"/api/models/{model_id}/suggested").json()["differs"] == ["threads"]
+    c.post(f"/api/models/{model_id}/load", json={})
+    log = (engine["tmp"] / "data" / "logs" / "llama-server.log").read_text(errors="replace")
+    cmd = log.rsplit("\n==== ", 1)[1].split("\n", 1)[0]
+    for flag in ("--spec-type ngram-mod", "-tb 12", "--prio 1", "-fa on", "-t 5", "--device none"):
+        assert flag in cmd, (flag, cmd)
+    c.post("/api/runtime/unload", json={"model_id": model_id})
+    c.put(f"/api/models/{model_id}", json={"compute": "auto", "gpu_layers": None, "spec": None, "threads": None,
+                                            "threads_batch": None, "priority": None, "flash_attn": None,
+                                            "kv_type": None})
+
+
+def test_follow_up_turns_reuse_the_cached_prompt(engine):
+    """Memory and knowledge chosen per request go on the latest message, so the system prompt and the tool
+    list are identical between turns and the model reuses them instead of re-reading them."""
+    c = engine["client"]
+    c.post("/api/memory", json={"scope": "global", "text": "Prefers answers with numbers"})
+    chat = c.post("/api/chats", json={"harness": "agent"}).json()
+    say(c, chat["id"], "show system prompt: tell me about the solar tender numbers")
+    second = say(c, chat["id"], "show system prompt: and the battery sizes?")
+    stats = second["meta"]["stats"]
+    assert stats["cached_tokens"] > stats["prompt_tokens"], stats
+    shown = second["content"]
+    system, user = shown.split(" || ", 1)
+    assert "Prefers answers with numbers" not in system and "Prefers answers with numbers" in user

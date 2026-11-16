@@ -299,6 +299,11 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         hw = await asyncio.to_thread(snapshot)
         for r in rows:
             r["fit"] = a.models.fit(r["size"] or 0, r.get("meta"), (r.get("settings") or {}).get("ctx"), hw)
+            if r["exists"]:
+                try:
+                    r["suggested"] = await asyncio.to_thread(a.models.suggest, r)
+                except Exception as exc:          # a suggestion must never break the page
+                    a.log(f"suggestion for {r['id']}: {type(exc).__name__}: {exc}")
         return {"models": rows, "default": a.models.default_model(), "status": a.runtime.status,
                 "loaded": a.runtime.loaded(),
                 "downloads": a.models.list_downloads()}
@@ -398,6 +403,24 @@ def create_app(data_dir=None, resources_dir=None, token=None):
     @api.get("/api/models/{model_id}/tune")
     async def models_tune_status(model_id: str):
         return A().models.tunes.get(model_id) or {"state": "idle"}
+
+    @api.delete("/api/models/{model_id}/tune")
+    async def models_tune_stop(model_id: str):
+        return A().models.stop_tune(model_id)
+
+    @api.get("/api/models/{model_id}/suggested")
+    async def models_suggested(model_id: str):
+        a = A()
+        model = a.db.get("models", model_id)
+        if not model:
+            raise KeyError(model_id)
+        return await asyncio.to_thread(a.models.suggest, model)
+
+    @api.post("/api/models/{model_id}/suggested")
+    async def models_apply_suggested(model_id: str):
+        """Use suggested configuration: the settings stay editable afterwards."""
+        a = A()
+        return await asyncio.to_thread(a.models.apply_suggested, model_id)
 
     # ------------------------------------------------------------------ projects
     @api.get("/api/projects")

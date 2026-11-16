@@ -265,6 +265,7 @@ function AssistantMessage({ msg, isLast, onRetry }: any) {
         {stats.cost ? <span title={stats.cost_estimated ? "Estimated: this model's price is not known" : "Online model cost (estimate from tokens and price)"}>· {stats.cost_estimated ? "~" : ""}${stats.cost < 0.01 ? stats.cost.toFixed(4) : stats.cost.toFixed(2)}</span> : null}
         {stats.seconds ? <span>· {stats.seconds}s</span> : null}
         {stats.tokens_per_second ? <span>· {stats.tokens_per_second} tok/s</span> : null}
+        {stats.cached_tokens ? <span title={`${stats.cached_tokens.toLocaleString()} prompt tokens came from the model's cache; ${(stats.prompt_tokens || 0).toLocaleString()} were read`}>· {Math.round(100 * stats.cached_tokens / Math.max(1, stats.cached_tokens + (stats.prompt_tokens || 0)))}% from cache</span> : null}
         <button className="icon-btn" title="Copy" onClick={() => navigator.clipboard.writeText(msg.content || "")}><Copy size={13} /></button>
         {isLast && <button className="icon-btn" title="Retry" onClick={onRetry}><RotateCcw size={13} /></button>}
       </div>

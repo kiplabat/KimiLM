@@ -144,34 +144,132 @@ function Placement({ m, rt, set }: any) {
   );
 }
 
-function Tune({ m, onDone }: any) {
+const SPEC_LABEL: any = { none: "Off", ngram: "Repeat-aware (no extra model)", mtp: "Built-in multi-token prediction", draft: "Draft model" };
+const KV_LABEL: any = { f16: "Full (16-bit)", q8_0: "Compact (8-bit)", q4_0: "Smallest (4-bit)" };
+
+function speedSummary(st: any) {
+  const p: string[] = [];
+  p.push(st.compute === "gpu" ? (st.gpu_layers === "all" ? "everything on the GPU" : st.gpu_layers === "auto" || !st.gpu_layers ? "GPU, rest on the CPU" : `${st.gpu_layers} layers on the GPU`) : "CPU");
+  if (st.moe_cpu === "all") p.push("experts on the CPU");
+  if (st.threads) p.push(`${st.threads} writing threads`);
+  if (st.threads_batch) p.push(`${st.threads_batch} reading threads`);
+  if (st.kv_type && st.kv_type !== "f16") p.push(`${(KV_LABEL[st.kv_type] || st.kv_type).toLowerCase()} context memory`);
+  if (st.spec && st.spec !== "none") p.push(SPEC_LABEL[st.spec].toLowerCase());
+  if (st.ctx) p.push(`context ${Number(st.ctx).toLocaleString()}`);
+  if (st.priority && st.priority !== "normal") p.push(`${st.priority} priority`);
+  return p.join(" · ");
+}
+
+// Speed: the suggested configuration for this computer (rules of thumb, then measurements), one button to use
+// it, a measured comparison, and every setting still adjustable.
+function Speed({ m, models, set, onDone }: any) {
   const { toast } = useApp();
   const [st, setSt] = useState<any>(null);
+  const [open, setOpen] = useState(false);
+  const [why, setWhy] = useState(false);
   useEffect(() => { api.get(`/models/${m.id}/tune`).then((r) => r.state === "running" && setSt(r)); }, [m.id]);
-  useEvent((e) => { if (e.kind === "tune" && e.model_id === m.id) { setSt(e); if (e.state === "done") { toast(`Fastest: ${e.best}. Saved for this model.`, "ok"); onDone(); } if (e.state === "failed") toast(e.error, "error"); } });
+  useEvent((e) => {
+    if (e.kind !== "tune" || e.model_id !== m.id) return;
+    setSt(e);
+    if (e.state === "done") { toast("Measured. The suggested configuration is updated — press Use suggested configuration to apply it.", "ok"); onDone(); }
+    if (e.state === "failed") toast(e.error, "error");
+  });
+  const s = m.settings || {};
+  const sug = m.suggested;
   const saved = m.bench?.tune;
   const rows = st?.results?.length ? st.results : saved?.results || [];
-  const best = st?.state === "running" ? null : (st?.best || saved?.best);
+  const running = st?.state === "running";
+  const reuse = (st?.state === "done" && st.reuse) || saved?.reuse;
+  const drafts = (models || []).filter((x: any) => x.id !== m.id && x.meta?.architecture === m.meta?.architecture && x.size <= m.size * 0.3);
+  const apply = async () => { try { await api.post(`/models/${m.id}/suggested`); toast("Using the suggested configuration. You can still change anything below.", "ok"); onDone(); } catch (e: any) { toast(e.message, "error"); } };
   return (
-    <>
-      {(st?.state === "running" || rows.length > 0) && (
-        <div className="tune">
-          {st?.state === "running" && <div className="row gap-s small"><Spinner size={12} /> Trying {st.step} of {st.total}: {st.label}… (each setup loads the model again)</div>}
-          {rows.length > 0 && (
-            <table className="data-table">
-              <thead><tr><th>Setup</th><th>Reads (tok/s)</th><th>Writes (tok/s)</th><th>Where it ran</th></tr></thead>
-              <tbody>{rows.map((r: any) => (
-                <tr key={r.label} className={r.label === best ? "best-row" : ""}>
-                  <td>{r.label}{r.label === best ? " ✓" : ""}</td>
-                  <td>{r.error ? "—" : r.reads}</td><td>{r.error ? "—" : r.writes}</td>
-                  <td className="small muted">{r.error ? r.error : r.note ? r.note : placementText({ compute: r.settings.compute, placement: r.placement, kv_on: r.settings.kv_on, moe_cpu: r.settings.moe_cpu })}</td>
-                </tr>))}</tbody>
-            </table>
-          )}
-          {best && <div className="small muted">The fastest writer is used from now on{saved?.at ? ` (measured ${new Date(saved.at).toLocaleDateString()})` : ""}. Measured with a short context; long chats shift the balance towards the GPU.</div>}
+    <div className="speed">
+      <div className="row between wrap gap-s">
+        <div className="speed-title"><Zap size={14} /> Speed</div>
+        <div className="row gap-s wrap">
+          {sug && (sug.differs.length === 0
+            ? <span className="small ok">Using the suggested configuration{sug.measured ? " (measured)" : ""}</span>
+            : <Button small kind="primary" icon={<Wand2 size={13} />} onClick={apply}>Use suggested configuration</Button>)}
+          {running
+            ? <Button small kind="ghost" icon={<X size={13} />} onClick={() => api.del(`/models/${m.id}/tune`)}>Stop measuring</Button>
+            : <Button small icon={<Gauge size={13} />} title="Loads the model several times: CPU vs GPU, thread counts, speed-ups and follow-up reuse. About 5 minutes." onClick={async () => {
+                try { await api.post(`/models/${m.id}/tune`); } catch (e: any) { toast(e.message, "error"); } }}>{saved ? "Measure again" : "Find the fastest setup"}</Button>}
+        </div>
+      </div>
+      {sug && (
+        <div className="small">
+          <span className="muted">Suggested{sug.measured ? ` (measured ${new Date(sug.measured_at).toLocaleDateString()})` : " for this computer"}:</span> {speedSummary(sug.settings)}
+          {sug.differs.length > 0 && <span className="muted"> · differs in: {sug.differs.map((k: string) => ({ compute: "where it runs", gpu_layers: "GPU layers", threads: "writing threads", threads_batch: "reading threads", kv_type: "context memory", flash_attn: "flash attention", priority: "priority", spec: "speculative decoding", ctx: "context", parallel: "simultaneous replies", moe_cpu: "experts", ubatch: "batch", draft_model: "draft model", kv_on: "context placement" } as any)[k] || k).join(", ")}</span>}
+          {" "}<button className="link small" onClick={() => setWhy(!why)}>{why ? "Hide why" : "Why"}</button>
+          {why && <ul className="speed-why">{sug.reasons.map((r: string, i: number) => <li key={i}>{r}</li>)}</ul>}
         </div>
       )}
-    </>
+      {reuse && <div className="small muted">Follow-up messages: {reuse.percent}% of the prompt reused from the cache ({reuse.cached} reused, {reuse.read} read).</div>}
+      {running && <div className="row gap-s small"><Spinner size={12} /> {st.stage}: {st.label} ({st.step} of about {st.total}; each step loads the model again)</div>}
+      {st?.state === "stopped" && <div className="small muted">Measuring stopped.</div>}
+      {rows.length > 0 && (
+        <details open={running}>
+          <summary className="small">Measurements ({rows.length})</summary>
+          <table className="data-table">
+            <thead><tr><th>Step</th><th>Setup</th><th>Reads</th><th>Writes</th><th>Writes, repeated text</th><th>Where it ran</th></tr></thead>
+            <tbody>{rows.map((r: any, i: number) => (
+              <tr key={i}>
+                <td className="small muted">{r.stage || ""}</td><td>{r.label}</td>
+                <td>{r.error ? "—" : r.reads}</td><td>{r.error ? "—" : r.writes}</td><td>{r.writes_repeat ?? ""}</td>
+                <td className="small muted">{r.error ? r.error : r.reuse ? `${r.reuse.percent}% reused` : r.note ? r.note : placementText({ compute: r.settings.compute, placement: r.placement, kv_on: r.settings.kv_on, moe_cpu: r.settings.moe_cpu })}</td>
+              </tr>))}</tbody>
+          </table>
+          <div className="small muted">Tokens per second, with a short context. Long chats favour the GPU and compact context memory more.</div>
+        </details>
+      )}
+      <button className="link small" onClick={() => setOpen(!open)}>{open ? "Hide the speed settings" : "Adjust the speed settings"}</button>
+      {open && (
+        <div className="row gap-m wrap">
+          <Field label="Writing threads" help="Writing is limited by memory speed: usually best at one per physical core.">
+            <input className="input narrow" type="number" min={1} max={128} placeholder="auto" value={s.threads || ""} onChange={(e) => set(m.id, { threads: e.target.value ? Number(e.target.value) : null })} />
+          </Field>
+          <Field label="Reading threads" help="Reading the prompt gains from every thread.">
+            <input className="input narrow" type="number" min={1} max={128} placeholder="same" value={s.threads_batch || ""} onChange={(e) => set(m.id, { threads_batch: e.target.value ? Number(e.target.value) : null })} />
+          </Field>
+          <Field label="Context memory" help="Compact halves the memory and speeds up long chats.">
+            <select className="input" value={s.kv_type || "f16"} onChange={(e) => set(m.id, { kv_type: e.target.value })}>
+              {Object.keys(KV_LABEL).map((k) => <option key={k} value={k}>{KV_LABEL[k]}</option>)}
+            </select>
+          </Field>
+          <Field label="Flash attention">
+            <select className="input narrow" value={s.flash_attn || "auto"} onChange={(e) => set(m.id, { flash_attn: e.target.value })}>
+              <option value="auto">Auto</option><option value="on">On</option><option value="off">Off</option>
+            </select>
+          </Field>
+          <Field label="Priority" help="High makes other programs slower while the model works.">
+            <select className="input narrow" value={s.priority || "normal"} onChange={(e) => set(m.id, { priority: e.target.value })}>
+              <option value="normal">Normal</option><option value="medium">Above normal</option><option value="high">High</option>
+            </select>
+          </Field>
+          <Field label="Speculative decoding" help="Writes several tokens at a time when the guess is right. Measure before relying on it.">
+            <select className="input" value={s.spec || "none"} onChange={(e) => set(m.id, { spec: e.target.value })}>
+              <option value="none">Off</option><option value="ngram">Repeat-aware (no extra model)</option>
+              {(m.meta?.nextn_predict_layers || 0) > 0 && <option value="mtp">Built-in multi-token prediction</option>}
+              {drafts.length > 0 && <option value="draft">Draft model</option>}
+            </select>
+          </Field>
+          {s.spec === "draft" && (
+            <Field label="Draft model">
+              <select className="input" value={s.draft_model || ""} onChange={(e) => set(m.id, { draft_model: e.target.value || null })}>
+                <option value="">Choose…</option>{drafts.map((d: any) => <option key={d.id} value={d.id}>{d.name}</option>)}
+              </select>
+            </Field>
+          )}
+          {s.compute === "gpu" && (
+            <Field label="Batch size" help="Bigger batches read faster on a graphics card.">
+              <select className="input narrow" value={s.ubatch || ""} onChange={(e) => set(m.id, { ubatch: e.target.value ? Number(e.target.value) : null })}>
+                <option value="">Default (512)</option><option value="1024">1024</option><option value="2048">2048</option>
+              </select>
+            </Field>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -237,10 +335,6 @@ function Installed() {
                   {CTX.map((c) => <option key={c} value={c}>{c.toLocaleString()} tokens</option>)}
                 </select>
               </Field>
-              <Field label="CPU threads">
-                <input className="input narrow" type="number" min={1} max={64} placeholder="auto" value={s.threads || ""}
-                  onChange={(e) => set(m.id, { threads: e.target.value ? Number(e.target.value) : null })} />
-              </Field>
               <Field label="Simultaneous replies" help="For agents in parallel; uses more memory.">
                 <select className="input narrow" value={s.parallel || 1} onChange={(e) => set(m.id, { parallel: Number(e.target.value) })}>
                   {[1, 2, 3, 4].map((n) => <option key={n} value={n}>{n}</option>)}
@@ -271,12 +365,10 @@ function Installed() {
                 setBusy(`load-${m.id}`); try { await api.post(`/models/${m.id}/load`, {}); } catch (e: any) { toast(e.message, "error"); } setBusy(""); }}>Load now</Button>
               <Button small icon={<Gauge size={13} />} busy={busy === `bench-${m.id}`} onClick={async () => {
                 setBusy(`bench-${m.id}`); try { await api.post(`/models/${m.id}/benchmark`); load(); toast("Speed test done", "ok"); } catch (e: any) { toast(e.message, "error"); } setBusy(""); }}>Test speed</Button>
-              <Button small icon={<Wand2 size={13} />} title="Tries CPU only, everything on the GPU and CPU/GPU splits, then keeps the fastest. Takes a few minutes." onClick={async () => {
-                try { await api.post(`/models/${m.id}/tune`); } catch (e: any) { toast(e.message, "error"); } }}>Find the fastest setup</Button>
               {m.id !== data.default && <Button small icon={<Star size={13} />} onClick={() => set(m.id, { make_default: true })}>Make default</Button>}
               <ConfirmButton small icon={<Trash2 size={13} />} onConfirm={async () => { try { await api.del(`/models/${m.id}`); load(); } catch (e: any) { toast(e.message, "error"); } }}>Delete</ConfirmButton>
             </div>
-            <Tune m={m} onDone={load} />
+            <Speed m={m} models={data.models} set={set} onDone={load} />
           </div>
         );
       })}
