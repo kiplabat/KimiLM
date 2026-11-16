@@ -238,7 +238,7 @@ class Memory:
             return []
         from .cloud import USAGE
         USAGE.set({"chat_id": chat_id, "purpose": "memory"})
-        async with self.app.runtime.lease(model_id):
+        async with self.app.runtime.lease(model_id, as_loaded=True):   # never reloads a model just to learn
             try:
                 out = await self.app.llm.json([{"role": "system", "content": system},
                                                {"role": "user", "content": user}], schema, max_tokens=400)
@@ -329,7 +329,7 @@ class Memory:
         user = (f"Task: {title}\nAlready known lessons:\n" + ("\n".join(f"- {k}" for k in known) or "(none)") +
                 f"\n\nOutcome:\n{outcome_text[-3500:]}")
         try:
-            async with self.app.runtime.lease(model_id):
+            async with self.app.runtime.lease(model_id, as_loaded=True):
                 out = await self.app.llm.json([{"role": "system", "content": system},
                                                {"role": "user", "content": user}], LESSON_SCHEMA, max_tokens=300)
         except Exception:

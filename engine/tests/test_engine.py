@@ -428,7 +428,7 @@ def test_stop_keeps_queued_messages_unsent(engine):
     assert again["state"] == "started" and wait_job(c, again["job_id"])["status"] == "done"
 
 
-def test_team_runs_agents_in_parallel(engine):
+def test_team_builder_runs_each_agent(engine):
     c = engine["client"]
     chat = c.post("/api/chats", json={"harness": "chat"}).json()
     team = [{"name": "Alpha", "harness": "chat", "task": "say hello", "model": "role:worker"},
@@ -968,3 +968,192 @@ def test_follow_up_turns_reuse_the_cached_prompt(engine):
     shown = second["content"]
     system, user = shown.split(" || ", 1)
     assert "Prefers answers with numbers" not in system and "Prefers answers with numbers" in user
+
+
+# ---------------------------------------------------------------- 2.5.0: sequenced, looped runs
+def model_id(c):
+    data = c.get("/api/models").json()
+    rows = data["models"] if isinstance(data, dict) else data
+    return c.get("/api/bootstrap").json()["settings"].get("default_model") or rows[0]["id"]
+
+
+def loaded_models(c):
+    return c.get("/api/runtime").json()["loaded"]
+
+
+def run_team(c, text, timeout=150, approve="allow", **chat):
+    made = c.post("/api/chats", json={"harness": "agent", **chat}).json()
+    job = c.post(f"/api/chats/{made['id']}/messages", json={"text": text}).json()
+    status = wait_job(c, job["job_id"], timeout=timeout, approve=approve)["status"]
+    return made, status, last_assistant(c, made["id"])
+
+
+def test_steps_run_in_order_with_links_the_plan_forgot(engine):
+    """A small planner leaves depends_on out. Code finds the links (t2 names t1; t3 follows t2), runs one step
+    at a time, and each agent starts only after the result it needs was accepted."""
+    c = engine["client"]
+    chat, status, msg = run_team(c, "As a team with a forgetful plan: find greetings, summarise them, publish.")
+    assert status == "done"
+    team = team_of(msg)
+    tasks = {t["id"]: t for t in team["tasks"]}
+    assert team["mode"] == "sequence" and list(tasks) == ["t1", "t2", "t3"]
+    assert tasks["t2"]["depends_on"] == ["t1"] and tasks["t3"]["depends_on"] == ["t2"], tasks
+    assert all(t["status"] == "done" for t in tasks.values()), team
+    assert any("links between steps" in line["text"] or "link between steps" in line["text"] for line in team["log"])
+    ends = {}
+    for tid, t in tasks.items():
+        rows = c.get(f"/api/chats/{t['chat_id']}").json()["messages"]
+        ends[tid] = (rows[0]["created"], rows[-1]["created"])
+    assert ends["t1"][1] <= ends["t2"][0] and ends["t2"][1] <= ends["t3"][0], ends      # never two at once
+    assert "### t1 Find" in first_user_text(c, tasks["t2"]["chat_id"])
+    assert "### t2 Summarise" in first_user_text(c, tasks["t3"]["chat_id"])
+    assert "never rebuild it from memory" in first_user_text(c, tasks["t3"]["chat_id"])
+    # every accepted result is a file the next steps (and you) can read
+    assert all(t["result_file"] and Path(t["result_file"]).exists() for t in tasks.values())
+
+
+def test_a_failed_step_stops_the_steps_that_need_it(engine):
+    """The 16 November run: a later agent worked without its input and invented it. Now it does not start."""
+    c = engine["client"]
+    chat, status, msg = run_team(c, "As a team with a forgetful plan (explode-first): find, summarise, publish.")
+    assert status == "done"                      # the run ends with an honest answer, not a crash
+    tasks = {t["id"]: t for t in team_of(msg)["tasks"]}
+    assert tasks["t1"]["status"] == "failed" and tasks["t1"]["attempts"] == 3, tasks["t1"]
+    assert tasks["t2"]["status"] == "cancelled" and not tasks["t2"]["chat_id"], tasks["t2"]   # never started
+    assert tasks["t3"]["status"] == "cancelled" and not tasks["t3"]["chat_id"], tasks["t3"]
+    assert "could not start" in tasks["t3"]["note"]
+    assert msg["content"]
+
+
+def test_a_step_loops_until_it_passes_or_keeps_its_best_attempt(engine):
+    c = engine["client"]
+    _, status, msg = run_team(c, "As a team (never-pass): collect some greetings, then summarise them in one line.")
+    assert status == "done"
+    team = team_of(msg)
+    tasks = {t["id"]: t for t in team["tasks"]}
+    t1 = tasks["t1"]
+    assert t1["status"] == "done" and t1["partial"] and t1["attempts"] == t1["rounds"] == 3, t1
+    assert "best of 3 rounds" in t1["note"]
+    assert any("fresh agent" in line["text"] for line in team["log"]), team["log"]    # same objection twice
+    brief = first_user_text(c, tasks["t2"]["chat_id"])
+    assert "(incomplete:" in brief                                  # the next step is told, not misled
+    assert tasks["t2"]["status"] == "done"
+
+
+def test_a_run_loads_its_model_sized_for_its_steps_and_learns(engine):
+    """The model is set to 32,768 tokens for 4 replies at once (131,072 tokens of context memory). A run needs a
+    fraction of that: it loads one reply slot with the context its steps need, and says so."""
+    c = engine["client"]
+    mid = model_id(c)
+    c.put(f"/api/models/{mid}", json={"ctx": 32768, "parallel": 4})
+    try:
+        c.post("/api/runtime/unload", json={})
+        _, status, msg = run_team(c, "As a team: collect some greetings, then summarise them for me in one line.")
+        assert status == "done"
+        team = team_of(msg)
+        now_loaded = next(m for m in loaded_models(c) if m["model_id"] == mid)
+        assert now_loaded["parallel"] == 1 and now_loaded["ctx"] < 32768, now_loaded
+        assert any(line["text"].startswith("Forecast: this run needs") for line in team["log"]), team["log"]
+        for t in team["tasks"]:
+            assert t["forecast"]["tokens"] > 0 and t["forecast"]["ctx"] > 0 and t["used"]["tokens"] > 0, t
+        assert any(m["id"] == mid and m["loaded"] for m in team["models"])
+        # a short chat right after the run uses the model as the run loaded it (no reload to the full setting)
+        small = c.post("/api/chats", json={"harness": "chat"}).json()
+        say(c, small["id"], "hello there")
+        again = next(m for m in loaded_models(c) if m["model_id"] == mid)
+        assert (again["ctx"], again["parallel"]) == (now_loaded["ctx"], 1), again
+        # the second run forecasts from what the first one measured
+        _, status, msg = run_team(c, "As a team: collect some greetings, then summarise them for me in one line.")
+        assert status == "done" and all(t["forecast"]["learned"] for t in team_of(msg)["tasks"])
+    finally:
+        c.put(f"/api/models/{mid}", json={"ctx": 8192, "parallel": 1})
+        c.post("/api/runtime/unload", json={})
+
+
+def test_steps_can_run_side_by_side_when_allowed(engine):
+    c = engine["client"]
+    c.put("/api/settings", json={"agent_order": "parallel"})
+    try:
+        chat = c.post("/api/chats", json={"harness": "chat"}).json()
+        team = [{"name": "Alpha", "harness": "chat", "task": "say hello"},
+                {"name": "Beta", "harness": "chat", "task": "say goodbye"}]
+        job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "greet in two ways", "team": team}).json()
+        assert wait_job(c, job["job_id"], timeout=90)["status"] == "done"
+        step = team_of(last_assistant(c, chat["id"]))
+        assert step["mode"] == "parallel" and all(t["status"] == "done" for t in step["tasks"]), step
+    finally:
+        c.put("/api/settings", json={"agent_order": "sequence"})
+
+
+def test_models_are_unloaded_when_a_run_no_longer_needs_them(engine):
+    c = engine["client"]
+    c.put("/api/settings", json={"unload_after_run": True})
+    try:
+        _, status, _ = run_team(c, "As a team: collect some greetings, then summarise them for me in one line.")
+        assert status == "done"
+        for _ in range(30):
+            if not loaded_models(c):
+                break
+            time.sleep(0.2)
+        assert loaded_models(c) == []
+    finally:
+        c.put("/api/settings", json={"unload_after_run": False})
+
+
+def test_a_hung_model_is_restarted_and_the_reply_still_comes(engine):
+    c = engine["client"]
+    c.put("/api/settings", json={"first_token_timeout_seconds": 3})
+    try:
+        chat = c.post("/api/chats", json={"harness": "chat"}).json()
+        msg = say(c, chat["id"], "hang-once, then say hello", timeout=90)
+        notes = [s["text"] for s in msg["meta"]["steps"] if s["type"] == "note"]
+        assert any("stopped responding" in n and "Restarting" in n for n in notes), msg["meta"]["steps"]
+        assert "Hello from the fake model" in msg["content"] and not msg["meta"]["error"]
+    finally:
+        c.put("/api/settings", json={"first_token_timeout_seconds": 0})
+
+
+def test_a_plan_can_wait_for_approval(engine):
+    c = engine["client"]
+    c.put("/api/settings", json={"plan_approval": True})
+    try:
+        _, status, msg = run_team(c, "As a team: collect some greetings, then summarise them.", approve="deny")
+        errors = [s["text"] for s in msg["meta"]["steps"] if s["type"] == "error"]
+        assert any("declined the plan" in e for e in errors), msg["meta"]["steps"]
+        assert all(t["status"] == "cancelled" or not t["chat_id"] for t in team_of(msg)["tasks"])
+    finally:
+        c.put("/api/settings", json={"plan_approval": False})
+
+
+def test_plan_repair_and_failure_kinds():
+    """The pure parts: which failure a step had, and whether feedback repeats itself."""
+    from dva.orchestrator import RunFit, classify, same_objection
+    assert classify("TurnStopped: The model stopped responding twice in a row") == "timeout"
+    assert classify(None, timed_out=True) == "timeout"
+    assert classify("RuntimeError_: Not enough memory to load this model with these settings.") == "memory"
+    assert classify("LLMContextFull: the prompt does not fit the model's context: 9000 > 8192") == "context"
+    assert classify("ToolError: no such file") == "error" and classify("") is None
+    assert same_objection("the second greeting is still missing", "The second greeting is still missing.")
+    assert not same_objection("add a second greeting", "the file report.csv was not saved")
+    fit = RunFit()
+    fit.want("m", 9000)
+    fit.want("m", 5000)                 # a run's need never shrinks: the model is not reloaded back and forth
+    assert fit.tokens("m") == 9000 and fit.tokens("other") == RunFit.BASE
+    fit.cap["m"] = 4096                 # after it ran out of memory
+    assert fit.tokens("m") == 4096
+
+
+def test_the_forecast_sizes_the_context():
+    from dva.runtime import CTX_STEPS, Runtime
+
+    class FakeDB:
+        def get(self, table, row_id, key="id"):
+            return {"id": row_id, "settings": {"ctx": 65536, "parallel": 4}}
+
+        def setting(self, key, default=None):
+            return default
+    rt = Runtime.__new__(Runtime)
+    rt.db, rt.servers = FakeDB(), {}
+    assert rt.fit("m", 9000) == {"ctx": 12288, "parallel": 1}
+    assert rt.fit("m", 500000)["ctx"] == 65536            # never more than the user's own setting
+    assert rt.fit("m", 100)["ctx"] == CTX_STEPS[0]

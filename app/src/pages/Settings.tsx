@@ -52,7 +52,7 @@ export default function Settings() {
       </div>
       <div className="card stack-s">
         <h3>Teams of agents</h3>
-        <p className="muted small">A planner (your strongest model) splits a multi-step request into tasks, starts each agent when the results it needs are ready, reads every result, sends work back with feedback, and writes the answer. Agents can be paused from the chat.</p>
+        <p className="muted small">A planner (your strongest model) turns a multi-step request into a short sequence of steps and creates an agent for each. A step starts only when the results it needs are accepted. Every result is checked; a step that does not pass goes round again with what is missing. Before a step starts, its tokens, context and time are forecast, and each model is loaded with only the context the run needs and unloaded when no remaining step uses it.</p>
         <Field label="Use a team" help={s.team_mode === "always" ? "Every request in an Agent or Planner chat goes to the planner first." : s.team_mode === "off" ? "Only with a team harness or the team builder in the composer." : "The planner looks at requests that seem multi-step and decides whether one agent is enough."}>
           <select className="input" value={s.team_mode || "auto"} onChange={(e) => set({ team_mode: e.target.value })}>
             <option value="auto">Automatically, when a request looks multi-step</option>
@@ -60,8 +60,24 @@ export default function Settings() {
             <option value="off">Only when I ask (team harness or team builder)</option>
           </select>
         </Field>
+        <Field label="Order of steps" help={(s.agent_order || "sequence") === "parallel" ? "Steps that do not need each other run together, as far as each model's Simultaneous replies allow. Uses more memory; worth it with online models or a dedicated graphics card." : "One step at a time, in plan order: the least memory, and no agent works before its input exists. Best on a laptop."}>
+          <select className="input" value={s.agent_order || "sequence"} onChange={(e) => set({ agent_order: e.target.value })}>
+            <option value="sequence">One after another (recommended)</option>
+            <option value="parallel">Side by side when steps are independent</option>
+          </select>
+        </Field>
+        <Toggle checked={s.fit_context ?? true} onChange={(v: boolean) => set({ fit_context: v })} label="Load models for a run with the context its steps need (forecast), not each model's full context setting" />
+        <Toggle checked={s.verify_results ?? true} onChange={(v: boolean) => set({ verify_results: v })} label="Check every step's result against its 'done when' before the next step starts" />
+        <Toggle checked={s.plan_approval ?? false} onChange={(v: boolean) => set({ plan_approval: v })} label="Ask me before a plan starts (scheduled tasks and auto-approved chats start right away)" />
+        <Toggle checked={s.unload_after_run ?? false} onChange={(v: boolean) => set({ unload_after_run: v })} label="Unload the planner's model as well when a run ends (scheduled runs always do)" />
         <div className="row gap-m wrap">
-          <Field label="Agents at once">
+          <Field label="Rounds per step" help="Tries before the best attempt is kept. Steps the planner marks as loops get two more.">
+            <input className="input narrow" type="number" min={1} max={8} value={s.step_rounds ?? 3} onChange={(e) => set({ step_rounds: Number(e.target.value) })} />
+          </Field>
+          <Field label="Restart a silent model after (seconds)" help="No new token for this long means the model is stuck: it is restarted and the call is made again.">
+            <input className="input narrow" type="number" min={30} value={s.stall_timeout_seconds ?? 180} onChange={(e) => set({ stall_timeout_seconds: Number(e.target.value) })} />
+          </Field>
+          <Field label="Agents at once" help="Only when steps run side by side.">
             <input className="input narrow" type="number" min={1} max={8} value={s.max_parallel_agents ?? 4} onChange={(e) => set({ max_parallel_agents: Number(e.target.value) })} />
           </Field>
           <Field label="Most tasks in a plan">
