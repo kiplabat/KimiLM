@@ -116,7 +116,24 @@ def create_app(data_dir=None, resources_dir=None, token=None):
 
     @api.get("/api/hardware")
     async def hardware():
-        return await asyncio.to_thread(snapshot)
+        """The computer, with each graphics card's usable memory as the GPU runtimes see it (integrated graphics
+        report only a small reserved amount to Windows but can use up to half of the computer's memory)."""
+        a = A()
+        snap = await asyncio.to_thread(snapshot)
+        devices = await asyncio.to_thread(lambda: {b: a.runtime.list_devices(b) for b in a.runtime.backends()
+                                                   if b not in ("cpu", "custom")})
+        snap["gpu_backends"] = await asyncio.to_thread(a.runtime.gpu_backends)
+        for g in snap["gpus"]:
+            key = g["name"].lower().replace("(r)", "").replace("(tm)", "")
+            seen = [(b, d) for b, ds in devices.items() for d in ds
+                    if d.get("name") and key[:18] in d["name"].lower().replace("(r)", "").replace("(tm)", "")]
+            g["runtimes"] = sorted({b for b, _ in seen})
+            if seen:
+                g["usable_mb"] = max(d["total_mb"] for _, d in seen)
+            if g.get("integrated"):
+                g["reserved_mb"] = g.get("vram_mb", 0)
+                g["shared_mb"] = g.get("usable_mb") or snap["ram_mb"] // 2
+        return snap
 
     @api.get("/api/events")
     async def events(request: Request, since: int = 0):
@@ -370,6 +387,17 @@ def create_app(data_dir=None, resources_dir=None, token=None):
     async def models_benchmark(model_id: str):
         a = A()
         return await a.models.benchmark(model_id, a.llm)
+
+    @api.post("/api/models/{model_id}/tune")
+    async def models_tune(model_id: str):
+        """Find the fastest setup: try CPU only, everything on the GPU, a CPU/GPU split (and MoE experts on the
+        CPU), keep the fastest. Runs in the background; progress comes as "tune" events."""
+        a = A()
+        return a.models.tune(model_id, a.llm)
+
+    @api.get("/api/models/{model_id}/tune")
+    async def models_tune_status(model_id: str):
+        return A().models.tunes.get(model_id) or {"state": "idle"}
 
     # ------------------------------------------------------------------ projects
     @api.get("/api/projects")

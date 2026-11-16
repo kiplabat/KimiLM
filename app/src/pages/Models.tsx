@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Cpu, Download, Eye, Gauge, HardDrive, MemoryStick, Play, RotateCcw, Search, Star, Trash2, X, Zap } from "lucide-react";
+import { AlertTriangle, Cpu, Download, Eye, Gauge, HardDrive, Layers, MemoryStick, Play, RotateCcw, Search, Star, Trash2, Wand2, X, Zap } from "lucide-react";
 import { api, desktop, enc, fmtBytes } from "../api";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, ConfirmButton, Field, FolderInput, PageHeader, Progress, Spinner, Tabs, Toggle, fitBadge } from "../components/ui";
@@ -45,13 +45,144 @@ function DownloadsBar() {
   );
 }
 
+const gb = (mb: number) => `${(mb / 1024).toFixed(1)} GB`;
+
+// Where llama-server actually put a loaded model: layers on the GPU and memory per device.
+function placementText(l: any) {
+  const p = l.placement || {};
+  if (l.compute !== "gpu") return "everything on the CPU";
+  const parts: string[] = [];
+  if (p.layers) parts.push(p.gpu_layers === p.layers ? `all ${p.layers} layers on the GPU` : `${p.gpu_layers} of ${p.layers} layers on the GPU, the rest on the CPU`);
+  const devs = Object.entries(p.devices || {}).map(([d, v]: any) => `${d === "CPU" ? "CPU" : d} ${gb((v.model_mb || 0) + (v.kv_mb || 0) + (v.compute_mb || 0))}`);
+  if (devs.length) parts.push(devs.join(" · "));
+  if (l.kv_on === "cpu") parts.push("context memory on the CPU");
+  if (l.moe_cpu === "all") parts.push("MoE experts on the CPU");
+  else if (typeof l.moe_cpu === "number" && l.moe_cpu > 0) parts.push(`experts of ${l.moe_cpu} layers on the CPU`);
+  return parts.join(" · ");
+}
+
+// Saves when released: every change reloads the model.
+function LayerSlider({ value, max, onCommit }: any) {
+  const [v, setV] = useState(value);
+  useEffect(() => setV(value), [value]);
+  const commit = () => { if (v !== value) onCommit(v); };
+  return (<>
+    <input type="range" min={0} max={max} value={v} onChange={(e) => setV(Number(e.target.value))} onPointerUp={commit} onKeyUp={commit} onBlur={commit} />
+    <span className="small">{v} of {max}</span>
+  </>);
+}
+
+// Per-model choices for where each part of the model runs when it uses the GPU.
+function Placement({ m, rt, set }: any) {
+  const s = m.settings || {};
+  const layers = (m.meta?.block_count || 0) + 1;
+  const moe = (m.meta?.expert_count || 0) > 1;
+  const usable: string[] = rt?.usable || [];
+  const backend = usable.includes(s.gpu_backend) ? s.gpu_backend : usable[0];
+  const devices = (rt?.devices?.[backend] || []).filter((d: any) => !d.error);
+  const lay = s.gpu_layers ?? "auto";
+  const layMode = lay === "auto" || lay === "all" ? lay : "some";
+  const moeMode = !s.moe_cpu || s.moe_cpu === "none" ? "none" : s.moe_cpu === "all" ? "all" : "some";
+  if (!usable.length) return (
+    <div className="placement"><div className="warn-line"><AlertTriangle size={14} /> No installed GPU runtime can see a graphics card on this computer, so this model runs on the CPU. CUDA needs an NVIDIA card; Intel and AMD graphics use the Vulkan runtime (Hardware &amp; GPU tab).</div></div>
+  );
+  return (
+    <div className="placement">
+      <div className="placement-title"><Layers size={14} /> Where each part runs</div>
+      <div className="row gap-m wrap">
+        {usable.length > 1 && (
+          <Field label="GPU runtime">
+            <select className="input" value={backend} onChange={(e) => set(m.id, { gpu_backend: e.target.value, gpu_device: null })}>
+              {usable.map((b: string) => <option key={b} value={b}>{(rt.labels?.[b] || b).replace(/ \(.*\)/, "")} — {(rt.devices?.[b] || []).map((d: any) => d.name).join(", ") || "custom"}</option>)}
+            </select>
+          </Field>
+        )}
+        {devices.length > 1 && (
+          <Field label="Graphics card">
+            <select className="input" value={s.gpu_device || ""} onChange={(e) => set(m.id, { gpu_device: e.target.value || null })}>
+              <option value="">Automatic</option>
+              {devices.map((d: any) => <option key={d.id} value={d.id}>{d.name} ({gb(d.total_mb)}{d.integrated ? ", shared" : ""})</option>)}
+            </select>
+          </Field>
+        )}
+        <Field label="Layers on the GPU" help={layMode === "auto" ? "As many as fit in the card's memory; the rest run on the CPU." : layMode === "all" ? "The whole model on the GPU." : `The first ${lay} layers on the GPU, the other ${Math.max(0, layers - Number(lay))} on the CPU.`}>
+          <div className="row gap-s">
+            <select className="input narrow" value={layMode} onChange={(e) => set(m.id, { gpu_layers: e.target.value === "some" ? Math.max(1, Math.floor(layers / 2)) : e.target.value })}>
+              <option value="auto">Auto</option><option value="all">All</option><option value="some">Some…</option>
+            </select>
+            {layMode === "some" && <LayerSlider value={Number(lay)} max={layers > 1 ? layers : 100} onCommit={(v: number) => set(m.id, { gpu_layers: v })} />}
+          </div>
+        </Field>
+        <Field label="Context memory" help="The conversation's working memory. On the CPU it frees graphics memory for more layers; on the GPU it is faster.">
+          <div className="seg">
+            {["gpu", "cpu"].map((v) => <button key={v} className={`seg-btn${(s.kv_on || "gpu") === v ? " on" : ""}`} onClick={() => set(m.id, { kv_on: v })}>{v.toUpperCase()}</button>)}
+          </div>
+        </Field>
+        {moe && (
+          <Field label="Experts (MoE)" help="Mixture-of-experts models: keeping the large expert weights on the CPU lets the rest run on a smaller card.">
+            <div className="row gap-s">
+              <select className="input narrow" value={moeMode} onChange={(e) => set(m.id, { moe_cpu: e.target.value === "some" ? Math.max(1, Math.floor(layers / 2)) : e.target.value })}>
+                <option value="none">On the GPU</option><option value="some">Some on the CPU…</option><option value="all">All on the CPU</option>
+              </select>
+              {moeMode === "some" && <><input className="input narrow" type="number" min={1} max={layers} value={s.moe_cpu}
+                onChange={(e) => set(m.id, { moe_cpu: Math.max(1, Number(e.target.value) || 1) })} /><span className="small">layers' experts on the CPU</span></>}
+            </div>
+          </Field>
+        )}
+        {s.mmproj && s.vision !== false && (
+          <Field label="Vision part">
+            <div className="seg">
+              {["gpu", "cpu"].map((v) => <button key={v} className={`seg-btn${(s.mmproj_on || "gpu") === v ? " on" : ""}`} onClick={() => set(m.id, { mmproj_on: v })}>{v.toUpperCase()}</button>)}
+            </div>
+          </Field>
+        )}
+      </div>
+      {devices.some((d: any) => d.integrated) && !devices.some((d: any) => !d.integrated) && (
+        <p className="muted small">Integrated graphics use the computer's own memory, so moving parts to the GPU does not free memory, and speed depends on the chip. Use “Find the fastest setup” to measure it on this computer.</p>
+      )}
+    </div>
+  );
+}
+
+function Tune({ m, onDone }: any) {
+  const { toast } = useApp();
+  const [st, setSt] = useState<any>(null);
+  useEffect(() => { api.get(`/models/${m.id}/tune`).then((r) => r.state === "running" && setSt(r)); }, [m.id]);
+  useEvent((e) => { if (e.kind === "tune" && e.model_id === m.id) { setSt(e); if (e.state === "done") { toast(`Fastest: ${e.best}. Saved for this model.`, "ok"); onDone(); } if (e.state === "failed") toast(e.error, "error"); } });
+  const saved = m.bench?.tune;
+  const rows = st?.results?.length ? st.results : saved?.results || [];
+  const best = st?.state === "running" ? null : (st?.best || saved?.best);
+  return (
+    <>
+      {(st?.state === "running" || rows.length > 0) && (
+        <div className="tune">
+          {st?.state === "running" && <div className="row gap-s small"><Spinner size={12} /> Trying {st.step} of {st.total}: {st.label}… (each setup loads the model again)</div>}
+          {rows.length > 0 && (
+            <table className="data-table">
+              <thead><tr><th>Setup</th><th>Reads (tok/s)</th><th>Writes (tok/s)</th><th>Where it ran</th></tr></thead>
+              <tbody>{rows.map((r: any) => (
+                <tr key={r.label} className={r.label === best ? "best-row" : ""}>
+                  <td>{r.label}{r.label === best ? " ✓" : ""}</td>
+                  <td>{r.error ? "—" : r.reads}</td><td>{r.error ? "—" : r.writes}</td>
+                  <td className="small muted">{r.error ? r.error : r.note ? r.note : placementText({ compute: r.settings.compute, placement: r.placement, kv_on: r.settings.kv_on, moe_cpu: r.settings.moe_cpu })}</td>
+                </tr>))}</tbody>
+            </table>
+          )}
+          {best && <div className="small muted">The fastest writer is used from now on{saved?.at ? ` (measured ${new Date(saved.at).toLocaleDateString()})` : ""}. Measured with a short context; long chats shift the balance towards the GPU.</div>}
+        </div>
+      )}
+    </>
+  );
+}
+
 function Installed() {
   const { toast, modelStatus, boot } = useApp();
   const [data, setData] = useState<any>(null);
   const [busy, setBusy] = useState<string>("");
+  const [rt, setRt] = useState<any>(null);
   const load = () => api.get("/models").then(setData);
-  useEffect(() => { load(); }, []);
-  useEvent((e) => { if (["models_changed", "model_status"].includes(e.kind)) load(); });
+  useEffect(() => { load(); api.get("/runtime").then(setRt); }, []);
+  useEvent((e) => { if (["models_changed", "model_status"].includes(e.kind)) load(); if (e.kind === "runtime" && e.action !== "install_progress") api.get("/runtime").then(setRt); });
   const set = async (id: string, values: any) => { try { await api.put(`/models/${id}`, values); load(); } catch (e: any) { toast(e.message, "error"); } };
   if (!data) return <Spinner />;
   const gpuInstalled = (boot.runtime.installed || []).some((b: string) => b !== "cpu");
@@ -65,7 +196,9 @@ function Installed() {
           {modelStatus.state === "failed" && <div className="error-line">{modelStatus.error}</div>}
           {(data.loaded || []).map((l: any) => (
             <div key={l.model_id} className="loaded-row">
-              <div><b>{l.model_id}</b> {l.vision && <Eye size={13} className="accent" />} <span className="muted small">· {l.compute?.toUpperCase()} ({l.backend}) · context {l.ctx?.toLocaleString()}{l.parallel > 1 ? ` · ${l.parallel} replies at once` : ""} · about {(l.memory_mb / 1024).toFixed(1)} GB{l.users ? ` · in use (${l.users})` : ""}</span></div>
+              <div><b>{l.model_id}</b> {l.vision && <Eye size={13} className="accent" />} <span className="muted small">· {l.compute?.toUpperCase()} ({l.backend}) · context {l.ctx?.toLocaleString()}{l.parallel > 1 ? ` · ${l.parallel} replies at once` : ""} · about {(l.memory_mb / 1024).toFixed(1)} GB{l.users ? ` · in use (${l.users})` : ""}</span>
+                <div className="small">{placementText(l)}</div>
+                {l.note && <div className="warn-line small"><AlertTriangle size={12} /> {l.note}</div>}</div>
               <Button small disabled={l.users > 0} onClick={async () => { try { await api.post("/runtime/unload", { model_id: l.model_id }); load(); } catch (e: any) { toast(e.message, "error"); } }}>Unload</Button>
             </div>
           ))}
@@ -104,12 +237,6 @@ function Installed() {
                   {CTX.map((c) => <option key={c} value={c}>{c.toLocaleString()} tokens</option>)}
                 </select>
               </Field>
-              {s.compute === "gpu" && (
-                <Field label="Layers on the GPU" help="auto = as many as fit; the rest run on the CPU (CPU + GPU together).">
-                  <input className="input narrow" placeholder="auto" value={s.gpu_layers && s.gpu_layers !== "auto" ? s.gpu_layers : ""}
-                    onChange={(e) => set(m.id, { gpu_layers: e.target.value ? (e.target.value === "all" ? "all" : Number(e.target.value) || "auto") : "auto" })} />
-                </Field>
-              )}
               <Field label="CPU threads">
                 <input className="input narrow" type="number" min={1} max={64} placeholder="auto" value={s.threads || ""}
                   onChange={(e) => set(m.id, { threads: e.target.value ? Number(e.target.value) : null })} />
@@ -133,6 +260,7 @@ function Installed() {
                       setBusy(""); }}>Add vision</Button>}
               </Field>
             </div>
+            {s.compute === "gpu" && <Placement m={m} rt={rt} set={set} />}
             {b.at && (
               <div className="bench">
                 <Gauge size={14} /> Last test ({b.compute?.toUpperCase()}): reply in {b.reply_seconds}s · reads {Math.round(b.prompt_per_second || 0)} tok/s · writes {(b.predicted_per_second || 0).toFixed(1)} tok/s · structured answers {b.json_valid ? "OK" : "failed"}
@@ -143,9 +271,12 @@ function Installed() {
                 setBusy(`load-${m.id}`); try { await api.post(`/models/${m.id}/load`, {}); } catch (e: any) { toast(e.message, "error"); } setBusy(""); }}>Load now</Button>
               <Button small icon={<Gauge size={13} />} busy={busy === `bench-${m.id}`} onClick={async () => {
                 setBusy(`bench-${m.id}`); try { await api.post(`/models/${m.id}/benchmark`); load(); toast("Speed test done", "ok"); } catch (e: any) { toast(e.message, "error"); } setBusy(""); }}>Test speed</Button>
+              <Button small icon={<Wand2 size={13} />} title="Tries CPU only, everything on the GPU and CPU/GPU splits, then keeps the fastest. Takes a few minutes." onClick={async () => {
+                try { await api.post(`/models/${m.id}/tune`); } catch (e: any) { toast(e.message, "error"); } }}>Find the fastest setup</Button>
               {m.id !== data.default && <Button small icon={<Star size={13} />} onClick={() => set(m.id, { make_default: true })}>Make default</Button>}
               <ConfirmButton small icon={<Trash2 size={13} />} onConfirm={async () => { try { await api.del(`/models/${m.id}`); load(); } catch (e: any) { toast(e.message, "error"); } }}>Delete</ConfirmButton>
             </div>
+            <Tune m={m} onDone={load} />
           </div>
         );
       })}
@@ -407,10 +538,14 @@ function Hardware() {
           <div><MemoryStick size={16} /> <b>{(hw.ram_mb / 1024).toFixed(1)} GB memory</b><div className="muted small">{(hw.ram_free_mb / 1024).toFixed(1)} GB free now</div></div>
           <div><HardDrive size={16} /> <b>{hw.disk_free_mb ? `${(hw.disk_free_mb / 1024).toFixed(0)} GB free` : "—"}</b><div className="muted small">on the home drive</div></div>
           {hw.gpus.map((g: any) => (
-            <div key={g.name}><Zap size={16} /> <b>{g.name}</b><div className="muted small">{g.vram_mb ? `${(g.vram_mb / 1024).toFixed(1)} GB` : "shared memory"}{g.integrated ? " · integrated" : ""}</div></div>
+            <div key={g.name}><Zap size={16} /> <b>{g.name}</b>
+              <div className="muted small">{g.integrated
+                ? <>integrated · uses up to {gb(g.shared_mb || hw.ram_mb / 2)} of the computer's memory{g.reserved_mb ? ` (${gb(g.reserved_mb)} reserved)` : ""}</>
+                : <>{g.usable_mb || g.vram_mb ? gb(g.usable_mb || g.vram_mb) : "memory unknown"} of its own memory</>}
+                {g.runtimes?.length ? ` · works with ${g.runtimes.map((r: string) => r === "cuda" ? "CUDA" : r === "vulkan" ? "Vulkan" : r).join(", ")}` : ""}</div></div>
           ))}
         </div>
-        <p className="small">Suggested: <b>{hw.recommended_backend === "cpu" ? "CPU" : hw.recommended_backend.toUpperCase()}</b>{hw.recommended_backend === "cpu" && hw.gpus.some((g: any) => g.integrated) ? " — integrated graphics share the computer's memory and are usually not faster." : ""}</p>
+        <p className="small">Suggested: <b>{hw.recommended_backend === "cpu" ? "CPU" : hw.recommended_backend.toUpperCase()}</b>{hw.recommended_backend === "cpu" && hw.gpus.some((g: any) => g.integrated) ? " — integrated graphics share the computer's memory and are often no faster than the CPU. To check, set a model to GPU and use “Find the fastest setup” on its card." : ""}</p>
       </div>
       <div className="card">
         <h3>Processing</h3>
@@ -429,7 +564,10 @@ function Hardware() {
             <div key={b} className="runtime-row">
               <div><b>{rt.labels[b] || b}</b> {installed && <Badge kind="ok">installed</Badge>}
                 <div className="muted small">{info[b]}</div>
-                {rt.devices[b]?.length > 0 && <div className="small">Devices: {rt.devices[b].map((d: any) => d.error ? d.error : `${d.name} (${(d.total_mb / 1024).toFixed(1)} GB)`).join(", ")}</div>}
+                {rt.devices[b]?.length > 0 && <div className="small">Devices: {rt.devices[b].map((d: any) => d.error ? d.error : `${d.name} (${(d.total_mb / 1024).toFixed(1)} GB${d.integrated ? ", shared with the computer" : ""})`).join(", ")}</div>}
+                {installed && b !== "cpu" && b !== "custom" && b !== "metal" && !(rt.devices[b] || []).some((d: any) => !d.error) && (
+                  <div className="small warn-c">{b === "cuda" ? "No NVIDIA card was found on this computer, so this runtime is never used here. You can remove it." : "This runtime found no graphics card it can use."}</div>
+                )}
                 {p && <div className="row gap-s"><Progress value={p.done || 0} total={p.total || 1} /><span className="small muted">{p.state || "downloading"}</span></div>}
               </div>
               <div>

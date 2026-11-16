@@ -4,7 +4,8 @@ import struct
 TYPES = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
 WANTED_SUFFIXES = ("context_length", "block_count", "embedding_length", "attention.head_count",
                    "attention.head_count_kv", "attention.key_length", "attention.value_length", "expert_count",
-                   "expert_used_count")
+                   "expert_used_count", "full_attention_interval")
+META_VERSION = 2      # 2: hybrid models (only some layers keep a context cache) are read correctly
 
 
 class _Reader:
@@ -57,7 +58,7 @@ def read_metadata(path):
                 meta[key] = value
             if key == "general.architecture":
                 arch = value
-    out = {"gguf_version": version, "architecture": arch, "name": meta.get("general.name"),
+    out = {"meta_v": META_VERSION, "gguf_version": version, "architecture": arch, "name": meta.get("general.name"),
            "file_type": meta.get("general.file_type"), "size_label": meta.get("general.size_label"),
            "basename": meta.get("general.basename")}
     if arch:
@@ -75,11 +76,19 @@ def kv_cache_bytes(meta, ctx, bytes_per_value=2):
     """Approximate K+V cache size for a context length; None when the header lacks the numbers."""
     try:
         layers = int(meta["block_count"])
-        heads = int(meta.get("head_count_kv") or meta["head_count"])
-        if isinstance(heads, list):
-            heads = max(heads)
-        key_len = int(meta.get("key_length") or meta["embedding_length"] / int(meta["head_count"]))
+        heads = meta.get("head_count_kv") or meta["head_count"]
+        q_heads = meta["head_count"]
+        q_heads = max(q_heads) if isinstance(q_heads, list) else int(q_heads)
+        key_len = int(meta.get("key_length") or meta["embedding_length"] / q_heads)
         val_len = int(meta.get("value_length") or key_len)
-        return layers * ctx * heads * (key_len + val_len) * bytes_per_value
+        if isinstance(heads, list):          # per-layer counts; 0 = a layer without attention (hybrid models)
+            head_layers = sum(int(h) for h in heads)
+        else:
+            attn_layers = layers
+            interval = int(meta.get("full_attention_interval") or 0)
+            if interval > 1:                 # e.g. Qwen3.5 / Qwen3-Next: one attention layer in every N
+                attn_layers = -(-layers // interval)
+            head_layers = attn_layers * int(heads)
+        return head_layers * ctx * (key_len + val_len) * bytes_per_value
     except (KeyError, TypeError, ZeroDivisionError, ValueError):
         return None

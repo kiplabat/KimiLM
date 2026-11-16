@@ -112,3 +112,5 @@ signing certificate is added (`win.certificateFile` / Azure Trusted Signing in `
 - Teams: the planner's quality decides the team's quality; small local planners make simpler plans. Tested with
   stand-in models. A team of local agents on one model with "Simultaneous replies" 1 runs its tasks one at a time.
 - Knowledge files: scanned PDFs (no text layer) are not read; images inside documents are ignored.
+- GPU placement (2.4.1): integrated graphics share the computer's memory and bandwidth, so moving layers there frees
+  no memory and is often no faster; "Find the fastest setup" measures it with a short context.

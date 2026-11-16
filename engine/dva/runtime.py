@@ -83,7 +83,20 @@ class Server:
                 "loaded_at": self.loaded_at, "users": self.users, "vision": bool(self.plan.get("mmproj"))}
 
     def matches(self, plan):
-        return all(self.plan.get(k) == plan.get(k) for k in ("compute", "ctx", "parallel", "mmproj"))
+        return all(self.plan.get(k) == plan.get(k) for k in PLAN_KEYS)
+
+
+# a loaded model restarts when any of these change
+PLAN_KEYS = ("compute", "backend", "ctx", "parallel", "mmproj", "gpu_layers", "kv_on", "moe_cpu", "mmproj_on",
+             "device", "threads")
+# what llama-server reports about where it put the model (read from its log after loading)
+OFFLOAD_LINE = re.compile(r"offloaded (\d+)/(\d+) layers to GPU")
+BUFFER_LINE = re.compile(r"(\S+)\s+(model|KV|compute) buffer size\s*=\s*([\d.]+) MiB")
+
+
+def is_integrated(name):
+    from .hardware import INTEGRATED
+    return bool(INTEGRATED.search(name or ""))
 
 
 class Runtime:
@@ -245,27 +258,54 @@ class Runtime:
         return {
             "tag": self.tag, "installed": {k: str(v) for k, v in installed.items()},
             "available": self.available_backends(), "labels": BACKEND_LABELS,
-            "devices": {b: self.list_devices(b) for b in installed if b not in ("cpu",)},
+            "devices": {b: [{**d, "integrated": is_integrated(d.get("name"))} for d in self.list_devices(b)]
+                        for b in installed if b not in ("cpu",)},
+            "usable": self.gpu_backends(),
             "installing": self.installing, "status": self.status, "current": self.current, "loaded": self.loaded(),
         }
 
     # ------------------------------------------------------------------ choose how to run a model
-    def plan(self, model, compute=None):
-        """Decide backend and flags for a model. compute: auto | cpu | gpu."""
-        settings = model.get("settings") or {}
+    def gpu_backends(self):
+        """Installed GPU runtimes that can actually see a graphics card, best first. A CUDA build on a computer
+        without an NVIDIA card finds no device (and would quietly run everything on the CPU), so it is skipped;
+        Intel and AMD graphics are reached through Vulkan."""
+        installed = self.backends()
+        out = []
+        for b in ("custom", "cuda", "metal", "vulkan"):
+            if b not in installed:
+                continue
+            if b in ("custom", "metal"):
+                out.append(b)
+                continue
+            devices = [d for d in self.list_devices(b) if not d.get("error")]
+            if devices:
+                out.append(b)
+        dedicated = [b for b in out if any(not is_integrated(d["name"]) for d in self.list_devices(b))]
+        return dedicated + [b for b in out if b not in dedicated]     # a real graphics card before integrated
+
+    def plan(self, model, compute=None, overrides=None):
+        """Decide backend and flags for a model. compute: auto | cpu | gpu. overrides: settings for this load only
+        (the speed tuner tries placements without saving them)."""
+        settings = {**(model.get("settings") or {}), **(overrides or {})}
         compute = compute or settings.get("compute") or self.db.setting("default_compute", "auto")
         installed = self.backends()
-        gpu_backends = [b for b in ("custom", "cuda", "metal", "vulkan") if b in installed]
-        if compute == "gpu" and not gpu_backends:
-            raise RuntimeError_("GPU was chosen but no GPU build is installed. Install one in Models → Hardware, "
-                                "or switch this model to CPU.")
+        usable = self.gpu_backends()
+        note = None
+        if compute == "gpu" and not usable:
+            if not any(b in installed for b in ("custom", "cuda", "metal", "vulkan")):
+                raise RuntimeError_("GPU was chosen but no GPU runtime is installed. Install one in Models → "
+                                    "Hardware & GPU, or switch this model to CPU.")
+            note = ("GPU was chosen, but the installed GPU runtime found no graphics card it can use (CUDA needs "
+                    "an NVIDIA card; Intel and AMD graphics need the Vulkan runtime), so it runs on the CPU.")
+            compute = "cpu"
         if compute == "auto":
             if self._recommended is None:
                 from .hardware import gpus, recommend_backend
                 self._recommended = recommend_backend(gpus())
-            compute = "gpu" if self._recommended in gpu_backends else "cpu"
+            compute = "gpu" if usable and self._recommended in usable else "cpu"
         if compute == "gpu":
-            backend = gpu_backends[0]
+            wanted = settings.get("gpu_backend")
+            backend = wanted if wanted in usable else usable[0]
         else:
             backend = "cpu" if "cpu" in installed else (next(iter(installed), None))
         if not backend:
@@ -278,9 +318,22 @@ class Runtime:
         mmproj = settings.get("mmproj") if settings.get("vision", True) else None
         if mmproj and not Path(mmproj).exists():
             mmproj = None
-        return {"backend": backend, "exe": str(installed[backend]), "compute": compute, "ctx": ctx,
-                "threads": int(threads), "gpu_layers": settings.get("gpu_layers", "auto"),
-                "parallel": max(1, min(8, int(settings.get("parallel") or 1))), "mmproj": mmproj}
+        plan = {"backend": backend, "exe": str(installed[backend]), "compute": compute, "ctx": ctx,
+                "threads": int(threads), "parallel": max(1, min(8, int(settings.get("parallel") or 1))),
+                "mmproj": mmproj, "note": note, "gpu_layers": None, "kv_on": None, "moe_cpu": None,
+                "mmproj_on": None, "device": None}
+        if compute == "gpu":
+            # where each part runs: layers on the GPU (the rest on the CPU), the context cache, MoE experts,
+            # the vision part, and which card
+            layers = settings.get("gpu_layers", "auto")
+            plan["gpu_layers"] = layers if layers in ("auto", "all") else max(0, int(layers or 0))
+            plan["kv_on"] = "cpu" if settings.get("kv_on") == "cpu" else "gpu"
+            moe = settings.get("moe_cpu") or "none"
+            plan["moe_cpu"] = moe if moe in ("none", "all") else max(0, int(moe))
+            plan["mmproj_on"] = "cpu" if settings.get("mmproj_on") == "cpu" else "gpu"
+            ids = [d["id"] for d in self.list_devices(backend) if d.get("id")]
+            plan["device"] = settings.get("gpu_device") if settings.get("gpu_device") in ids else None
+        return plan
 
     # ------------------------------------------------------------------ process
     def _command(self, model, plan, port):
@@ -292,18 +345,41 @@ class Runtime:
         if plan["compute"] == "cpu":
             cmd += ["--device", "none", "-ngl", "0"]
         else:
-            cmd += ["-ngl", str(plan["gpu_layers"] or "auto")]
+            # -ngl: layers on the GPU, the rest on the CPU ("auto" fits as many as the card's memory allows)
+            cmd += ["-ngl", str(plan["gpu_layers"] if plan["gpu_layers"] is not None else "auto")]
+            if plan.get("device"):
+                cmd += ["-dev", plan["device"]]
+            if plan.get("kv_on") == "cpu":
+                cmd += ["--no-kv-offload"]              # the context cache stays in the computer's memory
+            if plan.get("moe_cpu") == "all":
+                cmd += ["--cpu-moe"]                    # MoE experts on the CPU, the rest on the GPU
+            elif isinstance(plan.get("moe_cpu"), int) and plan["moe_cpu"] > 0:
+                cmd += ["--n-cpu-moe", str(plan["moe_cpu"])]
         if plan.get("mmproj"):
             cmd += ["--mmproj", plan["mmproj"]]
-            if plan["compute"] == "cpu":
+            if plan["compute"] == "cpu" or plan.get("mmproj_on") == "cpu":
                 cmd += ["--no-mmproj-offload"]
         extra = (model.get("settings") or {}).get("extra_args")
         if extra:
             cmd += [a for a in extra.split() if a]
         return cmd
 
+    def _meta(self, model):
+        """The model's header facts; headers read before 2.4.1 are read again (hybrid models were overcounted)."""
+        from . import gguf
+        meta = model.get("meta") or {}
+        if (meta.get("meta_v") or 1) < gguf.META_VERSION and model.get("path") and Path(model["path"]).exists():
+            try:
+                meta = gguf.read_metadata(model["path"])
+                self.db.update("models", model["id"], {"meta": meta})
+                model["meta"] = meta
+            except Exception:
+                pass
+        return meta
+
     def _need_bytes(self, model, plan):
         from . import gguf
+        self._meta(model)
         size = int(model.get("size") or 0)
         if plan.get("mmproj"):
             try:
@@ -331,6 +407,7 @@ class Runtime:
         log = self.log_path.open("ab")
         log.write(f"\n==== {time.ctime()} {' '.join(c if c != self.api_key else '***' for c in cmd)}\n".encode())
         log.flush()
+        log_start = log.tell()
         try:
             server.proc = await asyncio.to_thread(
                 subprocess.Popen, cmd, stdout=log, stderr=subprocess.STDOUT, cwd=str(Path(plan["exe"]).parent),
@@ -360,6 +437,7 @@ class Runtime:
                 await self._stop_server(server)
                 raise RuntimeError_("The model took more than 10 minutes to load")
         server.loaded_at = time.time()
+        server.placement = self._read_placement(log_start)
         self.servers[model["id"]] = server
         self.status = {"state": "ready", "model_id": model["id"], "backend": plan["backend"],
                        "compute": plan["compute"], "ctx": plan["ctx"], "vision": bool(plan.get("mmproj"))}
@@ -367,13 +445,33 @@ class Runtime:
         self.db.update("models", model["id"], {"last_used": time.strftime("%Y-%m-%dT%H:%M:%S")})
         return server
 
+    def _read_placement(self, start):
+        """Where llama-server actually put the model: layers on the GPU, and memory per device (from its log)."""
+        try:
+            with self.log_path.open("rb") as f:
+                f.seek(start)
+                text = f.read(400_000).decode("utf-8", errors="replace")
+        except OSError:
+            return {}
+        out = {"devices": {}}
+        m = OFFLOAD_LINE.search(text)
+        if m:
+            out["gpu_layers"], out["layers"] = int(m.group(1)), int(m.group(2))
+        for dev, kind, mib in BUFFER_LINE.findall(text):
+            dev = "CPU" if dev.upper().startswith("CPU") or "HOST" in dev.upper() else dev
+            d = out["devices"].setdefault(dev, {"model_mb": 0, "kv_mb": 0, "compute_mb": 0})
+            d[{"model": "model_mb", "KV": "kv_mb", "compute": "compute_mb"}[kind]] += round(float(mib))
+        return out
+
     def _publish(self):
         self.bus.publish("model_status", **self.status, loaded=self.loaded())
 
     def loaded(self):
         return [{"model_id": s.model_id, "backend": s.plan["backend"], "compute": s.plan["compute"],
                  "ctx": s.plan["ctx"], "parallel": s.plan["parallel"], "users": s.users,
-                 "vision": bool(s.plan.get("mmproj")), "memory_mb": s.need_bytes // 2**20}
+                 "vision": bool(s.plan.get("mmproj")), "memory_mb": s.need_bytes // 2**20,
+                 "placement": getattr(s, "placement", {}), "note": s.plan.get("note"),
+                 "kv_on": s.plan.get("kv_on"), "moe_cpu": s.plan.get("moe_cpu")}
                 for s in self.servers.values()]
 
     def friendly_error(self, tail):
@@ -437,7 +535,7 @@ class Runtime:
             await self._stop_server(idle.pop(0))
 
     @asynccontextmanager
-    async def lease(self, model_id, compute=None, on_wait=None):
+    async def lease(self, model_id, compute=None, on_wait=None, overrides=None):
         """Use a model for the duration of a block; yields its Server. Loads it if needed (alongside the models
         already loaded when memory allows), otherwise waits for a busy model to finish. Online models
         ("cloud:…") are leased from cloud.Cloud: nothing to load."""
@@ -449,7 +547,7 @@ class Runtime:
         if not model:
             raise RuntimeError_(f"Model {model_id!r} is not installed. Download it in Models.")
         async with self.cond:
-            plan = self.plan(model, compute)
+            plan = self.plan(model, compute, overrides)
             waited = False
             while True:
                 server = self.servers.get(model_id)
