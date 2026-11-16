@@ -114,6 +114,7 @@ class Models:
         self._cancel = {}
         self._tasks = set()
         self._browse_cache = {}
+        self.tunes = {}      # model id -> progress of "Find the fastest setup"
         for row in self.db.all("SELECT * FROM downloads WHERE state NOT IN ('done', 'cancelled')"):
             spec = row.get("spec") or {}
             state = {**spec.get("state", {}), "id": row["id"], "state": "paused", "rate": 0, "eta": None,
@@ -746,5 +747,105 @@ class Models:
             results["json_seconds"] = round(time.monotonic() - t0, 2)
             results["json_valid"] = isinstance(r2.get("json"), dict)
         results["at"] = now()
+        old = (self.db.get("models", model_id) or {}).get("bench") or {}
+        if old.get("tune"):
+            results["tune"] = old["tune"]
         self.db.update("models", model_id, {"bench": results})
         return results
+
+    # ------------------------------------------------------------------ find the fastest setup
+    TUNE_PROMPT = ("Read this note and answer the question at the end.\n\n" + " ".join([
+        "Solar home systems in rural areas combine a panel, a battery and efficient appliances.",
+        "Households often start with lights and phone charging, then add a radio, a fan or a television.",
+        "Efficient appliances matter because every watt saved shrinks the panel and battery that are needed.",
+        "Prices fell sharply over the last decade, while pay-as-you-go plans spread the cost over months.",
+        "Field data shows that many systems are used for more hours a day than their designers expected."] * 3) +
+        "\n\nQuestion: in two sentences, why do efficient appliances matter for solar home systems?")
+
+    def placements(self, model):
+        """The setups worth comparing on this computer for this model."""
+        meta = self.runtime._meta(model)
+        out = [("CPU only", {"compute": "cpu"})]
+        backends = self.runtime.gpu_backends()
+        if not backends:
+            return out
+        layers = int(meta.get("block_count") or 0) + 1        # llama.cpp also counts the output layer
+        out.append(("Everything on the GPU", {"compute": "gpu", "gpu_layers": "all"}))
+        if layers > 2:
+            out.append(("Half the layers on the GPU", {"compute": "gpu", "gpu_layers": layers // 2}))
+        if int(meta.get("expert_count") or 0) > 1:
+            out.append(("GPU, with the MoE experts on the CPU", {"compute": "gpu", "gpu_layers": "all", "moe_cpu": "all"}))
+        devices = [d for b in backends for d in self.runtime.list_devices(b)]
+        from .runtime import is_integrated
+        if any(not is_integrated(d.get("name")) for d in devices):
+            out.append(("GPU, context memory on the CPU", {"compute": "gpu", "gpu_layers": "all", "kv_on": "cpu"}))
+        return out
+
+    def tune(self, model_id, llm):
+        """Start comparing setups in the background; progress arrives as "tune" events."""
+        model = self.db.get("models", model_id)
+        if not model:
+            raise KeyError(model_id)
+        current = self.tunes.get(model_id)
+        if current and current.get("state") == "running":
+            return current
+        self.tunes[model_id] = {"model_id": model_id, "state": "running", "step": 0,
+                                "total": len(self.placements(model)), "results": [], "label": ""}
+        task = asyncio.ensure_future(self._tune(model_id, llm))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return self.tunes[model_id]
+
+    async def _tune(self, model_id, llm):
+        state = self.tunes[model_id]
+        model = self.db.get("models", model_id)
+        keep = {k: (model.get("settings") or {}).get(k) for k in ("compute", "gpu_layers", "kv_on", "moe_cpu")}
+
+        def publish():
+            self.bus.publish("tune", **state)
+        try:
+            for i, (label, setup) in enumerate(self.placements(model), 1):
+                state.update(step=i, label=label)
+                publish()
+                result = {"label": label, "settings": setup}
+                try:
+                    async with self.runtime.lease(model_id, compute=setup["compute"],
+                                                  overrides={**setup, "ctx": 4096, "parallel": 1}) as server:
+                        t0 = time.monotonic()
+                        r = await llm.complete([{"role": "user", "content": self.TUNE_PROMPT}], max_tokens=48,
+                                               temperature=0, server=server)
+                        t = r.get("timings") or {}
+                        result.update(seconds=round(time.monotonic() - t0, 1), backend=server.plan["backend"],
+                                      reads=round(t.get("prompt_per_second") or 0, 1),
+                                      writes=round(t.get("predicted_per_second") or 0, 2),
+                                      placement=getattr(server, "placement", {}), note=server.plan.get("note"))
+                except Exception as exc:
+                    result["error"] = str(exc)[:300]
+                state["results"].append(result)
+                publish()
+                try:
+                    await self.runtime.unload(model_id)       # each setup starts from a fresh load
+                except Exception:
+                    pass
+            ok = [r for r in state["results"] if not r.get("error") and r.get("writes")]
+            if not ok:
+                raise RuntimeError("No setup could be measured")
+            top = max(r["writes"] for r in ok)
+            # writing speed decides (it is what you wait for); within 5 %, the faster reader wins
+            best = max((r for r in ok if r["writes"] >= top * 0.95), key=lambda r: r["reads"])
+            state.update(state="done", best=best["label"])
+            settings = {k: v for k, v in keep.items() if v is not None}
+            settings.update(best["settings"])
+            for k in ("gpu_layers", "kv_on", "moe_cpu"):
+                if k not in best["settings"]:
+                    settings[k] = None
+            self.update_settings(model_id, {**{k: None for k in ("gpu_layers", "kv_on", "moe_cpu")}, **settings})
+            row = self.db.get("models", model_id)
+            bench = {**(row.get("bench") or {}), "tune": {"at": now(), "best": best["label"],
+                                                         "results": state["results"]}}
+            self.db.update("models", model_id, {"bench": bench})
+        except Exception as exc:
+            state.update(state="failed", error=str(exc)[:300])
+        finally:
+            publish()
+            self.bus.publish("models_changed")

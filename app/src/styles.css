@@ -308,3 +308,11 @@ label.menu-item { flex-direction: row; }
 .side-hit .ellipsis { flex: none; }
 .side-snippet { font-size: 11.5px; color: var(--text-soft); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .side-snippet mark { background: rgba(255, 92, 58, .18); color: inherit; border-radius: 3px; padding: 0 1px; }
+
+/* Where each part of a model runs (2.4.1) */
+.placement { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.placement-title { font-weight: 600; font-size: 13px; display: flex; gap: 6px; align-items: center; }
+.placement input[type=range] { width: 160px; accent-color: var(--coral); }
+.warn-line { display: flex; gap: 6px; align-items: flex-start; color: #A85F00; font-size: 12.5px; }
+.tune { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.data-table tr.best-row td { font-weight: 600; }

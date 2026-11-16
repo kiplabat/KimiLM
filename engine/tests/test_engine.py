@@ -860,3 +860,78 @@ def test_search_by_meaning_with_the_search_model(engine):
     assert c.get("/api/search/status").json()["model"]["running"]
     c.put("/api/settings", json={"embedding_model_path": ""})
     c.delete(f"/api/knowledge/{doc['id']}")
+
+
+# ---------------------------------------------------------------- 2.4.1: GPU runtime choice and CPU/GPU placement
+def _runtime_with(backends, devices, settings=None):
+    sys.path.insert(0, str(ENGINE))
+    from dva.runtime import Runtime
+
+    class DB:
+        def setting(self, key, default=None):
+            return (settings or {}).get(key, default)
+    rt = Runtime.__new__(Runtime)
+    rt.db, rt.api_key, rt._recommended, rt._devices_cache = DB(), "k", "cpu", {}
+    rt.backends = lambda: {b: Path(f"/x/{b}/llama-server") for b in backends}
+    rt.list_devices = lambda b: devices.get(b, [])
+    return rt
+
+
+def test_gpu_runtime_without_a_card_is_skipped_and_parts_can_be_placed():
+    igpu = {"id": "Vulkan0", "name": "Intel(R) UHD Graphics", "total_mb": 16288, "free_mb": 16000}
+    rt = _runtime_with(["cpu", "cuda", "vulkan"], {"cuda": [], "vulkan": [igpu]})
+    assert rt.gpu_backends() == ["vulkan"]          # CUDA found no NVIDIA card: never picked
+    model = {"id": "m", "path": "/m.gguf", "settings": {
+        "compute": "gpu", "gpu_layers": 20, "kv_on": "cpu", "moe_cpu": 10, "mmproj_on": "cpu",
+        "gpu_device": "Vulkan0", "mmproj": __file__}}
+    plan = rt.plan(model)
+    assert plan["backend"] == "vulkan" and plan["compute"] == "gpu" and plan["gpu_layers"] == 20
+    cmd = rt._command(model, plan, 1234)
+    joined = " ".join(cmd)
+    assert "-ngl 20" in joined and "-dev Vulkan0" in joined and "--no-kv-offload" in cmd
+    assert "--n-cpu-moe 10" in joined and "--no-mmproj-offload" in cmd
+    model["settings"].update(moe_cpu="all", kv_on="gpu", gpu_layers="all")
+    cmd = rt._command(model, rt.plan(model), 1234)
+    assert "--cpu-moe" in cmd and "--no-kv-offload" not in cmd and "-ngl all" in " ".join(cmd)
+    # only CUDA installed on a computer without an NVIDIA card: runs on the CPU and says why
+    rt = _runtime_with(["cpu", "cuda"], {"cuda": []})
+    plan = rt.plan({"id": "m", "path": "/m.gguf", "settings": {"compute": "gpu"}})
+    assert plan["compute"] == "cpu" and plan["backend"] == "cpu" and "no graphics card" in plan["note"]
+    # a real graphics card comes before integrated graphics
+    rt = _runtime_with(["cpu", "vulkan", "cuda"], {"vulkan": [igpu], "cuda": [
+        {"id": "CUDA0", "name": "NVIDIA GeForce RTX 3060", "total_mb": 12288, "free_mb": 11000}]})
+    assert rt.gpu_backends()[0] == "cuda"
+
+
+def test_hybrid_models_need_less_context_memory():
+    sys.path.insert(0, str(ENGINE))
+    from dva.gguf import kv_cache_bytes
+    meta = {"block_count": 32, "head_count": 16, "head_count_kv": 4, "key_length": 256, "value_length": 256}
+    full = kv_cache_bytes(meta, 65536)
+    assert kv_cache_bytes({**meta, "full_attention_interval": 4}, 65536) == full // 4
+    assert kv_cache_bytes({**meta, "head_count_kv": [0, 0, 0, 4] * 8}, 65536) == full // 4
+
+
+def test_find_the_fastest_setup(engine):
+    c = engine["client"]
+    model_id = c.get("/api/models").json()["models"][0]["id"]
+    c.put(f"/api/models/{model_id}", json={"compute": "gpu", "gpu_layers": 12})
+    c.post(f"/api/models/{model_id}/load", json={})
+    loaded = next(l for l in c.get("/api/models").json()["loaded"] if l["model_id"] == model_id)
+    assert loaded["placement"]["gpu_layers"] == 12 and loaded["placement"]["layers"] == 33
+    assert loaded["placement"]["devices"]["CPU"]["model_mb"] == 215 and loaded["placement"]["devices"]["Vulkan0"]["kv_mb"] == 64
+    c.post("/api/runtime/unload", json={"model_id": model_id})
+    assert c.post(f"/api/models/{model_id}/tune").json()["state"] == "running"
+    for _ in range(300):
+        st = c.get(f"/api/models/{model_id}/tune").json()
+        if st["state"] != "running":
+            break
+        time.sleep(0.2)
+    assert st["state"] == "done", st
+    labels = [r["label"] for r in st["results"]]
+    assert labels[:2] == ["CPU only", "Everything on the GPU"] and all(not r.get("error") for r in st["results"])
+    model = next(m for m in c.get("/api/models").json()["models"] if m["id"] == model_id)
+    assert model["bench"]["tune"]["best"] == st["best"]
+    best = next(r for r in st["results"] if r["label"] == st["best"])
+    assert model["settings"]["compute"] == best["settings"]["compute"]
+    c.put(f"/api/models/{model_id}", json={"compute": "auto", "gpu_layers": None})
