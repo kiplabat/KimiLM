@@ -215,7 +215,7 @@ class Turn:
         self.steps = []
         self.reasoning = []
         self.text = []
-        self.stats = {"model_calls": 0, "prompt_tokens": 0, "output_tokens": 0, "seconds": 0}
+        self.stats = {"model_calls": 0, "prompt_tokens": 0, "output_tokens": 0, "seconds": 0, "cached_tokens": 0}
         self.tool_map = {}
         self.workspace = app.paths.workspace(chat_id)
         self.auto_approve = bool(job.get("payload", {}).get("auto_approve")) or \
@@ -541,16 +541,10 @@ class Turn:
             parts.append(self.harness["system_prompt"].strip())
         if self.project and (self.project.get("instructions") or "").strip():
             parts.append(f"Project “{self.project['name']}” instructions:\n{self.project['instructions'].strip()}")
+        # Memory, notes and knowledge passages chosen for this request are NOT here: they change from request to
+        # request, and anything that changes in the system prompt makes the model re-read everything after it
+        # (including the tool list) on every turn. They go on the latest message instead (request_context).
         recall = getattr(self, "recall_blocks", {})
-        if recall.get("memory"):
-            self.private.add("memory")
-            parts.append(recall["memory"] + "\nUse these when relevant; the user can edit them on the Memory page.")
-        if recall.get("notes"):
-            self.private.add("notes")
-            parts.append(recall["notes"])
-        if recall.get("knowledge"):
-            self.private.add("knowledge")
-            parts.append(recall["knowledge"])
         if "search_chats" in self.tool_map:
             parts.append("When I refer to something from an earlier conversation, look it up with search_chats and "
                          "read_chat instead of guessing." + (" This project has knowledge files: use "
@@ -782,14 +776,46 @@ class Turn:
                         self.app.log(f"knowledge passages: {type(exc).__name__}: {exc}")
         self.recall_blocks = blocks
 
+    def request_context(self):
+        """What memory, project notes and knowledge files say about this request: put in front of the latest
+        message, so the system prompt and tool list stay identical between turns and the model reuses them from
+        its cache instead of re-reading them (on a laptop CPU that is minutes per turn)."""
+        recall = getattr(self, "recall_blocks", {})
+        parts = []
+        if recall.get("memory"):
+            self.private.add("memory")
+            parts.append(recall["memory"] + "\nUse these when relevant; the user can edit them on the Memory page.")
+        if recall.get("notes"):
+            self.private.add("notes")
+            parts.append(recall["notes"])
+        if recall.get("knowledge"):
+            self.private.add("knowledge")
+            parts.append(recall["knowledge"])
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def with_context(messages, context):
+        if not context:
+            return messages
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                note = f"<context>\n{context}\n</context>\n\n"
+                if isinstance(m.get("content"), list):
+                    m["content"] = [{"type": "text", "text": note}] + m["content"]
+                else:
+                    m["content"] = note + (m.get("content") or "")
+                break
+        return messages
+
     async def base_messages(self, tools):
         await self.recall()
         system = self.system_prompt(tools)
+        context = self.request_context()
         history = self.history()
-        history = await self.fit_history(system, tools, history)
+        history = await self.fit_history(system + ("\n\n" + context if context else ""), tools, history)
         messages = [{"role": "system", "content": system}] + [
             {k: v for k, v in m.items() if not k.startswith("_")} for m in history]
-        return await self.attach_media(messages, history)
+        return self.with_context(await self.attach_media(messages, history), context)
 
     async def run_loop(self):
         self.new_ctx()
@@ -871,6 +897,7 @@ class Turn:
             if timings.get("cost_estimated"):
                 self.stats["cost_estimated"] = True
         self.stats["prompt_tokens"] += int(timings.get("prompt_n") or 0)
+        self.stats["cached_tokens"] += int(timings.get("cache_n") or 0)   # reused from the model's cache, not re-read
         self.stats["output_tokens"] += int(timings.get("predicted_n") or 0)
         if timings.get("predicted_per_second"):
             self.stats["tokens_per_second"] = round(timings["predicted_per_second"], 1)

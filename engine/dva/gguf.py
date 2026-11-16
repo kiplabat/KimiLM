@@ -4,8 +4,24 @@ import struct
 TYPES = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
 WANTED_SUFFIXES = ("context_length", "block_count", "embedding_length", "attention.head_count",
                    "attention.head_count_kv", "attention.key_length", "attention.value_length", "expert_count",
-                   "expert_used_count", "full_attention_interval")
-META_VERSION = 2      # 2: hybrid models (only some layers keep a context cache) are read correctly
+                   "expert_used_count", "full_attention_interval", "nextn_predict_layers")
+META_VERSION = 3      # 2: hybrid models (only some layers keep a context cache); 3: built-in multi-token prediction
+HYBRID_ARCHS = {"mamba", "mamba2", "rwkv6", "rwkv7", "rwkv6qwen2", "arwkv7", "jamba", "falcon-h1", "lfm2", "lfm2moe",
+                "granitehybrid", "nemotron_h", "plamo2", "qwen3next", "qwen35", "qwen35moe", "kimi_linear"}
+
+
+def is_hybrid(meta):
+    """Models with recurrent (state-space / linear-attention) layers: their state cannot be rewound to any
+    position, so prompt reuse between turns depends on saved checkpoints."""
+    meta = meta or {}
+    heads = meta.get("head_count_kv")
+    return (meta.get("architecture") in HYBRID_ARCHS or int(meta.get("full_attention_interval") or 0) > 1
+            or (isinstance(heads, list) and 0 in heads))
+
+
+def has_mtp(meta):
+    """The file carries multi-token-prediction layers (llama.cpp's draft-mtp speculative decoding)."""
+    return int((meta or {}).get("nextn_predict_layers") or 0) > 0
 
 
 class _Reader:

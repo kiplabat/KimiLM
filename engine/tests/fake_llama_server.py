@@ -24,6 +24,9 @@ p.add_argument("--alias")
 p.add_argument("--list-devices", action="store_true")
 p.add_argument("-ngl", default="auto")
 p.add_argument("--device", "-dev")
+p.add_argument("-t", type=int, default=4)
+p.add_argument("-tb")      # declared so "-tb 12" is not read as "-t b"
+p.add_argument("--spec-type", default="none")
 args, _ = p.parse_known_args()
 if not args.list_devices and args.device != "none":     # report placement like llama.cpp does (read by the runtime)
     on_gpu = 33 if args.ngl in ("auto", "all") else min(33, int(args.ngl))
@@ -82,7 +85,7 @@ def decide(body):
     after_tool = msgs and msgs[-1]["role"] == "tool"
     text = text_of(last_user.get("content"))
     if "show system prompt" in text and not after_tool:        # tests read what reached the prompt
-        return {"text": msgs[0]["content"][:8000].replace("\n", " ")}
+        return {"text": (msgs[0]["content"][:8000] + " || " + text[:6000]).replace("\n", " ")}
     for trigger, tool, key in (("search earlier chats for ", "search_chats", "query"),
                                ("search knowledge for ", "search_knowledge", "query"),
                                ("note decision: ", "update_project_notes", "text")):
@@ -118,7 +121,9 @@ def decide(body):
                 return {"tool": (name, {})}
     if after_tool:
         return {"text": f"Done. The tool said: {msgs[-1]['content'][:60]}"}
-    return {"text": "Hello from the fake model. " + ("I remember: " + msgs[0]["content"][-80:] if "remembered" in msgs[0]["content"] else "")}
+    # memory chosen for the request arrives in a <context> block on the latest message (2.4.2)
+    ctx = text.split("</context>")[0] if "<context>" in text else ""
+    return {"text": "Hello from the fake model. " + ("I remember: " + ctx[-80:] if "remembered" in ctx else "")}
 
 
 @app.get("/health")
@@ -158,6 +163,33 @@ async def embeddings(request: Request):
 
 TIMINGS = {"prompt_n": 50, "prompt_ms": 100.0, "predicted_n": 10, "predicted_ms": 200.0,
            "prompt_per_second": 500.0, "predicted_per_second": 50.0, "cache_n": 0}
+CACHED = []     # recent prompts (llama-server keeps several in RAM with --cache-ram and picks the best match)
+
+
+def timings(body):
+    """Like llama-server: speed depends on threads (best at 6 here), CPU vs GPU, and speculative decoding on
+    repetitive output; a prompt cache reuses the longest common prefix of the rendered prompt (system, then
+    tools, then the conversation — the order of Qwen's chat template)."""
+    msgs = body.get("messages") or []
+    system = msgs[0] if msgs and msgs[0]["role"] == "system" else None
+    rendered = (text_of(system.get("content")) if system else "") + json.dumps(body.get("tools") or []) + \
+        "".join(m["role"] + text_of(m.get("content")) for m in msgs if m is not system)
+    common = 0
+    for prev in CACHED:
+        n = 0
+        for a, b in zip(prev, rendered):
+            if a != b:
+                break
+            n += 1
+        common = max(common, n)
+    CACHED.insert(0, rendered)
+    del CACHED[8:]
+    writes = 50.0 - abs(args.t - 6) * 2.5 + (5.0 if args.device == "none" else 0.0)
+    last = text_of(msgs[-1].get("content")) if msgs else ""
+    if args.spec_type != "none" and "Copy this list exactly" in last:
+        writes *= 2
+    return {**TIMINGS, "cache_n": common // 4, "prompt_n": max(1, (len(rendered) - common) // 4),
+            "predicted_per_second": writes}
 
 
 def structured(schema, body):
@@ -192,7 +224,7 @@ async def chat(request: Request):
     if rf:
         content = json.dumps(structured(rf["json_schema"]["schema"], body))
         return {"choices": [{"message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
-                "timings": TIMINGS}
+                "timings": timings(body)}
     d = decide(body)
     if d.get("delay") and "tool" in d:
         time.sleep(d["delay"])
@@ -200,7 +232,7 @@ async def chat(request: Request):
         msg = {"role": "assistant", "content": d.get("text", "")}
         if "tool" in d:
             msg["tool_calls"] = [{"id": "call_1", "type": "function", "function": {"name": d["tool"][0], "arguments": json.dumps(d["tool"][1])}}]
-        return {"choices": [{"message": msg, "finish_reason": "stop"}], "timings": TIMINGS}
+        return {"choices": [{"message": msg, "finish_reason": "stop"}], "timings": timings(body)}
 
     def gen():
         def chunk(delta, finish=None):
@@ -218,7 +250,7 @@ async def chat(request: Request):
                 yield chunk({"content": word + " "})
                 time.sleep(d.get("delay") or 0.005)
             yield chunk({}, "stop")
-        yield "data: " + json.dumps({"choices": [], "timings": TIMINGS, "usage": {}}) + "\n\n"
+        yield "data: " + json.dumps({"choices": [], "timings": timings(body), "usage": {}}) + "\n\n"
         yield "data: [DONE]\n\n"
     return StreamingResponse(gen(), media_type="text/event-stream")
 

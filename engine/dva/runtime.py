@@ -88,7 +88,14 @@ class Server:
 
 # a loaded model restarts when any of these change
 PLAN_KEYS = ("compute", "backend", "ctx", "parallel", "mmproj", "gpu_layers", "kv_on", "moe_cpu", "mmproj_on",
-             "device", "threads")
+             "device", "threads", "threads_batch", "kv_type", "flash_attn", "priority", "ubatch", "spec", "draft",
+             "hybrid")
+KV_TYPES = {"f16": 2.0, "q8_0": 1.0625, "q4_0": 0.5625}          # bytes per value in the context cache
+PRIORITY = {"normal": 0, "medium": 1, "high": 2}
+SPEC_TYPES = ("none", "ngram", "mtp", "draft")
+HYBRID_CHECKPOINTS = 8          # saved states per reply slot for hybrid models …
+HYBRID_CHECKPOINT_STEP = 256    # … at most this many tokens apart, so a follow-up re-reads little
+HYBRID_STATE_MB = 64            # rough size of one saved state
 # what llama-server reports about where it put the model (read from its log after loading)
 OFFLOAD_LINE = re.compile(r"offloaded (\d+)/(\d+) layers to GPU")
 BUFFER_LINE = re.compile(r"(\S+)\s+(model|KV|compute) buffer size\s*=\s*([\d.]+) MiB")
@@ -318,10 +325,27 @@ class Runtime:
         mmproj = settings.get("mmproj") if settings.get("vision", True) else None
         if mmproj and not Path(mmproj).exists():
             mmproj = None
+        from . import gguf
+        meta = self._meta(model)
+        kv_type = settings.get("kv_type") if settings.get("kv_type") in KV_TYPES else "f16"
+        spec = settings.get("spec") if settings.get("spec") in SPEC_TYPES else "none"
+        draft = None
+        if spec == "draft":
+            row = self.db.get("models", settings.get("draft_model") or "") if settings.get("draft_model") else None
+            draft = row["path"] if row and row.get("path") and Path(row["path"]).exists() else None
+            spec = "draft" if draft else "none"
+        if spec == "mtp" and not gguf.has_mtp(meta):
+            spec = "none"
         plan = {"backend": backend, "exe": str(installed[backend]), "compute": compute, "ctx": ctx,
                 "threads": int(threads), "parallel": max(1, min(8, int(settings.get("parallel") or 1))),
                 "mmproj": mmproj, "note": note, "gpu_layers": None, "kv_on": None, "moe_cpu": None,
-                "mmproj_on": None, "device": None}
+                "mmproj_on": None, "device": None,
+                # speed: reading threads, context-cache type, flash attention, priority, batch, speculative decoding
+                "threads_batch": int(settings.get("threads_batch") or 0) or None, "kv_type": kv_type,
+                "flash_attn": settings.get("flash_attn") if settings.get("flash_attn") in ("on", "off") else "auto",
+                "priority": settings.get("priority") if settings.get("priority") in PRIORITY else "normal",
+                "ubatch": int(settings.get("ubatch") or 0) or None, "spec": spec, "draft": draft,
+                "hybrid": gguf.is_hybrid(meta)}
         if compute == "gpu":
             # where each part runs: layers on the GPU (the rest on the CPU), the context cache, MoE experts,
             # the vision part, and which card
@@ -359,6 +383,7 @@ class Runtime:
             cmd += ["--mmproj", plan["mmproj"]]
             if plan["compute"] == "cpu" or plan.get("mmproj_on") == "cpu":
                 cmd += ["--no-mmproj-offload"]
+        cmd += self._speed_args(plan)
         extra = (model.get("settings") or {}).get("extra_args")
         if extra:
             cmd += [a for a in extra.split() if a]
@@ -377,6 +402,38 @@ class Runtime:
                 pass
         return meta
 
+    @staticmethod
+    def _speed_args(plan):
+        """Flags that make a model faster on this computer (see Models.suggest and the speed tuner)."""
+        args = []
+        if plan.get("threads_batch"):
+            args += ["-tb", str(plan["threads_batch"])]       # reading the prompt is compute-bound: more threads help
+        fa = plan.get("flash_attn") or "auto"
+        kv = plan.get("kv_type") or "f16"
+        if kv != "f16":
+            args += ["-ctk", kv, "-ctv", kv]                  # a compact context cache: less memory to stream
+            fa = "on"                                         # a quantised V cache needs flash attention
+        if fa != "auto":
+            args += ["-fa", fa]
+        if PRIORITY.get(plan.get("priority") or "normal"):
+            args += ["--prio", str(PRIORITY[plan["priority"]])]
+        if plan.get("ubatch"):
+            args += ["-ub", str(plan["ubatch"]), "-b", str(max(2048, plan["ubatch"]))]
+        spec = plan.get("spec") or "none"
+        if spec == "ngram":
+            args += ["--spec-type", "ngram-mod"]              # drafts from text already in the conversation
+        elif spec == "mtp":
+            args += ["--spec-type", "draft-mtp"]              # the model's own multi-token-prediction layers
+        elif spec == "draft" and plan.get("draft"):
+            args += ["--spec-type", "draft-simple", "-md", plan["draft"]]
+            if plan["compute"] == "cpu":
+                args += ["-devd", "none", "-ngld", "0"]
+        if plan.get("hybrid"):
+            # recurrent layers cannot rewind to any point: keep a few close checkpoints so the next turn
+            # re-reads only what changed instead of most of the prompt
+            args += ["--ctx-checkpoints", str(HYBRID_CHECKPOINTS), "--checkpoint-min-step", str(HYBRID_CHECKPOINT_STEP)]
+        return args
+
     def _need_bytes(self, model, plan):
         from . import gguf
         self._meta(model)
@@ -386,9 +443,18 @@ class Runtime:
                 size += Path(plan["mmproj"]).stat().st_size
             except OSError:
                 pass
-        kv = gguf.kv_cache_bytes(model.get("meta"), plan["ctx"] * plan["parallel"]) if model.get("meta") else None
+        per_value = KV_TYPES.get(plan.get("kv_type") or "f16", 2.0)
+        kv = gguf.kv_cache_bytes(model.get("meta"), plan["ctx"] * plan["parallel"], per_value) \
+            if model.get("meta") else None
         if kv is None:
-            kv = max(0.35, size / 2**30 * 0.12) * (plan["ctx"] * plan["parallel"] / 8192) * 2**30
+            kv = max(0.35, size / 2**30 * 0.12) * (plan["ctx"] * plan["parallel"] / 8192) * 2**30 * per_value / 2
+        if plan.get("hybrid"):
+            kv += HYBRID_CHECKPOINTS * HYBRID_STATE_MB * 2**20 * plan["parallel"]
+        if plan.get("draft"):
+            try:
+                size += Path(plan["draft"]).stat().st_size
+            except OSError:
+                pass
         return int(size + kv + 0.4 * 2**30)
 
     def _free_bytes(self):
@@ -471,7 +537,8 @@ class Runtime:
                  "ctx": s.plan["ctx"], "parallel": s.plan["parallel"], "users": s.users,
                  "vision": bool(s.plan.get("mmproj")), "memory_mb": s.need_bytes // 2**20,
                  "placement": getattr(s, "placement", {}), "note": s.plan.get("note"),
-                 "kv_on": s.plan.get("kv_on"), "moe_cpu": s.plan.get("moe_cpu")}
+                 "kv_on": s.plan.get("kv_on"), "moe_cpu": s.plan.get("moe_cpu"),
+                 "speed": {k: s.plan.get(k) for k in ("threads", "threads_batch", "kv_type", "spec", "priority")}}
                 for s in self.servers.values()]
 
     def friendly_error(self, tail):

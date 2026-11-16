@@ -753,15 +753,160 @@ class Models:
         self.db.update("models", model_id, {"bench": results})
         return results
 
-    # ------------------------------------------------------------------ find the fastest setup
+    # ------------------------------------------------------------------ speed: the suggested configuration
+    SPEED_DEFAULTS = {"compute": "auto", "gpu_layers": "auto", "kv_on": "gpu", "moe_cpu": "none", "threads": None,
+                      "threads_batch": None, "kv_type": "f16", "flash_attn": "auto", "priority": "normal",
+                      "ubatch": None, "spec": "none", "draft_model": None, "ctx": None, "parallel": None}
     TUNE_PROMPT = ("Read this note and answer the question at the end.\n\n" + " ".join([
         "Solar home systems in rural areas combine a panel, a battery and efficient appliances.",
         "Households often start with lights and phone charging, then add a radio, a fan or a television.",
         "Efficient appliances matter because every watt saved shrinks the panel and battery that are needed.",
-        "Prices fell sharply over the last decade, while pay-as-you-go plans spread the cost over months.",
-        "Field data shows that many systems are used for more hours a day than their designers expected."] * 3) +
+        "Field data shows that many systems are used for more hours a day than their designers expected."] * 2) +
         "\n\nQuestion: in two sentences, why do efficient appliances matter for solar home systems?")
+    REPEAT_PROMPT = ("Copy this list exactly, changing only 'kWh' to 'kilowatt-hours'. Output the list only.\n\n" +
+                     "\n".join(f"- Site {i}: daily use {round(1.5 + i * 0.37, 2)} kWh, battery {12 + i} kWh, "
+                               f"panel {300 + 25 * i} W" for i in range(1, 9)))
+    FOLLOW_UP = "Thanks. Now in one sentence: what is the main risk for these systems?"
+    _hw_cache = (0.0, None)
 
+    def hardware(self):
+        from .hardware import snapshot
+        at, hw = self._hw_cache
+        if not hw or time.monotonic() - at > 120:
+            hw = snapshot()
+            fake = os.environ.get("DVA_TEST_CPU")          # tests only: "6x12" = 6 cores, 12 threads
+            if fake:
+                hw["cores"], hw["threads"] = (int(x) for x in fake.split("x"))
+            self._hw_cache = (time.monotonic(), hw)
+        return hw
+
+    def _devices(self):
+        from .runtime import is_integrated
+        out = []
+        for b in self.runtime.gpu_backends():
+            for d in self.runtime.list_devices(b):
+                if not d.get("error"):
+                    out.append({**d, "backend": b, "integrated": is_integrated(d.get("name"))})
+        return out
+
+    def _draft_candidates(self, model):
+        """Small installed models of the same family that could draft for this one (same architecture)."""
+        meta = self.runtime._meta(model)
+        out = []
+        for row in self.installed():
+            if row["id"] == model["id"] or not row["exists"]:
+                continue
+            m = self.runtime._meta(row)
+            if m.get("architecture") == meta.get("architecture") and 0 < (row["size"] or 0) <= 0.3 * (model["size"] or 0):
+                out.append(row)
+        return sorted(out, key=lambda r: r["size"])
+
+    def suggest(self, model):
+        """The configuration that should make this model fastest here, with plain reasons. Measured results from
+        "Find the fastest setup" win over rules of thumb."""
+        from . import gguf
+        hw = self.hardware()
+        meta = self.runtime._meta(model)
+        s = model.get("settings") or {}
+        measured = ((model.get("bench") or {}).get("tune") or {}).get("suggested") or {}
+        out, why = {}, []
+        devices = self._devices()
+        dedicated = [d for d in devices if not d["integrated"]]
+        size = int(model.get("size") or 0)
+        moe = int(meta.get("expert_count") or 0) > 1
+        if "compute" in measured:
+            for k in ("compute", "gpu_layers", "kv_on", "moe_cpu"):
+                if k in measured:
+                    out[k] = measured[k]
+            why.append(f"Where it runs was measured on this computer: {measured.get('placement_label', out['compute'].upper())}.")
+        elif dedicated:
+            vram = max(d["total_mb"] for d in dedicated) * 2**20
+            if size * 1.2 < vram:
+                out.update(compute="gpu", gpu_layers="all")
+                why.append(f"The whole model fits in the {dedicated[0]['name']}'s own memory: everything on the GPU.")
+            else:
+                out.update(compute="gpu", gpu_layers="auto", moe_cpu="all" if moe else "none")
+                why.append("The model is larger than the graphics card's memory: as many layers as fit on the GPU, "
+                           "the rest on the CPU" + (", with the MoE experts on the CPU" if moe else "") + ".")
+        else:
+            out["compute"] = "cpu"
+            why.append("Integrated graphics share the computer's memory and were slower than the CPU on a typical "
+                       "laptop, so the CPU does the work (measure it with Find the fastest setup)."
+                       if devices else "No graphics card with its own memory: the CPU does the work.")
+        cores, logical = int(hw.get("cores") or 4), int(hw.get("threads") or 4)
+        out["threads"] = int(measured.get("threads") or cores)
+        why.append(f"{out['threads']} threads for writing" + (" (measured fastest)" if measured.get("threads") else
+                                                              f" — one per physical core ({cores})") + ".")
+        if logical > out["threads"]:
+            out["threads_batch"] = logical
+            why.append(f"{logical} threads for reading prompts (reading gains from every thread).")
+        ctx, parallel = int(s.get("ctx") or self.db.setting("default_ctx", 8192)), int(s.get("parallel") or 1)
+        out["flash_attn"] = "on"
+        if ctx * parallel >= 16384:
+            out["kv_type"] = "q8_0"
+            why.append("Compact context memory (8-bit): half the memory and faster long chats, with no noticeable "
+                       "loss in quality.")
+        else:
+            out["kv_type"] = "f16"
+        # memory: keep the model and its context well inside the computer's memory (swapping is the slowest of all)
+        budget = hw["ram_mb"] * 2**20 * (0.7 if out["compute"] == "cpu" or (devices and not dedicated) else 0.85)
+
+        def need(c, p):
+            plan = {"ctx": c, "parallel": p, "kv_type": out["kv_type"], "hybrid": gguf.is_hybrid(meta),
+                    "mmproj": s.get("mmproj") if s.get("vision", True) else None, "draft": None}
+            return self.runtime._need_bytes(model, plan)
+        if need(ctx, parallel) > budget:
+            fits = [c for c in (65536, 32768, 16384, 8192, 4096) if c <= ctx and need(c, parallel) <= budget]
+            if fits:
+                out["ctx"] = fits[0]
+                why.append(f"Context {fits[0]:,} tokens so the model and its memory fit comfortably "
+                           f"({ctx:,} × {parallel} replies would need about {need(ctx, parallel) / 2**30:.0f} GB).")
+            else:
+                out.update(ctx=8192, parallel=1)
+                why.append("Context 8,192 tokens and one reply at a time: anything larger does not fit in memory.")
+        out["priority"] = "medium"
+        why.append("Above-normal priority, so other programs slow the model down less.")
+        if out["compute"] == "gpu" and dedicated:
+            out["ubatch"] = 1024
+        if measured.get("spec") and measured["spec"] != "none":
+            out["spec"] = measured["spec"]
+            if measured.get("draft_model"):
+                out["draft_model"] = measured["draft_model"]
+            why.append({"ngram": "Repeat-aware speculative decoding: replies that reuse text from the conversation "
+                                 "(code edits, lists, quotes) are written several tokens at a time (measured faster).",
+                        "mtp": "The model's own multi-token prediction writes several tokens at a time (measured faster).",
+                        "draft": "A small model of the same family drafts tokens that this one checks (measured faster)."
+                        }[measured["spec"]])
+        else:
+            out["spec"] = "none"
+        if gguf.is_hybrid(meta):
+            why.append("This is a hybrid model: KimiLM keeps close checkpoints so follow-up messages re-read only "
+                       "what is new.")
+        defaults = {**self.SPEED_DEFAULTS, "threads": cores, "ctx": ctx, "parallel": parallel}
+        defaults["threads_batch"] = s.get("threads") or cores
+        differs = []
+        for k, v in out.items():
+            have = s.get(k)
+            have = defaults.get(k) if have in (None, "") else have
+            if (defaults.get(k) if v in (None, "") else v) != have:
+                differs.append(k)
+        tune = (model.get("bench") or {}).get("tune") or {}
+        return {"settings": out, "reasons": why, "differs": differs, "measured": bool(measured),
+                "measured_at": tune.get("at"), "reuse": tune.get("reuse")}
+
+    def apply_suggested(self, model_id):
+        model = self.db.get("models", model_id)
+        if not model:
+            raise KeyError(model_id)
+        sug = self.suggest(model)
+        values = {k: v for k, v in sug["settings"].items()}
+        for k in ("gpu_layers", "kv_on", "moe_cpu", "ubatch", "draft_model"):
+            values.setdefault(k, None)
+        self.update_settings(model_id, values)
+        self.bus.publish("models_changed")
+        return self.suggest(self.db.get("models", model_id))
+
+    # ------------------------------------------------------------------ find the fastest setup (measured)
     def placements(self, model):
         """The setups worth comparing on this computer for this model."""
         meta = self.runtime._meta(model)
@@ -782,68 +927,149 @@ class Models:
         return out
 
     def tune(self, model_id, llm):
-        """Start comparing setups in the background; progress arrives as "tune" events."""
+        """Start measuring in the background; progress arrives as "tune" events. The result becomes the
+        suggested configuration (applied only when the user presses Use suggested configuration)."""
         model = self.db.get("models", model_id)
         if not model:
             raise KeyError(model_id)
         current = self.tunes.get(model_id)
         if current and current.get("state") == "running":
             return current
-        self.tunes[model_id] = {"model_id": model_id, "state": "running", "step": 0,
-                                "total": len(self.placements(model)), "results": [], "label": ""}
+        meta = self.runtime._meta(model)
+        from . import gguf
+        hw = self.hardware()
+        extra = 3 if int(hw.get("threads") or 4) > int(hw.get("cores") or 4) else 2
+        total = len(self.placements(model)) + extra + 2 + 1 + int(gguf.has_mtp(meta)) + int(bool(self._draft_candidates(model)))
+        self.tunes[model_id] = {"model_id": model_id, "state": "running", "step": 0, "total": total, "results": [],
+                                "label": "", "stage": ""}
         task = asyncio.ensure_future(self._tune(model_id, llm))
+        self._tune_tasks = getattr(self, "_tune_tasks", {})
+        self._tune_tasks[model_id] = task
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return self.tunes[model_id]
 
+    def stop_tune(self, model_id):
+        task = getattr(self, "_tune_tasks", {}).get(model_id)
+        if task and not task.done():
+            task.cancel()
+        return self.tunes.get(model_id) or {"state": "idle"}
+
+    async def _measure(self, model_id, llm, setup, repeat=False, follow_up=False):
+        out = {}
+        async with self.runtime.lease(model_id, compute=setup.get("compute"),
+                                      overrides={**setup, "ctx": 4096, "parallel": 1}) as server:
+            msgs = [{"role": "user", "content": self.TUNE_PROMPT}]
+            r = await llm.complete(msgs, max_tokens=40, temperature=0, server=server)
+            t = r.get("timings") or {}
+            out.update(reads=round(t.get("prompt_per_second") or 0, 1), writes=round(t.get("predicted_per_second") or 0, 2),
+                       backend=server.plan["backend"], placement=getattr(server, "placement", {}),
+                       note=server.plan.get("note"))
+            if repeat:
+                r2 = await llm.complete([{"role": "user", "content": self.REPEAT_PROMPT}], max_tokens=96,
+                                        temperature=0, server=server)
+                out["writes_repeat"] = round((r2.get("timings") or {}).get("predicted_per_second") or 0, 2)
+            if follow_up:   # how much of a follow-up message is reused from the cache instead of re-read
+                msgs = msgs + [{"role": "assistant", "content": r.get("content") or "OK."},
+                               {"role": "user", "content": self.FOLLOW_UP}]
+                r3 = await llm.complete(msgs, max_tokens=24, temperature=0, server=server)
+                t3 = r3.get("timings") or {}
+                cached, read = int(t3.get("cache_n") or 0), int(t3.get("prompt_n") or 0)
+                out["reuse"] = {"cached": cached, "read": read,
+                                "percent": round(100 * cached / max(1, cached + read))}
+        return out
+
     async def _tune(self, model_id, llm):
+        from . import gguf
         state = self.tunes[model_id]
         model = self.db.get("models", model_id)
-        keep = {k: (model.get("settings") or {}).get(k) for k in ("compute", "gpu_layers", "kv_on", "moe_cpu")}
+        meta = self.runtime._meta(model)
+        hw = self.hardware()
+        cores, logical = int(hw.get("cores") or 4), int(hw.get("threads") or 4)
+        base = {"threads": cores, "threads_batch": logical if logical > cores else None, "flash_attn": "on",
+                "priority": "medium", "spec": "none"}
 
         def publish():
             self.bus.publish("tune", **state)
+
+        async def run(stage, label, setup, **kw):
+            state.update(step=state["step"] + 1, label=label, stage=stage)
+            publish()
+            row = {"stage": stage, "label": label, "settings": setup}
+            try:
+                row.update(await self._measure(model_id, llm, {**base, **setup}, **kw))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                row["error"] = str(exc)[:300]
+            state["results"].append(row)
+            publish()
+            try:
+                await self.runtime.unload(model_id)        # the next setup starts from a fresh load
+            except Exception:
+                pass
+            return row
+
+        ok = lambda r: not r.get("error") and r.get("writes")   # noqa: E731
         try:
-            for i, (label, setup) in enumerate(self.placements(model), 1):
-                state.update(step=i, label=label)
-                publish()
-                result = {"label": label, "settings": setup}
-                try:
-                    async with self.runtime.lease(model_id, compute=setup["compute"],
-                                                  overrides={**setup, "ctx": 4096, "parallel": 1}) as server:
-                        t0 = time.monotonic()
-                        r = await llm.complete([{"role": "user", "content": self.TUNE_PROMPT}], max_tokens=48,
-                                               temperature=0, server=server)
-                        t = r.get("timings") or {}
-                        result.update(seconds=round(time.monotonic() - t0, 1), backend=server.plan["backend"],
-                                      reads=round(t.get("prompt_per_second") or 0, 1),
-                                      writes=round(t.get("predicted_per_second") or 0, 2),
-                                      placement=getattr(server, "placement", {}), note=server.plan.get("note"))
-                except Exception as exc:
-                    result["error"] = str(exc)[:300]
-                state["results"].append(result)
-                publish()
-                try:
-                    await self.runtime.unload(model_id)       # each setup starts from a fresh load
-                except Exception:
-                    pass
-            ok = [r for r in state["results"] if not r.get("error") and r.get("writes")]
-            if not ok:
-                raise RuntimeError("No setup could be measured")
-            top = max(r["writes"] for r in ok)
-            # writing speed decides (it is what you wait for); within 5 %, the faster reader wins
-            best = max((r for r in ok if r["writes"] >= top * 0.95), key=lambda r: r["reads"])
-            state.update(state="done", best=best["label"])
-            settings = {k: v for k, v in keep.items() if v is not None}
-            settings.update(best["settings"])
-            for k in ("gpu_layers", "kv_on", "moe_cpu"):
-                if k not in best["settings"]:
-                    settings[k] = None
-            self.update_settings(model_id, {**{k: None for k in ("gpu_layers", "kv_on", "moe_cpu")}, **settings})
+            # 1. where it runs
+            places = []
+            for label, setup in self.placements(model):
+                places.append(await run("Where it runs", label, setup))
+            good = [r for r in places if ok(r)]
+            if not good:
+                raise RuntimeError("No setup could be measured: " + (places[0].get("error") or "unknown error"))
+            top = max(r["writes"] for r in good)
+            best = max((r for r in good if r["writes"] >= top * 0.95), key=lambda r: r["reads"])
+            chosen = {k: v for k, v in base.items() if v is not None}     # what was measured, in full
+            chosen.update(best["settings"])
+            chosen_label = best["label"]
+            # 2. threads (when the CPU does part of the work)
+            on_cpu = chosen["compute"] == "cpu" or chosen.get("gpu_layers") not in ("all",) or chosen.get("moe_cpu")
+            if on_cpu:
+                tries = sorted({max(2, cores - 2), max(2, (cores + logical) // 2), logical} - {cores})
+                rows = [best]
+                for n in tries:
+                    rows.append(await run("Threads", f"{n} threads for writing", {**chosen, "threads": n}))
+                good = [r for r in rows if ok(r)]
+                fastest = max(good, key=lambda r: r["writes"])
+                if fastest is not best and fastest["writes"] >= best["writes"] * 1.03:
+                    chosen["threads"] = fastest["settings"]["threads"]
+                    best = fastest
+            # 3. writing several tokens at a time (speculative decoding)
+            baseline = await run("Speed-ups", "Without speculative decoding", chosen, repeat=True)
+            options = [("ngram", "Repeat-aware speculative decoding", {"spec": "ngram"})]
+            if gguf.has_mtp(meta):
+                options.append(("mtp", "Built-in multi-token prediction", {"spec": "mtp"}))
+            drafts = self._draft_candidates(model)
+            if drafts:
+                options.append(("draft", f"Draft model: {drafts[0]['name']}", {"spec": "draft", "draft_model": drafts[0]["id"]}))
+            spec_pick = None
+            if ok(baseline):
+                for key, label, extra in options:
+                    r = await run("Speed-ups", label, {**chosen, **extra}, repeat=True)
+                    if ok(r) and r.get("writes_repeat") and r["writes"] >= baseline["writes"] * 0.95 and \
+                            r["writes_repeat"] >= (baseline.get("writes_repeat") or 0) * 1.12:
+                        gain = r["writes_repeat"] / max(0.01, baseline.get("writes_repeat") or 0.01)
+                        if not spec_pick or gain > spec_pick[1]:
+                            spec_pick = (extra, gain)
+            if spec_pick:
+                chosen.update(spec_pick[0])
+            # 4. follow-up messages: how much is reused from the cache
+            final = await run("Follow-ups", "Follow-up message (cache reuse)", chosen, follow_up=True)
+            suggested = {k: v for k, v in chosen.items() if k in self.SPEED_DEFAULTS}
+            suggested["placement_label"] = chosen_label
+            state.update(state="done", best=chosen_label, suggested=suggested, reuse=final.get("reuse"))
             row = self.db.get("models", model_id)
-            bench = {**(row.get("bench") or {}), "tune": {"at": now(), "best": best["label"],
-                                                         "results": state["results"]}}
+            bench = {**(row.get("bench") or {}), "tune": {"at": now(), "best": chosen_label, "suggested": suggested,
+                                                         "results": state["results"], "reuse": final.get("reuse")}}
             self.db.update("models", model_id, {"bench": bench})
+        except asyncio.CancelledError:
+            state.update(state="stopped")
+            try:
+                await self.runtime.unload(model_id)
+            except Exception:
+                pass
         except Exception as exc:
             state.update(state="failed", error=str(exc)[:300])
         finally:

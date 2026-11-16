@@ -316,3 +316,10 @@ label.menu-item { flex-direction: row; }
 .warn-line { display: flex; gap: 6px; align-items: flex-start; color: #A85F00; font-size: 12.5px; }
 .tune { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
 .data-table tr.best-row td { font-weight: 600; }
+
+/* Speed: suggested configuration (2.4.2) */
+.speed { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.speed-title { font-weight: 600; font-size: 13px; display: flex; gap: 6px; align-items: center; }
+.speed-why { margin: 6px 0 0 18px; padding: 0; color: var(--text-soft); }
+.speed details summary { cursor: pointer; color: var(--text-soft); }
+.speed .link { align-self: flex-start; }
