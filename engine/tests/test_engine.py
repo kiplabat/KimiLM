@@ -49,9 +49,16 @@ def engine():
     else:
         wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{TESTS / "fake_llama_server.py"}" "$@"\n')
         wrapper.chmod(0o755)
+    painter = tmp / ("fake-sd-cli.cmd" if os.name == "nt" else "fake-sd-cli")     # stands in for sd-cli (2.11.0)
+    if os.name == "nt":
+        painter.write_text(f'@"{sys.executable}" "{TESTS / "fake_sd_cli.py"}" %*\n')
+    else:
+        painter.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{TESTS / "fake_sd_cli.py"}" "$@"\n')
+        painter.chmod(0o755)
     port = free_port()
     token = "test-token"
     env = {**os.environ, "DVA_TEST_CPU": "6x12", "DVA_TOKEN": token, "DVA_LLAMA_SERVER": str(wrapper), "DVA_SECRETS": "file",
+           "DVA_SD_CLI": str(painter),
            "PYTHONPATH": str(ENGINE), "OLLAMA_MODELS": str(tmp / "ollama"), "HF_HOME": str(tmp / "hf")}
     log = tmp / "engine-output.log"
     proc = subprocess.Popen([sys.executable, "-m", "dva", "serve", "--port", str(port), "--data-dir", str(tmp / "data")],
@@ -1991,3 +1998,225 @@ def test_a_bundle_gets_its_folder_and_settings_and_missing_programs_are_named(tm
     monkeypatch.setenv("DVA_NODE_IS_ELECTRON", "1")
     assert resolve_command("node") == ("/app/KimiLM.exe", {"ELECTRON_RUN_AS_NODE": "1"})   # the app's own Node
 
+
+
+# ---------------------------------------------------------------------------------------------- pictures (2.11.0)
+def wait_picture(c, job_id, timeout=60):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        job = next(j for j in c.get("/api/images").json()["jobs"] if j["id"] == job_id)
+        if job["state"] != "running":
+            return job
+        time.sleep(0.1)
+    raise AssertionError(f"picture job still running: {job}")
+
+
+def asked(path):
+    """What the stand-in image program was asked for (it writes that into the PNG)."""
+    from PIL import Image
+    with Image.open(path) as img:
+        return json.loads(img.text["asked"]), img.size
+
+
+def test_pictures_are_made_and_changed_on_this_computer(engine):
+    c, tmp = engine["client"], engine["tmp"]
+    start = c.get("/api/images").json()
+    assert start["engines"]["installed"] == ["custom"] and start["engines"]["tag"].startswith("master-")
+    assert not start["models"] and start["default"] is None
+    assert {"z-image-turbo", "sd15", "flux2-klein-4b"} <= {r["key"] for r in start["recipes"]}
+    assert all(r["licence"] and r["page"].startswith("https://") for r in start["recipes"])
+    assert "does not make" in start["claude"]
+    # no image model yet: an agent is not offered the picture tools, and the window says what to do
+    chat = c.post("/api/chats", json={"harness": "agent"}).json()
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "paint a picture of a red kite"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    assert not [s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool"]
+    none = wait_picture(c, c.post("/api/images/generate", json={"prompt": "a red kite"}).json()["id"])
+    assert none["state"] == "failed" and "No image model is set up" in none["error"]
+    assert c.post("/api/images/generate", json={"prompt": " "}).status_code == 400
+
+    # a model whose file is already on this computer is used where it is
+    weights = tmp / "checkpoints" / "tiny-sd.safetensors"
+    weights.parent.mkdir()
+    weights.write_bytes(b"\0" * 4096)
+    assert c.post("/api/images/models", json={"name": "x", "files": {"model": str(tmp / "nope.safetensors")}}).status_code == 400
+    assert c.post("/api/images/models", json={"name": "x", "files": {"vae": str(weights)}}).status_code == 400
+    model = c.post("/api/images/models", json={"name": "Tiny SD", "files": {"model": str(weights)},
+                                               "settings": {"steps": 6, "cfg": 5.5}}).json()
+    assert model["id"] == "tiny-sd" and model["default"] and model["ready"] and model["size"] == 4096
+    made = wait_picture(c, c.post("/api/images/generate", json={
+        "prompt": "a red kite over a green hill", "negative": "people", "width": 650, "height": 480, "seed": 7,
+        "count": 2}).json()["id"])
+    assert made["state"] == "done" and len(made["images"]) == 2, made
+    first, size = asked(made["images"][0]["path"])
+    assert size == (640, 480)                                     # sizes are rounded to what the models accept
+    assert first["model"] == str(weights) and first["prompt"] == "a red kite over a green hill"
+    assert (first["seed"], first["count"], first["steps"], first["cfg"], first["negative"]) == ("7", "2", "6", "5.5", "people")
+    assert made["images"][0]["params"]["seed"] == 7 and made["images"][0]["params"]["mode"] == "new"
+    assert made["images"][0]["params"]["engine"] == "custom" and made["images"][1]["params"]["index"] == 1
+    assert Path(made["images"][0]["path"]).parent == tmp / "data" / "images"
+    assert c.get("/api/file", params={"path": made["images"][0]["path"]}).headers["content-type"] == "image/png"
+    # no seed given: one is chosen and recorded, so the picture can be made again
+    again = wait_picture(c, c.post("/api/images/generate", json={"prompt": "a blue kite"}).json()["id"])
+    assert again["images"][0]["params"]["seed"] > 0 and again["images"][0]["params"]["steps"] == 6
+
+    # changing a picture: redrawn from the original; with a mask only there; a model that follows instructions
+    # about a picture is given it as a reference instead
+    source = made["images"][0]["path"]
+    redo = wait_picture(c, c.post("/api/images/generate", json={"prompt": "make the kite blue", "image": source,
+                                                                "strength": 0.4}).json()["id"])
+    a, _ = asked(redo["images"][0]["path"])
+    assert a["init"] == source and a["strength"] == "0.4" and not a["refs"] and redo["images"][0]["params"]["mode"] == "redraw"
+    part = wait_picture(c, c.post("/api/images/generate", json={"prompt": "a cloud", "image": source, "mask": source}).json()["id"])
+    a, _ = asked(part["images"][0]["path"])
+    assert a["mask"] == source and part["images"][0]["params"]["mode"] == "inpaint"
+    editor = c.post("/api/images/models", json={"name": "Tiny Edit", "files": {"diffusion_model": str(weights), "vae": str(weights)},
+                                                "edit": "reference", "settings": {"steps": 4, "cfg": 1.0, "args": "--offload-to-cpu"}}).json()
+    edit = wait_picture(c, c.post("/api/images/generate", json={"prompt": "remove the hill", "image": source,
+                                                                "model": editor["id"]}).json()["id"])
+    a, _ = asked(edit["images"][0]["path"])
+    assert a["refs"] == [source] and "init" not in a and a["diffusion_model"] == str(weights) and a["vae"] == str(weights)
+    assert "--offload-to-cpu" in a["flags"] and edit["images"][0]["params"]["mode"] == "edit"
+
+    # failures are said in plain words
+    oom = wait_picture(c, c.post("/api/images/generate", json={"prompt": "out of memory please"}).json()["id"])
+    assert oom["state"] == "failed" and "ran out of memory" in oom["error"]
+    c.put(f"/api/images/models/{editor['id']}", json={"settings": {"args": "--no-such-option"}})
+    bad = wait_picture(c, c.post("/api/images/generate", json={"prompt": "a kite", "model": editor["id"]}).json()["id"])
+    assert bad["state"] == "failed" and "did not accept its options" in bad["error"] and "--no-such-option" in bad["error"]
+    slow = c.post("/api/images/generate", json={"prompt": "slow picture of a kite"}).json()
+    time.sleep(0.6)
+    assert c.get("/api/busy").json()["active"] >= 1               # the computer is kept awake meanwhile
+    c.delete(f"/api/images/jobs/{slow['id']}")
+    assert wait_picture(c, slow["id"])["state"] == "stopped"
+
+    # the library remembers every picture with what made it; forgetting one can delete its file
+    library = c.get("/api/images/library").json()["images"]
+    assert len(library) == 6 and library[0]["prompt"] == "remove the hill" and library[0]["model_name"] == "Tiny Edit"
+    c.delete(f"/api/images/library/{library[0]['id']}", params={"file": 1})
+    assert not Path(library[0]["path"]).exists() and len(c.get("/api/images/library").json()["images"]) == 5
+    # choosing the default, removing a model (files the app did not download stay where they are)
+    c.put(f"/api/images/models/{editor['id']}", json={"default": True, "settings": {"args": ""}})
+    assert c.get("/api/images").json()["default"] == editor["id"]
+    c.delete(f"/api/images/models/{editor['id']}", params={"files": 1})
+    state = c.get("/api/images").json()
+    assert [m["id"] for m in state["models"]] == ["tiny-sd"] and state["default"] == "tiny-sd" and weights.exists()
+    assert c.put("/api/images/settings", json={"image_compute": "gpu"}).status_code == 400
+    assert c.put("/api/images/settings", json={"image_compute": "cpu", "image_timeout_minutes": 5}).json()["timeout_minutes"] == 5
+    c.put("/api/images/settings", json={"image_compute": "auto", "image_timeout_minutes": 60})
+
+
+def test_an_agent_makes_a_picture_and_changes_it(engine):
+    c, tmp = engine["client"], engine["tmp"]
+    folder = tmp / "picture-project"
+    folder.mkdir()
+    chat = c.post("/api/chats", json={"harness": "agent", "folders": [str(folder)]}).json()
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "paint a picture of a red kite"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    msg = last_assistant(c, chat["id"])
+    step = next(s for s in msg["meta"]["steps"] if s["type"] == "tool")
+    assert step["name"] == "generate_image" and step["ok"] and step["label"] == "Make picture", step
+    picture = step["media"][0]
+    assert picture["kind"] == "image" and picture["model"] == "Tiny SD" and picture["prompt"] == "a red kite"
+    assert Path(picture["path"]).parent == folder / "images" and Path(picture["path"]).exists()   # in the chat's folder
+    assert picture["path"] in step["result"] and "look_at_image" in step["result"]
+    assert c.get("/api/images/library", params={"chat_id": chat["id"]}).json()["images"][0]["id"] == picture["id"]
+    # the next request changes that picture; it keeps its shape
+    job = c.post(f"/api/chats/{chat['id']}/messages",
+                 json={"text": f"repaint {picture['path']} so that the kite is blue"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
+    assert step["name"] == "edit_image" and step["ok"], step
+    a, size = asked(step["media"][0]["path"])
+    assert a["init"] == picture["path"] and a["prompt"] == "the kite is blue" and size == (512, 512)
+    # a picture outside the chat's folders is not touched
+    job = c.post(f"/api/chats/{chat['id']}/messages",
+                 json={"text": f"repaint {tmp / 'checkpoints' / 'tiny-sd.safetensors'} so that it is blue"}).json()
+    wait_job(c, job["job_id"])
+    step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
+    assert not step["ok"] and "outside the folders" in step["result"] and "media" not in step
+
+
+def test_picture_sizes_recipes_and_file_choice():
+    from dva.images import RECIPES, SD_ASSETS, SLOT_FLAGS, nearest_ratio, openai_size, pick_file
+    from dva.tools.images import size_for
+    row = {"settings": {"width": 1024, "height": 1024}}
+    assert size_for(row, None, None, None) == (1024, 1024) and size_for(row, "square", None, None) == (1024, 1024)
+    wide = size_for(row, "landscape", None, None)
+    assert wide == (1248, 832) and abs(wide[0] * wide[1] - 1024 * 1024) < 1024 * 1024 * 0.03   # same number of pixels
+    assert size_for(row, "tall", None, None) == (768, 1360) and size_for(row, "wide", 800, 600) == (800, 600)
+    assert size_for({"settings": {}}, "portrait", None, None) == (416, 624)
+    assert openai_size(1024, 1024) == "1024x1024" and openai_size(1248, 832) == "1536x1024" and openai_size(768, 1360) == "1024x1536"
+    assert nearest_ratio(1248, 832) == "3:2" and nearest_ratio(768, 1360) == "9:16" and nearest_ratio(512, 512) == "1:1"
+    # every recipe names parts the image program has an option for, a licence and where to read it
+    for r in RECIPES:
+        assert {p["slot"] for p in r["parts"]} <= set(SLOT_FLAGS) and r["licence"] and r["page"].startswith("https://huggingface.co/")
+        assert {"model", "diffusion_model"} & {p["slot"] for p in r["parts"]} and {"steps", "cfg", "width", "height"} <= set(r["defaults"])
+    assert set(SD_ASSETS["windows"]) == {"cpu", "vulkan", "cuda"}
+    # the file of a repository that fits: the preferred quantisation first; a second source when the first has none
+    part = next(p for p in RECIPES[0]["parts"] if p["slot"] == "diffusion_model")
+    listing = {"leejet/Z-Image-Turbo-GGUF": [{"path": "z_image_turbo-Q8_0.gguf", "size": 7_000}, {"path": "README.md", "size": 1},
+                                              {"path": "z_image_turbo-Q4_K.gguf", "size": 4_000}, {"path": "z_image_turbo-Q3_K.gguf", "size": 3_000}]}
+    assert pick_file(listing, part)[1]["path"] == "z_image_turbo-Q4_K.gguf"
+    listing["leejet/Z-Image-Turbo-GGUF"] = [f for f in listing["leejet/Z-Image-Turbo-GGUF"] if "Q4" not in f["path"]]
+    assert pick_file(listing, part)[1]["path"] == "z_image_turbo-Q3_K.gguf"
+    vae = next(p for p in RECIPES[0]["parts"] if p["slot"] == "vae")
+    assert pick_file({"black-forest-labs/FLUX.1-schnell": [{"path": "ae.safetensors", "size": 300}, {"path": "vae/x.safetensors", "size": 1}]},
+                     vae) == ("black-forest-labs/FLUX.1-schnell", {"path": "ae.safetensors", "size": 300})
+    assert pick_file({}, vae) == (None, None)
+
+
+def test_the_image_engine_is_chosen_by_the_cards_and_memory_is_shared_with_text_models(tmp_path, monkeypatch):
+    import asyncio
+    import types
+    from dva import images
+    from dva.images import EXE, Images
+    monkeypatch.delenv("DVA_SD_CLI", raising=False)
+    settings = {}
+    db = types.SimpleNamespace(setting=lambda k, d=None: settings.get(k, d), set_setting=settings.__setitem__)
+    stopped = []
+
+    class Runtime:
+        free = 4 * 2**30
+
+        def __init__(self):
+            mk = lambda name, users, used: types.SimpleNamespace(model_id=name, users=users, last_used=used)   # noqa: E731
+            self.servers = {s.model_id: s for s in (mk("old-idle", 0, 1), mk("in-use", 1, 2), mk("new-idle", 0, 3))}
+
+        def _free_bytes(self):
+            return self.free
+
+        async def _stop_server(self, server):
+            stopped.append(server.model_id)
+            del self.servers[server.model_id]
+            self.free += 3 * 2**30
+    app = types.SimpleNamespace(db=db, bus=types.SimpleNamespace(publish=lambda *a, **k: None), log=lambda m: None,
+                                paths=types.SimpleNamespace(data=tmp_path), runtime=Runtime())
+    im = Images(app)
+    assert im.choose_engine() == (None, None) and im.available_engines()
+    for backend in ("cpu", "vulkan", "cuda"):
+        im.engine_dir(backend).mkdir(parents=True)
+        (im.engine_dir(backend) / EXE).write_text("")
+    cards = []
+    monkeypatch.setattr(Images, "_cards", lambda self: cards)
+    assert im.choose_engine()[0] == "cpu"                      # no real graphics card: the processor build
+    cards.append({"name": "AMD Radeon RX 7600", "vendor": "amd"})
+    assert im.choose_engine()[0] == "vulkan"                   # a card that is not NVIDIA's: Vulkan, never CUDA
+    cards.append({"name": "NVIDIA GeForce RTX 4060", "vendor": "nvidia"})
+    assert im.choose_engine()[0] == "cuda"
+    settings["image_compute"] = "cpu"
+    assert im.choose_engine()[0] == "cpu"                      # the user's choice wins
+    settings["image_compute"] = "vulkan"
+    assert im.choose_engine()[0] == "vulkan"
+    im.remove_engine("vulkan")
+    assert im.choose_engine()[0] == "cuda" and set(im.engines()) == {"cpu", "cuda"}
+    # memory: idle text models go, least recently used first, only as many as needed; one in use stays
+    assert asyncio.run(im._free_memory(5 * 2**30)) and stopped == ["old-idle"]
+    assert asyncio.run(im._free_memory(3 * 2**30)) and stopped == ["old-idle"]            # fits already
+    assert not asyncio.run(im._free_memory(40 * 2**30)) and stopped == ["old-idle", "new-idle"]
+    assert list(app.runtime.servers) == ["in-use"]
+    # what failed is said in plain words
+    row = {"name": "Tiny"}
+    assert "ran out of memory" in images.Images._explain(["ggml_aligned_malloc: failed to allocate 9000 MB"], 1, row)
+    assert "did not accept its options" in images.Images._explain(["error: unknown argument: --nope"], 1, row)
+    assert "unsupported model" in images.Images._explain(["loading", "[ERROR] load failed: unsupported model"], 1, row)

@@ -289,12 +289,128 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         await A().runtime.unload((data or {}).get("model_id"))
         return {"ok": True}
 
+    # ------------------------------------------------------------------ pictures (2.11.0)
+    @api.get("/api/images")
+    async def images_overview():
+        return await asyncio.to_thread(A().images.status)
+
+    @api.put("/api/images/settings")
+    async def images_settings(request: Request):
+        a = A()
+        data = await body(request)
+        if "image_compute" in data:
+            if data["image_compute"] not in ("auto", "cpu", "vulkan", "cuda", "metal", "custom"):
+                raise ValueError("image_compute must be auto, cpu, vulkan, cuda or metal")
+            a.db.set_setting("image_compute", data["image_compute"])
+        if "image_timeout_minutes" in data:
+            a.db.set_setting("image_timeout_minutes", max(1, min(720, int(data["image_timeout_minutes"] or 60))))
+        a.bus.publish("images_changed")
+        return await asyncio.to_thread(a.images.status)
+
+    @api.post("/api/images/engine")
+    async def images_engine_install(request: Request):
+        a = A()
+        backend = (await body(request)).get("backend")
+        if backend not in a.images.available_engines():
+            raise ValueError(f"No {backend} build of the image engine exists for this computer")
+
+        async def run():
+            try:
+                await a.images.install_engine(backend)
+            except Exception as exc:               # already reported through event image_engine
+                a.log(f"image engine install ({backend}): {type(exc).__name__}: {exc}")
+            a.bus.publish("images_changed")
+        a.spawn(run())
+        return {"ok": True}
+
+    @api.delete("/api/images/engine/{backend}")
+    async def images_engine_remove(backend: str):
+        A().images.remove_engine(backend)
+        A().bus.publish("images_changed")
+        return {"ok": True}
+
+    @api.post("/api/images/recipes/{key}/download")
+    async def images_recipe_download(key: str):
+        return {k: v for k, v in A().images.start_download(key).items() if k != "cancel"}
+
+    @api.delete("/api/images/recipes/{key}/download")
+    async def images_recipe_cancel(key: str):
+        A().images.cancel_download(key)
+        return {"ok": True}
+
+    @api.get("/api/images/online/{provider}/models")
+    async def images_online_models(provider: str):
+        a = A()
+        from .images import ONLINE
+        if provider not in ONLINE:
+            raise ValueError("Online pictures come from OpenAI or Google. Claude reads pictures but does not make them.")
+        if not a.providers.ready(provider):
+            raise ValueError(f"Add the {ONLINE[provider]['name']} key first")
+        return await a.images.online_candidates(provider)
+
+    @api.post("/api/images/models")
+    async def images_model_add(request: Request):
+        a = A()
+        data = await body(request)
+        if data.get("kind") == "online":
+            return a.images.add_online(data.get("provider"), data.get("remote_id"), data.get("name"))
+        return a.images.add_local(data.get("name"), data.get("files") or {}, data.get("settings"),
+                                  edit=data.get("edit") or "img2img")
+
+    @api.put("/api/images/models/{model_id}")
+    async def images_model_update(model_id: str, request: Request):
+        return A().images.update(model_id, await body(request))
+
+    @api.delete("/api/images/models/{model_id}")
+    async def images_model_remove(model_id: str, files: int = 0):
+        A().images.remove(model_id, delete_files=bool(files))
+        return {"ok": True}
+
+    @api.post("/api/images/generate")
+    async def images_generate(request: Request):
+        data = await body(request)
+        if not str(data.get("prompt") or "").strip():
+            raise ValueError("Say what the picture should show")
+        return A().images.start_job(data)
+
+    @api.delete("/api/images/jobs/{job_id}")
+    async def images_job_stop(job_id: str):
+        A().images.stop_job(job_id)
+        return {"ok": True}
+
+    @api.post("/api/images/upload")
+    async def images_upload(file: UploadFile = File(...)):
+        """A picture to change, from the Images window (kept in the app's own folder)."""
+        folder = A().paths.data / "images" / "sources"
+        folder.mkdir(parents=True, exist_ok=True)
+        dest = folder / (new_id("src_") + Path(file.filename or "picture.png").suffix.lower())
+        size = 0
+        with dest.open("wb") as f:
+            while chunk := await file.read(1 << 20):
+                size += len(chunk)
+                if size > 50 * 2**20:
+                    f.close()
+                    dest.unlink(missing_ok=True)
+                    raise ValueError("Pictures up to 50 MB")
+                f.write(chunk)
+        return {"path": str(dest), "name": file.filename}
+
+    @api.get("/api/images/library")
+    async def images_library(limit: int = 60, chat_id: str = ""):
+        return {"images": A().images.library(max(1, min(300, limit)), chat_id or None)}
+
+    @api.delete("/api/images/library/{media_id}")
+    async def images_forget(media_id: str, file: int = 0):
+        A().images.forget(media_id, delete_file=bool(file))
+        return {"ok": True}
+
     # ------------------------------------------------------------------ long-running tasks (2.9.0)
     @api.get("/api/busy")
     async def busy():
         """What is running right now (the desktop shell keeps the computer awake while this is not empty)."""
         a = A()
         rows = [a.db.get("jobs", jid) or {} for jid in list(a.jobs.tasks)]
+        rows += [{"title": "Making a picture"} for _ in a.images.tasks]
         return {"active": len(rows), "titles": [r.get("title") or "Task" for r in rows][:6],
                 "waiting": sum(r.get("status") == "waiting" for r in rows)}
 

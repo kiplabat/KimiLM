@@ -74,7 +74,40 @@ async def requests_():
 async def openai_models(request: Request):
     if request.headers.get("authorization") != "Bearer sk-test":
         return JSONResponse({"error": {"message": "Incorrect API key"}}, 401)
-    return {"data": [{"id": "gpt-test-pro"}, {"id": "gpt-test-mini"}, {"id": "text-embedding-3-small"}]}
+    return {"data": [{"id": "gpt-test-pro"}, {"id": "gpt-test-mini"}, {"id": "text-embedding-3-small"},
+                     {"id": "gpt-image-test"}]}
+
+
+def png(colour=(200, 30, 30), size=(64, 48)):
+    import base64
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", size, colour).save(buf, "PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+@app.post("/openai/v1/images/generations")
+async def openai_images(request: Request):
+    body = await request.json()
+    REQUESTS.append({"provider": "openai-images", "body": body, "headers": dict(request.headers)})
+    if request.headers.get("authorization") != "Bearer sk-test":
+        return JSONResponse({"error": {"message": "Incorrect API key"}}, 401)
+    if "forbidden picture" in body.get("prompt", ""):
+        return JSONResponse({"error": {"message": "Your request was rejected by the safety system."}}, 400)
+    return {"created": 1, "data": [{"b64_json": png()} for _ in range(int(body.get("n") or 1))],
+            "usage": {"input_tokens": 20, "output_tokens": 1500}}
+
+
+@app.post("/openai/v1/images/edits")
+async def openai_image_edits(request: Request):
+    form = await request.form()
+    files = form.getlist("image[]")
+    REQUESTS.append({"provider": "openai-images", "edit": True, "headers": dict(request.headers),
+                     "body": {"model": form.get("model"), "prompt": form.get("prompt"), "size": form.get("size"),
+                              "images": [f.filename for f in files], "bytes": [len(await f.read()) for f in files],
+                              "mask": getattr(form.get("mask"), "filename", None)}})
+    return {"created": 1, "data": [{"b64_json": png((30, 30, 200))}], "usage": {"input_tokens": 300, "output_tokens": 1500}}
 
 
 @app.post("/openai/v1/responses")
@@ -197,7 +230,18 @@ async def gemini_models(request: Request):
     if request.headers.get("authorization") != "Bearer gm-test":
         return JSONResponse([{"error": {"message": "API key not valid"}}], 400)
     return {"object": "list", "data": [{"id": "models/gemini-test-pro"}, {"id": "models/gemini-test-flash"},
-                                       {"id": "models/text-embedding-004"}]}
+                                       {"id": "models/text-embedding-004"}, {"id": "models/gemini-test-flash-image"}]}
+
+
+@app.post("/gemini/models/{name}:generateContent")
+async def gemini_generate(name: str, request: Request):
+    body = await request.json()
+    REQUESTS.append({"provider": "gemini-images", "model": name, "body": body, "headers": dict(request.headers)})
+    if request.headers.get("x-goog-api-key") != "gm-test":
+        return JSONResponse({"error": {"message": "API key not valid"}}, 400)
+    return {"candidates": [{"content": {"parts": [{"text": "Here is the picture."},
+                                                  {"inlineData": {"mimeType": "image/png", "data": png((30, 200, 30))}}]}}],
+            "usageMetadata": {"promptTokenCount": 12, "candidatesTokenCount": 1300}}
 
 
 @app.post("/gemini/chat/completions")

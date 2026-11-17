@@ -1,6 +1,8 @@
 {
   "llama_cpp_tag": "b12207",
   "llama_cpp_repo": "ggml-org/llama.cpp",
+  "sd_cpp_tag": "master-1106-532d2c1",
+  "sd_cpp_repo": "leejet/stable-diffusion.cpp",
   "playwright_mcp": "0.0.85",
   "python_embed": "3.12.10",
   "backend_assets": {

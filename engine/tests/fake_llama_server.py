@@ -113,12 +113,16 @@ def decide(body):
     for trigger, tool, key in (("search earlier chats for ", "search_chats", "query"),
                                ("search knowledge for ", "search_knowledge", "query"),
                                ("note decision: ", "update_project_notes", "text"),
-                               ("read resource ", "read_connector_resource", "uri")):
+                               ("read resource ", "read_connector_resource", "uri"),
+                               ("paint a picture of ", "generate_image", "prompt")):
         if trigger in text and tool in tools and not after_tool:
             args = {key: text.split(trigger, 1)[1].strip()}
             if tool == "update_project_notes":
                 args["section"] = "Decisions"
             return {"tool": (tool, args)}
+    if "repaint " in text and "edit_image" in tools and not after_tool:      # "repaint <path> so that <what>"
+        path, _, what = text.split("repaint ", 1)[1].partition(" so that ")
+        return {"tool": ("edit_image", {"image": path.strip(), "prompt": what.strip()})}
     if after_tool and msgs[-1].get("content", "").startswith(("- chat_id", "[", "Added to the project notes",
                                                               "No earlier chat")):
         return {"text": "Found: " + msgs[-1]["content"][:600].replace("\n", " ")}

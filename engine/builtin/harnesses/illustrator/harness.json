@@ -1,0 +1,18 @@
+{
+  "name": "Illustrator",
+  "description": "Makes and changes pictures: writes the prompt for the image model, looks at the result when its own model can see, and improves it. Needs an image model (Images).",
+  "type": "loop",
+  "mode": "agent",
+  "tools": [
+    "files",
+    "images",
+    "vision",
+    "memory"
+  ],
+  "connectors": false,
+  "max_steps": 10,
+  "temperature": 0.6,
+  "memory": true,
+  "learn": true,
+  "icon": "eye"
+}

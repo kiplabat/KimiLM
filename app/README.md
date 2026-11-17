@@ -30,6 +30,15 @@ can sign in with the browser (OAuth) or use keys and headers; MCP bundles (`.mcp
 tools, a server's resources and prompts are available. The protocol itself is handled by the bundled client
 library, which speaks the 2026-07-28 revision and the earlier ones.
 
+From 2.11.0 KimiLM **makes and changes pictures** (the Images window, and the tools `generate_image` and
+`edit_image` for agents). On this computer the pictures come from stable-diffusion.cpp, which the app downloads
+like the llama.cpp runtimes (processor, Vulkan and CUDA builds) and runs only while a picture is made, with
+recommended models to download (Z-Image Turbo, Stable Diffusion 1.5, SDXL Turbo, FLUX.2 klein) or a model file you
+already have; nothing leaves the computer. Online, OpenAI and Google image models work with the keys already
+saved for those providers and count against the monthly online budget. Claude reads pictures but does not make
+them: a chat on Claude asks for pictures through the same tools. Pictures appear in the chat where they were
+made, can be downloaded, and are kept in a library with their prompt, model and seed.
+
 KimiLM was called **Datavera Agent** up to 2.1.x. Version 2.2.0 renamed it; see "Upgrading from Datavera Agent".
 
 ```
