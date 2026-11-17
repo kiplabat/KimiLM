@@ -21,6 +21,12 @@ context in memory. Now:
              is stopped, classified and tried again with a fitting change; a failed planner call falls back to
              code, so one bad call cannot end the run.
 
+2.7.0 adds: the run's state is saved after every change (table `runs`), so a run that was stopped, or cut off
+by a crash or restart, continues from its accepted steps (Orchestra.restore); each step of the general agent
+gets only the tool groups its goal calls for (lean_kit), the full set on a fresh attempt; a step that keeps
+failing moves to a stronger model if one is installed; the result check can run on a smaller model
+(`check_model`); and briefs ask for a result length that fits the computer's writing speed.
+
 Agents can read the board and ask the planner a question. Chats, projects and scheduled tasks use this
 automatically when a request looks multi-step; team harnesses, the team builder and `delegate` always use it."""
 import asyncio
@@ -29,7 +35,7 @@ import re
 import time
 from pathlib import Path
 
-from .db import new_id
+from .db import new_id, now
 from .forecast import pretty_seconds, pretty_tokens
 from .llm import LLMError, estimate_tokens
 from .providers import is_cloud
@@ -192,6 +198,34 @@ def classify(error, timed_out=False):
     return "error" if low else None
 
 
+# What a step's goal has to mention for a tool group to be handed to its agent (files are always given).
+KIT_WORDS = {
+    "web": r"web|online|internet|search|look up|url|https?:|site|page|latest|news|download|research|source|publish|api\b",
+    "python": r"python|code|script|run\b|test|comput|calculat|analy[sz]|csv|xlsx|excel|data|chart|plot|graph|command|"
+              r"shell|git\b|install|build|convert|parse|json|sql|statistic|average|sum\b|count",
+    "memory": r"remember|memory|earlier chat|previous chat|chat history|knowledge|project notes?",
+    "skills": r"skill",
+    "automation": r"schedul|harness|every (day|week|hour|morning)|recurring|remind",
+    "vision": r"image|photo|picture|screenshot|video|diagram|scan",
+}
+
+
+def lean_kit(goal, harness_groups=None):
+    """The tool groups a step needs, from the words of its goal. A smaller tool list is less for the model to
+    read and to hold in context, and a small model picks the right tool more often from a short list."""
+    groups = ["files"] + [g for g, words in KIT_WORDS.items() if re.search(words, goal or "", re.I)]
+    if harness_groups is not None:
+        groups = [g for g in groups if g in harness_groups]
+    return groups
+
+
+# the fields of a step that are saved so a run can continue after a stop, a crash or a restart
+SAVED = ("id", "name", "goal", "done_when", "depends_on", "role", "harness", "agent", "model", "limits", "status",
+         "auto_model", "chosen", "kit", "started_at",
+         "attempts", "output", "files", "loop", "expects", "rounds", "feedback", "partial", "note", "result_file",
+         "chat_id", "used", "forecast", "brief_tokens", "kind", "best", "error", "result_state", "full_kit")
+
+
 class Orchestra:
     """One run inside a chat turn. `turn` is the lead's Turn (its model plans and checks)."""
 
@@ -228,6 +262,66 @@ class Orchestra:
                      "mode": "sequence" if self.sequence else "parallel", "models": [], "totals": {}}
         self._wake = asyncio.Event()
         self._tick = time.monotonic()
+        self.outcome = "done"                 # how drive() ended: done | stopped | interrupted
+        self.resumes = 0
+        self.lean = bool(s("lean_tools", True))
+        self.escalate = bool(s("escalate_models", True))
+
+    # ------------------------------------------------------------------ saved state: a run can continue later
+    def save(self, status="running"):
+        """Write the run's state to the database (after every start and every settled step)."""
+        try:
+            state = {"overall": self.overall, "final_hint": self.final_hint, "sequence": self.sequence,
+                     "chain": self.chain, "roster": self.roster, "dir": str(self.dir), "log": self.step["log"][-40:],
+                     "agent_chats": self.agent_chats,
+                     "need": dict(self.fit.need) if self.fit is not None else {},
+                     "tasks": [{k: t.get(k) for k in SAVED} for t in self.tasks.values()]}
+            row = {"chat_id": self.turn.chat["id"], "status": status, "state": state, "resumes": self.resumes,
+                   "updated": now()}
+            if self.db.get("runs", self.id):
+                self.db.update("runs", self.id, row)
+            else:                             # a new run in this chat replaces older ones that were left open
+                self.db.run("UPDATE runs SET status='superseded' WHERE chat_id=? AND status IN "
+                            "('interrupted','stopped','running')", (self.turn.chat["id"],))
+                keep = int(self.db.setting("runs_kept", 300))        # the history keeps the newest runs
+                self.db.run("DELETE FROM runs WHERE id NOT IN (SELECT id FROM runs ORDER BY created DESC LIMIT ?)",
+                            (keep,))
+                self.db.insert("runs", {"id": self.id, "created": now(), **row})
+        except Exception as exc:              # saving must never stop a run
+            self.app.log(f"saving run {self.id}: {type(exc).__name__}: {exc}")
+
+    @classmethod
+    def restore(cls, turn, row, fit=None):
+        """Continue a saved run: accepted steps keep their results; a step that was working, being checked or
+        waiting starts again (the interrupted attempt is not counted); failed steps stay failed."""
+        state = row.get("state") or {}
+        self = cls(turn, roster=state.get("roster"), overall=state.get("overall"), fit=fit)
+        self.id = self.step["id"] = row["id"]
+        self.final_hint = state.get("final_hint") or ""
+        self.chain = bool(state.get("chain"))
+        self.resumes = int(row.get("resumes") or 0) + 1
+        self.step["log"] = list(state.get("log") or [])
+        if state.get("dir"):
+            self.dir = Path(state["dir"])
+            self.dir.mkdir(parents=True, exist_ok=True)
+            self.step["folder"] = str(self.dir)
+        if self.fit is not None:
+            for model, tokens in (state.get("need") or {}).items():
+                self.fit.want(model, tokens)
+        for saved in state.get("tasks") or []:
+            t = {"output": "", "files": [], "feedback": [], "attempts": 0, "depends_on": [], "limits": {}, **saved}
+            if t["status"] in ("running", "review", "paused"):
+                t["attempts"] = max(0, int(t.get("attempts") or 0) - 1)
+                t.update(status="waiting", chat_id=None, error=None, result_state=None)
+            elif t["status"] == "cancelled" and t.get("note") in ("the run ended before this step", "left paused"):
+                t.update(status="waiting", note=None)
+            self.tasks[t["id"]] = t
+            self.settled[t["id"]] = asyncio.Event()
+            if t["status"] in SETTLED:
+                self.settled[t["id"]].set()
+        done = sum(t["status"] == "done" for t in self.tasks.values())
+        self.logline(f"Continuing this run: {done} of {len(self.tasks)} steps were already accepted.")
+        return self
 
     # ------------------------------------------------------------------ helpers
     @property
@@ -253,7 +347,7 @@ class Orchestra:
         model = self.app.models.get_any(t["model"]) if t.get("model") else None
         out = {k: t.get(k) for k in ("id", "name", "agent", "done_when", "depends_on", "role", "harness", "model",
                                      "status", "attempts", "chat_id", "progress", "note", "files", "wait_reason",
-                                     "rounds", "loop", "partial", "forecast", "used", "result_file", "kind")}
+                                     "rounds", "loop", "partial", "forecast", "used", "result_file", "kind", "kit")}
         out["goal"] = _clip(t.get("goal"), 400)
         out["output"] = _clip(t.get("output"), 700)
         out["model_name"] = (model or {}).get("name") or t.get("model")
@@ -370,8 +464,11 @@ class Orchestra:
             self.tasks[t["id"]] = t
             self.settled[t["id"]] = asyncio.Event()
         self._order()
-        self.turn.assign_models([t for t in self.tasks.values() if t["status"] == "waiting" and
-                                 (not t.get("model") or str(t["model"]).startswith("role:") or t["model"] == "auto")])
+        auto = [t for t in self.tasks.values() if t["status"] == "waiting" and
+                (not t.get("model") or str(t["model"]).startswith("role:") or t["model"] == "auto")]
+        for t in auto:
+            t["auto_model"] = True             # nobody fixed its model: it may be chosen from measured results
+        self.turn.assign_models(auto)
 
     def preset(self, items):
         """Steps given directly (team builder with tasks, the delegate tool): no planning call."""
@@ -410,6 +507,11 @@ class Orchestra:
             "- Usual shapes: find → extract → analyse → write; write code → run and fix → review; get data → clean → "
             "chart → report; outline → draft → edit. Do not add a step only to check another step: every result is "
             "checked for you.\n"
+            '- Two examples of good steps: {"id":"t1","name":"Collect prices","goal":"Read prices.csv in the project '
+            'folder and list each product with its 2024 and 2025 price.","done_when":"a table with every product and '
+            'both prices","harness":"agent"} then {"id":"t2","name":"Price changes","goal":"Using the table from t1, '
+            'compute the percentage change per product with Python and save changes.csv.","done_when":"changes.csv '
+            'exists and lists every product with its change","depends_on":["t1"],"loop":true,"expects":["changes.csv"]}.\n'
             "- 'final' says what the final answer must contain." + roster + " JSON only.")
         schema = plan_schema(self.harness_ids, self.roles(), limit, allow_direct, self.agents())
         try:
@@ -486,8 +588,10 @@ class Orchestra:
             tokens += sum(min(self.dep_budget(t) // 3, 1500) for _ in t["depends_on"])
         else:
             tokens, exact = await fc.count(brief, model)
+        snaps = self.app.runtime.snapshots       # a saved snapshot means the system prompt and tools are not read
+        saved = not is_cloud(model) and snaps.enabled() and any(snaps.folder(model).glob("*.bin"))
         f = fc.step(self.harness_of(t), model, tokens, self.reply_limit(t), exact=exact,
-                    cached_fixed=(model, t.get("harness")) in self.warm)
+                    cached_fixed=saved or (model, t.get("harness")) in self.warm)
         t["forecast"] = f
         t["brief_tokens"] = tokens
         if self.fit is not None and not is_cloud(model):
@@ -612,8 +716,20 @@ class Orchestra:
                      "Work efficiently: use tools only as needed. If code fails, read the error, fix the cause and run "
                      "it again; check outputs before you rely on them. Use ask_lead only if you are truly blocked.\n"
                      "Finish with your result: what you did, the result itself (facts, numbers, sources, file paths), "
-                     "and whether 'done when' is met.")
+                     "and whether 'done when' is met." + self.length_hint(t))
         return "\n\n".join(parts)
+
+    def length_hint(self, t):
+        """Writing is the slowest thing a local model does, so a result should be as long as it needs to be and
+        no longer: about `writing_budget_seconds` of writing at this computer's speed, long material in a file."""
+        budget = float(self.db.setting("writing_budget_seconds", 180) or 0)
+        model = t.get("model") or self.turn.model_id
+        if budget <= 0 or is_cloud(model):
+            return ""
+        _, writes = self.app.forecaster.speeds(model)
+        words = int(max(120, min(700, writes * budget * 0.7)) // 10 * 10)
+        return (f" Keep the reply under about {words} words; put anything longer (full texts, tables, code) in a "
+                "file in the shared team folder and give its path.")
 
     def _files_since(self, since):
         try:
@@ -651,6 +767,14 @@ class Orchestra:
         model = t.get("model") or self.turn.model_id
         if model and not self.app.models.get_any(model):
             model = self.turn.model_id
+        if t.get("auto_model") and not t.get("chat_id") and not t.get("chosen") and not is_cloud(model) \
+                and self.db.setting("learned_model_choice", True):
+            t["chosen"] = True                 # once per step: from what steps like this did on each model here
+            picked, why = self.app.forecaster.choose(t.get("harness") or "agent", model,
+                                                     [c["id"] for c in self.app.router.local()])
+            if why and picked != model:
+                self.logline(f"{t['id']} runs on {self.model_name(picked)}: {why}.")
+                model = picked
         t["model"] = model
         if fresh:                                   # a new agent with an empty context
             if t.get("chat_id"):
@@ -661,13 +785,18 @@ class Orchestra:
             t["chat_id"] = None
         chat_id = t.get("chat_id") or (self.agent_chats.get(t["agent"]) if t.get("agent") else None)
         message = text or self.brief(t)
+        limits = dict(t.get("limits") or {})
+        if self.lean and not limits.get("tools") and (t.get("harness") or "agent") == "agent" and not t.get("full_kit"):
+            groups = self.harness_of(t).get("tools")
+            limits["tools"] = lean_kit(f"{t['goal']} {t.get('done_when') or ''}", groups)
+        t["kit"] = limits.get("tools")
         if not chat_id:
             name = t.get("agent") or t["name"]
             chat = self.app.create_chat(project_id=parent.get("project_id"), title=f"{name}: {t['goal'][:60]}",
                                         model=model, harness=t.get("harness") or "agent",
                                         connectors=parent.get("connectors"),
                                         folders=self.turn.folders() + [str(self.dir)], origin="agent",
-                                        settings=clean_limits(t.get("limits")), parent_chat_id=parent["id"],
+                                        settings=clean_limits(limits), parent_chat_id=parent["id"],
                                         agent_name=name)
             chat_id = chat["id"]
             if t.get("agent"):
@@ -694,6 +823,7 @@ class Orchestra:
                                   payload={"auto_approve": self.turn.auto_approve})
         t["job_id"] = job["id"]
         self.handles[t["id"]] = self.app.spawn(self._watch(t, job["id"]))
+        self.save()
         self.publish()
 
     async def _watch(self, t, job_id):
@@ -728,7 +858,13 @@ class Orchestra:
             int(stats.get("output_tokens") or 0)
         used = t.get("used") or {"tokens": 0, "seconds": 0}
         t["used"] = {"tokens": used["tokens"] + tokens, "seconds": round(used["seconds"] + float(stats.get("seconds") or 0)),
-                     "peak": max(int(used.get("peak") or 0), int(stats.get("peak_prompt") or 0))}
+                     "peak": max(int(used.get("peak") or 0), int(stats.get("peak_prompt") or 0)),
+                     # the timeline of a step: what was read, what came from the cache, what was written
+                     "read": int(used.get("read") or 0) + int(stats.get("prompt_tokens") or 0),
+                     "cached": int(used.get("cached") or 0) + int(stats.get("cached_tokens") or 0),
+                     "written": int(used.get("written") or 0) + int(stats.get("output_tokens") or 0),
+                     "calls": int(used.get("calls") or 0) + int(stats.get("model_calls") or 0),
+                     "tools": int(used.get("tools") or 0) + sum(1 for s in meta.get("steps", []) if s.get("type") == "tool")}
         ok = not error and bool(t["output"])
         try:
             if t["attempts"] == 1 or t.get("_fresh"):   # later rounds in the same chat start from a longer prompt
@@ -752,6 +888,8 @@ class Orchestra:
         self.settled[t["id"]].set()
         if status in ("cancelled",) and t.get("job_id"):
             self.app.jobs.cancel(t["job_id"])
+        if self.outcome == "done":             # (not while a stopped run is being wound down: its saved state stays)
+            self.save()
 
     def _save_result(self, t):
         """Every accepted result is a file in the team folder: later steps can read all of it, and the run's
@@ -798,11 +936,23 @@ class Orchestra:
         user = (f"Task: {_clip(t['goal'], 600)}\n\nAcceptance test (done when): {t['done_when']}\n\n"
                 f"Result:\n{_clip(t['output'], room)}"
                 + (f"\n\nFiles saved: {', '.join(t['files'][:12])}" if t.get("files") else ""))
+        checker = self.check_model()
         try:
-            await turn.hold_model()
-            out = (await turn.complete([{"role": "system", "content": VERIFY_SYSTEM},
-                                        {"role": "user", "content": user}], schema=VERIFY_SCHEMA,
-                                       max_tokens=220, temperature=0.1))["json"]
+            if checker:                        # a smaller local model does the check (Settings → Teams)
+                overrides = None
+                if self.fit is not None:
+                    self.fit.want(checker, 6000)
+                    overrides = self.fit.overrides(self.app.runtime, checker)
+                self.used.add(checker)
+                async with self.app.runtime.lease(checker, on_wait=turn.status, overrides=overrides) as server:
+                    out = await self.app.llm.json([{"role": "system", "content": VERIFY_SYSTEM},
+                                                   {"role": "user", "content": user}], VERIFY_SCHEMA,
+                                                  max_tokens=220, server=server)
+            else:
+                await turn.hold_model()
+                out = (await turn.complete([{"role": "system", "content": VERIFY_SYSTEM},
+                                            {"role": "user", "content": user}], schema=VERIFY_SCHEMA,
+                                           max_tokens=220, temperature=0.1))["json"]
         except Exception as exc:               # the check itself failed: code checks passed, so accept and say so
             if isinstance(exc, asyncio.CancelledError):
                 raise
@@ -814,6 +964,23 @@ class Orchestra:
             if not is_cloud(turn.model_id):
                 await turn.drop_model()        # the next step gets the model
         return bool(out.get("met")), (out.get("reason") or "").strip()
+
+    def check_model(self):
+        """The model that checks results when it is not the planner's own: 'check_model' in Settings is empty
+        (the planner's model), 'smallest' (the smallest installed local model, if smaller than the planner's),
+        or a model's id. A small model checks in a fraction of the time; whether its verdicts are good enough
+        on a given computer is what the evaluation (Settings) is for."""
+        choice = self.db.setting("check_model", "") or ""
+        if not choice or choice == "planner":
+            return None
+        rows = [r for r in self.db.all("SELECT id, size FROM models") if r.get("size")]
+        mine = next((r["size"] for r in rows if r["id"] == self.turn.model_id), None)
+        if choice == "smallest":
+            rows = sorted((r for r in rows if r["id"] != self.turn.model_id), key=lambda r: r["size"])
+            if rows and (mine is None or rows[0]["size"] < mine * 0.75 or is_cloud(self.turn.model_id)):
+                return rows[0]["id"]
+            return None
+        return choice if any(r["id"] == choice for r in rows) and choice != self.turn.model_id else None
 
     def keep_best(self, t, problems, hard):
         """Remember the best attempt so far (no hard problem beats one with; then the longer result)."""
@@ -840,6 +1007,7 @@ class Orchestra:
             met, reason = await self.verify(t)
             if met:
                 t["kind"] = None
+                self.judge(t, True)
                 self.settle(t, "done", None if t["attempts"] == 1 else f"passed in round {t['attempts']}")
                 self.logline(f"Accepted {t['id']}" + (f" in round {t['attempts']}" if t["attempts"] > 1 else "") + ".")
                 return
@@ -866,6 +1034,9 @@ class Orchestra:
         fresh = repeated or kind in ("timeout", "context", "memory")
         t["_fresh"] = fresh
         if fresh:
+            t["full_kit"] = True              # a fresh attempt gets every tool of its harness
+            if self.escalate and repeated:
+                self.step_up(t)
             self.logline(f"Round {t['attempts'] + 1} of {t['rounds']} for {t['id']} with a fresh agent"
                          + (" (the same objection twice)" if repeated else f" ({kind})") + f": {why[:160]}")
             await self.start(t, self.brief(t, redo=(
@@ -878,8 +1049,32 @@ class Orchestra:
             await self.start(t, "The planner reviewed your result and asks for this:\n" + _clip(why, 800)
                              + "\n\nFix it, check it, and reply with the complete corrected result.")
 
+    def step_up(self, t):
+        """A step that failed the same way twice moves to a stronger model, if one is installed and allowed."""
+        strong, _why = self.app.router.pick("strategist", chat=self.turn.chat, project=self.turn.project)
+        names = {c["id"]: c for c in self.app.router.local()}
+        if not strong or strong == t["model"]:
+            return
+        if is_cloud(strong):
+            if "files" in self.turn.private:   # the step may hold your files: keep it on this computer
+                return
+        elif names.get(strong, {}).get("strength", 0) <= names.get(t["model"], {}).get("strength", 0):
+            return
+        self.logline(f"{t['id']} moves from {self.model_name(t['model'])} to {self.model_name(strong)}: "
+                     "the same objection came twice.")
+        self.judge(t, False)                   # the first model did not manage this step
+        t["model"] = strong
+
+    def judge(self, t, passed):
+        """Remember how this kind of step went on this model (model choice learns from it)."""
+        try:
+            self.app.forecaster.judge(t.get("harness") or "agent", t["model"], passed, t.get("attempts") or 1)
+        except Exception as exc:
+            self.app.log(f"recording the verdict on {t['id']}: {type(exc).__name__}: {exc}")
+
     def exhausted(self, t, why):
         """The rounds are used up: keep the best attempt if it is usable, else the step fails."""
+        self.judge(t, False)
         best = t.get("best") or {}
         if best and not best.get("hard") and best.get("output"):
             t["output"], t["files"] = best["output"], best["files"] or t.get("files") or []
@@ -1068,7 +1263,9 @@ class Orchestra:
         turn.steps.append(self.step)
         try:
             await self.size_run(messages)
-            await self.approve_plan()
+            if not self.resumes:
+                await self.approve_plan()
+            self.save()
         except BaseException:
             app.orchestras.pop(turn.chat["id"], None)
             raise
@@ -1142,11 +1339,17 @@ class Orchestra:
                 elif not self.sequence:
                     await asyncio.sleep(0.5)          # results that arrive together are handled together
         except asyncio.CancelledError:
+            self.outcome = "stopped"
             for t in self.tasks.values():
                 if t.get("job_id") and t["status"] in ACTIVE:
                     app.jobs.cancel(t["job_id"])
             raise
+        except BaseException:
+            self.outcome = "interrupted"
+            raise
         finally:
+            if self.outcome != "done":               # keep the state as it was, so the run can be continued
+                self.save(self.outcome)
             for t in self.tasks.values():
                 if t["status"] == "review":          # finished, but the run stopped before it was checked
                     self.settle(t, "done" if t.get("result_state") == "done" else "failed")
@@ -1160,6 +1363,8 @@ class Orchestra:
                 if not fut.done():
                     fut.set_result("The team has finished.")
             app.orchestras.pop(turn.chat["id"], None)
+            if self.outcome == "done":
+                self.save("done")
             self.publish()
         try:
             await self.free_unneeded()

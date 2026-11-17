@@ -288,6 +288,57 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         await A().runtime.unload((data or {}).get("model_id"))
         return {"ok": True}
 
+    @api.get("/api/runs")
+    async def runs_list(limit: int = 60):
+        """Planned runs, newest first, with what each one cost."""
+        return {"runs": A().runs(min(max(1, limit), 300))}
+
+    @api.get("/api/runs/{run_id}")
+    async def runs_get(run_id: str):
+        run = A().run_detail(run_id)
+        if not run:
+            raise KeyError("run")
+        return run
+
+    @api.get("/api/models/records")
+    async def models_records():
+        """How each kind of step has fared on each model on this computer (what model choice learns from)."""
+        a = A()
+        rows = a.db.all("SELECT * FROM step_stats ORDER BY harness, model_id")
+        return {"records": [{"harness": r["harness"], "model": r["model_id"],
+                             "model_name": (a.models.get_any(r["model_id"]) or {}).get("name") or r["model_id"],
+                             "judged": r.get("judged") or 0, "passed": r.get("passed") or 0,
+                             "rounds": round(float(r.get("rounds") or 0), 1), "runs": r.get("runs") or 0,
+                             "seconds": round(float(r.get("seconds") or 0)), "calls": round(float(r.get("calls") or 0), 1),
+                             "read_tps": round(float(r.get("read_tps") or 0), 1),
+                             "write_tps": round(float(r.get("write_tps") or 0), 1)} for r in rows]}
+
+    @api.get("/api/evals")
+    async def evals_list():
+        """The built-in evaluation: its tasks, earlier runs, and the run in progress."""
+        a = A()
+        return {"tasks": a.evals.tasks(), "runs": a.evals.list(), "current": a.evals.current}
+
+    @api.post("/api/evals/run")
+    async def evals_run(request: Request):
+        data = await body(request)
+        return A().evals.start(model=data.get("model"), only=data.get("only"))
+
+    @api.post("/api/evals/stop")
+    async def evals_stop():
+        a = A()
+        if a.evals.current and a.evals.current.get("job_id"):
+            a.jobs.cancel(a.evals.current["job_id"])
+        return {"ok": True}
+
+    @api.post("/api/runtime/snapshots/clear")
+    async def snapshots_clear():
+        """Delete the saved prompt snapshots (they are made again the next time a prompt is read)."""
+        removed = await asyncio.to_thread(A().runtime.snapshots.clear)
+        for s in A().runtime.servers.values():
+            s.warm.clear()
+        return {"removed": removed, **A().runtime.snapshots.info()}
+
     @api.get("/api/runtime/log")
     async def runtime_log():
         return {"log": A().runtime.log_tail(120)}
@@ -564,7 +615,7 @@ def create_app(data_dir=None, resources_dir=None, token=None):
     async def chats(project_id: str = "", q: str = "", limit: int = 200):
         a = A()
         sql = ("SELECT id, project_id, title, model, harness, origin, pinned, updated FROM chats WHERE archived=0 "
-               "AND parent_chat_id IS NULL")
+               "AND parent_chat_id IS NULL AND COALESCE(origin, '') != 'eval'")   # evaluation chats: Settings
         params = []
         if project_id == "none":
             sql += " AND project_id IS NULL"
@@ -590,6 +641,16 @@ def create_app(data_dir=None, resources_dir=None, token=None):
                                connectors=data.get("connectors"), folders=data.get("folders"),
                                thinking=data.get("thinking", False))
 
+    @api.post("/api/chats/{chat_id}/run/resume")
+    async def run_resume(chat_id: str):
+        """Continue this chat's stopped or cut-off run from its accepted steps."""
+        return {"job_id": A().resume_run(chat_id)["id"]}
+
+    @api.post("/api/chats/{chat_id}/run/dismiss")
+    async def run_dismiss(chat_id: str):
+        A().dismiss_run(chat_id)
+        return {"ok": True}
+
     @api.get("/api/chats/{chat_id}")
     async def chat_get(chat_id: str):
         a = A()
@@ -605,6 +666,7 @@ def create_app(data_dir=None, resources_dir=None, token=None):
                                        **{x: v.get(x) for x in ("tool", "label", "description")}}
                                       for k, v in a.approvals.items() if v.get("parent_chat_id") == chat_id]
         chat["memories"] = a.memory.list("chat", chat_id)
+        chat["open_run"] = a.open_run(chat_id)       # a run that can be continued (2.7.0)
         chat["workspace"] = str(a.paths.workspace(chat_id))
         chat["agents"] = a.db.all("SELECT id, title, agent_name, model, harness, updated FROM chats "
                                   "WHERE parent_chat_id=? ORDER BY created", (chat_id,))

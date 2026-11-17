@@ -39,6 +39,17 @@ DEFAULT_SETTINGS = {
     # attempt is kept; fit_context: load a run's models with the context its steps need
     "agent_order": "sequence", "step_rounds": 3, "verify_results": True, "plan_approval": False,
     "fit_context": True, "unload_after_run": False, "stall_timeout_seconds": 180, "first_token_timeout_seconds": 0,
+    # 2.6.0: doing less work. prompt_snapshots: keep what a model read of its instructions and tools on disk;
+    # prompt_cache_mb: memory per loaded model for prompts already read (None = about 5% of memory);
+    # reading_budget_seconds: a tool result is cut to about this much reading at the measured speed (0 = fixed)
+    "prompt_snapshots": True, "snapshot_disk_mb": 4096, "prompt_cache_mb": None, "reading_budget_seconds": 60,
+    # 2.7.0: resume_runs: ask | auto (continue cut-off runs when the app starts); lean_tools: a step's agent gets
+    # only the tool groups its goal calls for; escalate_models: a step that keeps failing moves to a stronger
+    # model; check_model: "" (the planner's) | smallest | a model id; writing_budget_seconds: result length hint
+    "resume_runs": "ask", "lean_tools": True, "escalate_models": True, "check_model": "",
+    "writing_budget_seconds": 180,
+    # 2.8.0: learned_model_choice: a step whose model nobody fixed runs on the model that did such steps best here
+    "learned_model_choice": True, "runs_kept": 300,
 }
 CHAT_LIMIT_KEYS = ("max_reply_tokens", "max_steps", "time_limit_minutes", "temperature", "max_searches",
                    "max_tool_calls")
@@ -81,6 +92,8 @@ class App:
         self.team_of_chat = {}    # agent chat id -> (Orchestra, task id)
         self.run_fit = {}         # chat id -> orchestrator.RunFit: how a planned run loads its models
         self.forecaster = Forecaster(self)
+        from .evals import Evals
+        self.evals = Evals(self)
         self._bg = []
         for key, value in DEFAULT_SETTINGS.items():
             if self.db.setting(key) is None:
@@ -115,6 +128,97 @@ class App:
         self._bg = [asyncio.create_task(self.scheduler.loop()), asyncio.create_task(self.runtime.idle_watch()),
                     asyncio.create_task(self.knowledge.loop())]
         self.log(f"engine started; data {self.paths.data}; secrets backend {self.secrets.backend}")
+        # runs that were going when the app closed or crashed can be continued (2.7.0)
+        cut = self.db.all("SELECT id, chat_id, resumes FROM runs WHERE status='running'")
+        for row in cut:
+            self.db.update("runs", row["id"], {"status": "interrupted", "updated": now()})
+        if cut and self.db.setting("resume_runs", "ask") == "auto":
+            self._bg.append(asyncio.create_task(self._resume_cut_runs(cut)))
+
+    async def _resume_cut_runs(self, rows):
+        await asyncio.sleep(float(self.db.setting("resume_delay_seconds", 20)))
+        for row in rows:
+            if int(row.get("resumes") or 0) >= 2:        # a run that keeps cutting the app off is left alone
+                continue
+            try:
+                self.resume_run(row["chat_id"])
+            except Exception as exc:
+                self.log(f"continuing run {row['id']}: {type(exc).__name__}: {exc}")
+
+    @staticmethod
+    def _run_summary(row, title=None):
+        state = row.get("state") or {}
+        tasks = state.get("tasks") or []
+        used = [t.get("used") or {} for t in tasks]
+        return {"id": row["id"], "chat_id": row["chat_id"], "title": title, "status": row["status"],
+                "created": row.get("created"), "updated": row.get("updated"), "resumes": row.get("resumes") or 0,
+                "request": (state.get("overall") or "")[:240], "total": len(tasks),
+                "done": sum(t.get("status") == "done" for t in tasks),
+                "failed": sum(t.get("status") == "failed" for t in tasks),
+                "incomplete": sum(bool(t.get("partial")) for t in tasks),
+                "rounds": sum(int(t.get("attempts") or 0) for t in tasks),
+                "tokens": sum(int(u.get("tokens") or 0) for u in used),
+                "read": sum(int(u.get("read") or 0) for u in used),
+                "cached": sum(int(u.get("cached") or 0) for u in used),
+                "written": sum(int(u.get("written") or 0) for u in used),
+                "seconds": sum(int(u.get("seconds") or 0) for u in used),
+                "models": sorted({t.get("model") for t in tasks if t.get("model")})}
+
+    def runs(self, limit=60):
+        """The history of planned runs, newest first."""
+        rows = self.db.all("SELECT r.*, c.title AS chat_title FROM runs r LEFT JOIN chats c ON c.id = r.chat_id "
+                           "ORDER BY r.created DESC LIMIT ?", (limit,))
+        return [self._run_summary(r, r.get("chat_title")) for r in rows]
+
+    def run_detail(self, run_id):
+        """One run with the timeline of every step."""
+        row = self.db.get("runs", run_id)
+        if not row:
+            return None
+        chat = self.db.get("chats", row["chat_id"]) or {}
+        state = row.get("state") or {}
+        steps = []
+        for t in state.get("tasks") or []:
+            model = self.models.get_any(t.get("model")) if t.get("model") else None
+            steps.append({k: t.get(k) for k in ("id", "name", "status", "attempts", "rounds", "depends_on", "harness",
+                                                "model", "partial", "note", "kit", "chat_id", "result_file", "forecast",
+                                                "used", "kind")}
+                         | {"goal": (t.get("goal") or "")[:500], "output": (t.get("output") or "")[:1500],
+                            "model_name": (model or {}).get("name") or t.get("model")})
+        return {**self._run_summary(row, chat.get("title")), "steps": steps, "log": state.get("log") or [],
+                "folder": state.get("dir"), "can_continue": bool(self.open_run(row["chat_id"]))
+                and (self.open_run(row["chat_id"]) or {}).get("id") == run_id}
+
+    def open_run(self, chat_id):
+        """The chat's latest run if it can be continued (stopped, or cut off by a crash or restart)."""
+        row = self.db.one("SELECT * FROM runs WHERE chat_id=? ORDER BY created DESC, rowid DESC LIMIT 1", (chat_id,))
+        if not row or row["status"] not in ("interrupted", "stopped") or self.jobs.running_for_chat(chat_id):
+            return None
+        tasks = (row.get("state") or {}).get("tasks") or []
+        left = [t for t in tasks if t.get("status") not in ("done", "failed")]
+        if not tasks or not left:
+            return None
+        return {"id": row["id"], "status": row["status"], "total": len(tasks),
+                "done": sum(t.get("status") == "done" for t in tasks), "updated": row.get("updated"),
+                "next": next((t.get("name") for t in tasks if t.get("status") not in ("done", "failed", "cancelled")),
+                             left[0].get("name"))}
+
+    def resume_run(self, chat_id):
+        """Continue the chat's cut-off run from its accepted steps. Returns the new job."""
+        info = self.open_run(chat_id)
+        if not info:
+            raise ValueError("There is no run to continue in this chat.")
+        last = self.db.one("SELECT id, content FROM messages WHERE chat_id=? AND role='user' "
+                           "ORDER BY created DESC, rowid DESC LIMIT 1", (chat_id,))
+        if not last:
+            raise ValueError("The request this run belongs to is gone.")
+        auto = bool(self.db.setting(f"chat_auto_approve:{chat_id}", False))
+        return self.start_turn(chat_id, last["content"], message_id=last["id"],
+                               payload={"resume_run": info["id"], "auto_approve": auto})
+
+    def dismiss_run(self, chat_id):
+        self.db.run("UPDATE runs SET status='dismissed' WHERE chat_id=? AND status IN ('interrupted','stopped')",
+                        (chat_id,))
 
     async def stop(self):
         for t in self._bg:

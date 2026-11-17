@@ -1157,3 +1157,299 @@ def test_the_forecast_sizes_the_context():
     assert rt.fit("m", 9000) == {"ctx": 12288, "parallel": 1}
     assert rt.fit("m", 500000)["ctx"] == 65536            # never more than the user's own setting
     assert rt.fit("m", 100)["ctx"] == CTX_STEPS[0]
+
+
+# ---------------------------------------------------------------- 2.6.0: doing less work
+def test_a_reloaded_model_gets_its_prompt_back_from_a_snapshot(engine):
+    """The agent's system prompt and tool list are read once and saved. After the model is unloaded and loaded
+    again (which 2.5.0 does as soon as nothing needs it), they come from the file, not from reading."""
+    c = engine["client"]
+    mid = model_id(c)
+    c.post("/api/runtime/snapshots/clear")
+    c.post("/api/runtime/unload", json={})
+    first = c.post("/api/chats", json={"harness": "agent"}).json()
+    say(c, first["id"], "hello there")
+    info = c.get("/api/runtime").json()
+    now_loaded = next(m for m in info["loaded"] if m["model_id"] == mid)
+    assert now_loaded["snapshot"] and now_loaded["snapshot"]["restored"] is False, now_loaded
+    assert info["snapshots"]["files"] >= 1 and info["snapshots"]["saved"] >= 1, info["snapshots"]
+    assert now_loaded["cache_ram_mb"] and 256 <= info["cache_ram_mb"] <= 2048
+    c.post("/api/runtime/unload", json={})                          # a new server process: nothing in memory
+    second = c.post("/api/chats", json={"harness": "agent"}).json()
+    msg = say(c, second["id"], "hello again")
+    info = c.get("/api/runtime").json()
+    now_loaded = next(m for m in info["loaded"] if m["model_id"] == mid)
+    assert now_loaded["snapshot"]["restored"] is True and now_loaded["snapshot"]["tokens"] > 300, now_loaded
+    stats = msg["meta"]["stats"]
+    assert stats["cached_tokens"] > 3 * stats["prompt_tokens"], stats      # almost nothing was read again
+    assert info["snapshots"]["restored"] >= 1 and info["snapshots"]["tokens_restored"] > 300
+    # switching snapshots off stops using them; deleting them works
+    assert c.post("/api/runtime/snapshots/clear").json()["files"] == 0
+
+
+def test_the_date_is_not_in_the_system_prompt(engine):
+    """A date in the system prompt made every model read its whole tool list again each day."""
+    import datetime
+    c = engine["client"]
+    chat = c.post("/api/chats", json={"harness": "chat"}).json()
+    text = say(c, chat["id"], "show system prompt")["content"]
+    system, _, user = text.partition(" || ")
+    year = str(datetime.date.today().year)
+    assert year not in system and "Today is" in user and year in user, text[:600]
+
+
+def test_tool_result_size_follows_reading_speed():
+    from dva.runner import TOOL_RESULT_LIMIT, Turn
+
+    class DB:
+        def __init__(self, budget):
+            self.budget = budget
+
+        def setting(self, key, default=None):
+            return self.budget if key == "reading_budget_seconds" else default
+
+    class Server:
+        def __init__(self, tps):
+            self.read_tps = tps
+
+    def limit(tps, budget=60, model="local-model"):
+        t = Turn.__new__(Turn)
+        t.db, t.server, t.model_id = DB(budget), Server(tps), model
+        return t.result_limit()
+    assert limit(14) == int(14 * 60 * 3.6)                 # the reference laptop: about a minute of reading
+    assert limit(2) == 2500 and limit(2000) == 24000       # floor for very slow, ceiling for fast graphics cards
+    assert limit(0) == TOOL_RESULT_LIMIT and limit(14, budget=0) == TOOL_RESULT_LIMIT
+    assert limit(500, model="cloud:openai:gpt") == TOOL_RESULT_LIMIT
+
+
+def test_fast_cores_are_found_on_mixed_processors(tmp_path):
+    from dva.hardware import _linux_performance_cores
+    # Intel 12th generation style: 4 fast cores with 2 threads each (cpus 0-7), 8 efficient cores (8-15)
+    (tmp_path / "cpu_core").mkdir()
+    (tmp_path / "cpu_atom").mkdir()
+    (tmp_path / "cpu_core" / "cpus").write_text("0-7\n")
+    (tmp_path / "cpu_atom" / "cpus").write_text("8-15\n")
+    for cpu in range(16):
+        d = tmp_path / "system" / "cpu" / f"cpu{cpu}" / "topology"
+        d.mkdir(parents=True)
+        (d / "core_id").write_text(str(cpu // 2 if cpu < 8 else cpu))
+    assert _linux_performance_cores(str(tmp_path)) == 4
+    plain = tmp_path / "plain"
+    (plain / "system" / "cpu").mkdir(parents=True)
+    assert _linux_performance_cores(str(plain)) is None    # all cores alike
+
+
+def test_the_server_is_started_with_a_sized_prompt_cache_and_a_snapshot_folder(tmp_path):
+    rt = _runtime_with(["cpu"], {})
+    rt.cache_ram_mb = lambda: 512
+
+    class Snaps:
+        def enabled(self):
+            return True
+
+        def folder(self, model_id):
+            return tmp_path
+    rt.snapshots = Snaps()
+    model = {"id": "m", "path": "/m.gguf", "size": 4 * 2**30, "settings": {}}
+    plan = rt.plan(model)
+    cmd = " ".join(rt._command(model, plan, 1234))
+    assert "--cache-ram 512" in cmd and f"--slot-save-path {tmp_path}" in cmd
+    with_cache = rt._need_bytes(model, plan)
+    assert with_cache - rt._need_bytes(model, {**plan, "cache_ram": 0}) == 256 * 2**20     # half its limit is counted
+
+
+@pytest.mark.skipif(not os.environ.get("DVA_TEST_LLAMA_SERVER"), reason="real llama-server not configured")
+def test_real_llama_server_restores_a_prompt_snapshot():
+    """Against the real llama.cpp server: a planned run's two prompts (planner and agent) both survive a reload."""
+    tmp = Path(tempfile.mkdtemp(prefix="dva-real-snap-"))
+    port = free_port()
+    env = {**os.environ, "DVA_TOKEN": "t", "DVA_LLAMA_SERVER": os.environ["DVA_TEST_LLAMA_SERVER"],
+           "DVA_SECRETS": "file", "PYTHONPATH": str(ENGINE)}
+    proc = subprocess.Popen([sys.executable, "-m", "dva", "serve", "--port", str(port), "--data-dir", str(tmp)],
+                            cwd=str(ENGINE), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    assert proc.stdout.readline().startswith("DVA_READY")
+    c = httpx.Client(base_url=f"http://127.0.0.1:{port}", headers={"Authorization": "Bearer t"}, timeout=180,
+                     trust_env=False)
+    try:
+        m = c.post("/api/models/import", json={"path": os.environ["DVA_TEST_GGUF"]}).json()
+        c.put(f"/api/models/{m['id']}", json={"compute": "cpu", "ctx": 8192})
+        c.put("/api/settings", json={"max_reply_tokens": 8, "learn_enabled": False, "team_mode": "off"})
+
+        def turn(harness, text):
+            chat = c.post("/api/chats", json={"harness": harness, "model": m["id"]}).json()
+            job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": text}).json()
+            assert wait_job(c, job["job_id"], timeout=170)["status"] in ("done", "failed")
+            return last_assistant(c, chat["id"])["meta"]["stats"]
+        cold = turn("agent", "hi")              # the prefix is read once on its own and saved; the turn reuses it
+        assert cold["cached_tokens"] > 300, cold
+        assert c.get("/api/runtime").json()["snapshots"]["saved"] >= 1
+        c.post("/api/runtime/unload", json={})
+        warm = turn("agent", "hi again")                             # a new server process
+        loaded = c.get("/api/runtime").json()["loaded"][0]
+        assert loaded["snapshot"]["restored"] is True, loaded
+        assert warm["cached_tokens"] > 3 * warm["prompt_tokens"], (cold, warm)   # only the request itself is read
+    finally:
+        c.post("/api/shutdown")
+        proc.wait(timeout=20)
+
+
+# ---------------------------------------------------------------- 2.7.0: runs that continue, lean steps, evaluation
+def test_a_stopped_run_continues_from_its_accepted_steps(engine):
+    """Stop a run while its second step works; Resume runs steps 2 and 3 and does not repeat step 1."""
+    c = engine["client"]
+    chat = c.post("/api/chats", json={"harness": "agent"}).json()
+    job = c.post(f"/api/chats/{chat['id']}/messages",
+                 json={"text": "As a team with a forgetful plan (slow-steps): find, summarise, publish."}).json()
+    for _ in range(300):                                  # until the second agent has started
+        if len(c.get(f"/api/chats/{chat['id']}").json()["agents"]) >= 2:
+            break
+        time.sleep(0.05)
+    c.post(f"/api/jobs/{job['job_id']}/cancel")
+    assert wait_job(c, job["job_id"])["status"] == "cancelled"
+    run = c.get(f"/api/chats/{chat['id']}").json()["open_run"]
+    assert run and run["status"] == "stopped" and (run["done"], run["total"]) == (1, 3), run
+    assert run["next"] == "Summarise"
+    first_agents = [a["id"] for a in c.get(f"/api/chats/{chat['id']}").json()["agents"]]
+    again = c.post(f"/api/chats/{chat['id']}/run/resume").json()
+    assert wait_job(c, again["job_id"], timeout=120)["status"] == "done"
+    team = team_of(last_assistant(c, chat["id"]))
+    tasks = {t["id"]: t for t in team["tasks"]}
+    assert all(t["status"] == "done" for t in tasks.values()), tasks
+    assert tasks["t1"]["chat_id"] == first_agents[0] and tasks["t1"]["attempts"] == 1      # not run again
+    assert tasks["t2"]["chat_id"] not in first_agents and tasks["t2"]["attempts"] == 1     # the cut-off try is not counted
+    assert any(line["text"].startswith("Continuing this run: 1 of 3") for line in team["log"])
+    assert "### t1 Find" in first_user_text(c, tasks["t2"]["chat_id"])                     # it got step 1's saved result
+    assert c.get(f"/api/chats/{chat['id']}").json()["open_run"] is None
+    users = [m for m in c.get(f"/api/chats/{chat['id']}").json()["messages"] if m["role"] == "user"]
+    assert len(users) == 1                                                                 # no second request was added
+    assert c.post(f"/api/chats/{chat['id']}/run/resume").status_code == 400                # nothing left to continue
+
+
+def test_a_step_gets_only_the_tools_its_goal_needs(engine):
+    from dva.orchestrator import lean_kit
+    assert lean_kit("Read notes.txt and list the names") == ["files"]
+    assert lean_kit("Search the web for the latest tariff and compute the average with Python") == ["files", "web", "python"]
+    assert lean_kit("Look at the screenshot and describe it") == ["files", "vision"]
+    assert lean_kit("Compute the totals", ["files", "web"]) == ["files"]         # never more than its harness has
+    c = engine["client"]
+    _, status, msg = run_team(c, "As a team with a forgetful plan: find greetings, summarise them, publish.")
+    assert status == "done"
+    tasks = {t["id"]: t for t in team_of(msg)["tasks"]}
+    assert tasks["t1"]["kit"] == ["files"] and "web" in tasks["t3"]["kit"], tasks          # "publish" may need the web
+    # the timeline of each step: what it read, took from the cache and wrote
+    assert all(set(("read", "cached", "written", "calls", "tools")) <= set(t["used"]) for t in tasks.values())
+
+
+def test_the_evaluation_runs_tasks_and_keeps_the_numbers(engine):
+    c = engine["client"]
+    listing = c.get("/api/evals").json()
+    assert len(listing["tasks"]) == 12 and listing["current"] is None
+    started = c.post("/api/evals/run", json={"only": ["calc", "summary"]}).json()
+    assert started["total"] == 2
+    assert c.post("/api/evals/run", json={}).status_code == 400                            # one at a time
+    assert wait_job(c, started["job_id"], timeout=120)["status"] == "done"
+    run = c.get("/api/evals").json()["runs"][0]
+    assert run["id"] == started["id"] and run["status"] == "done" and run["version"]
+    assert sorted(r["id"] for r in run["results"]) == ["calc", "summary"]
+    for r in run["results"]:
+        assert isinstance(r["passed"], bool) and r["seconds"] >= 0 and r["chat_id"] and "read" in r, r
+    assert run["summary"]["ran"] == 2 and run["summary"]["total"] == 2 and 0 <= run["summary"]["passed"] <= 2
+    assert run["settings"]["agent_order"] == "sequence" and "lean_tools" in run["settings"]      # what it ran with
+    listed = {x["id"] for x in c.get("/api/chats").json()["chats"]} if isinstance(c.get("/api/chats").json(), dict) \
+        else {x["id"] for x in c.get("/api/chats").json()}
+    assert not ({r["chat_id"] for r in run["results"]} & listed)                           # not in the chat list
+
+
+def test_the_evaluation_checks_judge_files_and_replies(tmp_path):
+    from dva import evals
+    by_id = {t["id"]: t for t in evals.TASKS}
+
+    def folder(task_id):
+        d = tmp_path / task_id
+        d.mkdir()
+        for name, text in by_id[task_id]["files"].items():
+            (d / name).write_text(text, encoding="utf-8")
+        return d
+    assert evals.check_sum(None, "The total is 1,284.")[0] and not evals.check_sum(None, "1,248")[0]
+    d = folder("bug")
+    assert not evals.check_bug(d, "")[0]                                   # the bug is still there
+    (d / "buggy.py").write_text("def mean(values):\n    return sum(values) / len(values)\n", encoding="utf-8")
+    (d / "test_buggy.py").write_text("print('OK')\n", encoding="utf-8")    # a cheated test is replaced by the real one
+    assert evals.check_bug(d, "")[0]
+    d = folder("fizz")
+    (d / "out.txt").write_text("\n".join(["1", "2", "Fizz", "4", "Buzz", "Fizz", "7", "8", "Fizz", "Buzz", "11",
+                                           "Fizz", "13", "14", "FizzBuzz"]) + "\n", encoding="utf-8")
+    assert evals.check_fizz(d, "")[0]
+    d = folder("config")
+    assert not evals.check_config(d, "")[0]
+    (d / "config.ini").write_text(evals.CONFIG.replace("port = 8080", "port = 9090"), encoding="utf-8")
+    assert evals.check_config(d, "")[0]
+    (d / "config.ini").write_text(evals.CONFIG.replace("8080", "9090"), encoding="utf-8")   # changed the note too
+    assert not evals.check_config(d, "")[0]
+    d = folder("sort")
+    assert not evals.check_sorted(d, "")[0]
+    for sub, names in (("data", ("a.csv", "b.csv")), ("notes", ("todo.txt", "ideas.txt"))):
+        (d / sub).mkdir()
+        for n in names:
+            (d / n).rename(d / sub / n)
+    assert evals.check_sorted(d, "")[0]
+    d = folder("invoice")
+    (d / "invoice.json").write_text('{"number": "INV-2031", "date": "2026-03-14", "total": 18450.0}', encoding="utf-8")
+    assert evals.check_invoice(d, "")[0]
+    assert evals.check_diff(None, "Line 7 differs.")[0] and not evals.check_diff(None, "line 17")[0]
+    assert evals.check_summary(None, "Begun in 2019, the programme connected 42% of households.")[0]
+    d = folder("report")
+    (d / "report.md").write_text("| North | 165 |\n| South | 122 |\n| East | 355 |\n", encoding="utf-8")
+    assert evals.check_report(d, "")[0]
+    assert evals.Evals.summary([{"passed": True, "read": 100, "cached": 300, "written": 20, "seconds": 3.2},
+                                {"passed": False}], 12) == {
+        "passed": 1, "ran": 2, "total": 12, "seconds": 3, "read": 100, "cached": 300, "written": 20,
+        "agent_tokens": 0, "cache_percent": 75}
+
+
+# ---------------------------------------------------------------- 2.8.0: history, learned model choice
+def test_runs_are_kept_with_their_timeline(engine):
+    c = engine["client"]
+    chat, status, msg = run_team(c, "As a team with a forgetful plan: find greetings, summarise them, publish.")
+    assert status == "done"
+    runs = c.get("/api/runs").json()["runs"]
+    mine = next(r for r in runs if r["chat_id"] == chat["id"])
+    assert mine["status"] == "done" and (mine["done"], mine["total"], mine["failed"]) == (3, 3, 0), mine
+    assert mine["tokens"] > 0 and mine["read"] + mine["cached"] > 0 and mine["rounds"] == 3 and mine["models"]
+    assert "forgetful plan" in mine["request"]
+    detail = c.get(f"/api/runs/{mine['id']}").json()
+    assert [s["id"] for s in detail["steps"]] == ["t1", "t2", "t3"] and detail["can_continue"] is False
+    for step in detail["steps"]:
+        assert step["status"] == "done" and step["used"]["calls"] >= 1 and step["model_name"] and step["kit"], step
+    assert any(line["text"].startswith("Planned 3 tasks") for line in detail["log"])
+    assert c.get("/api/runs/nope").status_code == 404
+    # every judged step is counted for its harness and model
+    records = c.get("/api/models/records").json()["records"]
+    agent = next(r for r in records if r["harness"] == "agent")
+    assert agent["judged"] >= 3 and agent["passed"] >= 3 and agent["model_name"]
+
+
+def test_model_choice_learns_from_measured_steps(tmp_path):
+    from dva.db import DB
+    from dva.forecast import Forecaster
+
+    class App:
+        db = DB(tmp_path / "t.db")
+    fc = Forecaster(App())
+
+    def history(model, passed, failed, seconds):
+        for i in range(passed + failed):
+            fc.judge("coder", model, i < passed)
+        fc.db.update("step_stats", fc.key("coder", model), {"seconds": seconds}, key="key")
+    history("small", 1, 5, 60)        # the usual model fails this kind of step
+    history("big", 5, 1, 200)
+    history("new", 1, 0, 10)          # one step is not enough to judge a model
+    picked, why = fc.choose("coder", "small", ["small", "big", "new"])
+    assert picked == "big" and "5 of 6" in why and "1 of 6" in why
+    assert fc.choose("coder", "big", ["small", "big", "new"]) == ("big", None)        # nothing better: stay
+    history("quick", 9, 1, 80)        # as reliable as "big", well under 70% of its time
+    picked, why = fc.choose("coder", "big", ["small", "big", "quick"])
+    assert picked == "quick" and "as reliably" in why
+    assert fc.choose("writer", "small", ["small", "big"]) == ("small", None)          # no record for this harness
+    rec = fc.record_of("coder", "quick")
+    assert rec["judged"] == 10 and rec["passed"] == 9 and abs(rec["rate"] - 0.9) < 1e-9

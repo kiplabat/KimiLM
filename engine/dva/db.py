@@ -71,6 +71,13 @@ CREATE INDEX IF NOT EXISTS kb_chunks_project ON kb_chunks(project_id);
 CREATE TABLE IF NOT EXISTS msg_vec (message_id TEXT PRIMARY KEY, chat_id TEXT, vec BLOB);
 CREATE INDEX IF NOT EXISTS msg_vec_chat ON msg_vec(chat_id);
 CREATE TABLE IF NOT EXISTS mem_vec (memory_id TEXT PRIMARY KEY, text TEXT, vec BLOB);
+CREATE TABLE IF NOT EXISTS runs (
+  id TEXT PRIMARY KEY, chat_id TEXT, status TEXT, state_json TEXT DEFAULT '{}', resumes INTEGER DEFAULT 0,
+  created TEXT, updated TEXT);
+CREATE INDEX IF NOT EXISTS runs_chat ON runs(chat_id);
+CREATE TABLE IF NOT EXISTS eval_runs (
+  id TEXT PRIMARY KEY, created TEXT, version TEXT, model TEXT, status TEXT, results_json TEXT DEFAULT '[]',
+  summary_json TEXT DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS step_stats (
   key TEXT PRIMARY KEY, harness TEXT, model_id TEXT, runs INTEGER DEFAULT 0, ok INTEGER DEFAULT 0,
   calls REAL DEFAULT 0, fixed REAL DEFAULT 0, growth REAL DEFAULT 0, output REAL DEFAULT 0, seconds REAL DEFAULT 0,
@@ -104,6 +111,12 @@ MIGRATIONS = [
     ("chats", "agent_name", "TEXT"),
     ("projects", "notes", "TEXT DEFAULT ''"),               # living project notes (2.4.0)
     ("projects", "memory_mode", "TEXT DEFAULT 'shared'"),   # shared | isolated (2.4.0)
+    # how steps of a harness fared on a model (2.8.0): judged = steps with a verdict, passed = accepted complete,
+    # rounds = average rounds a step took
+    ("step_stats", "judged", "INTEGER DEFAULT 0"),
+    ("step_stats", "passed", "INTEGER DEFAULT 0"),
+    ("step_stats", "rounds", "REAL DEFAULT 0"),
+    ("eval_runs", "settings_json", "TEXT DEFAULT '{}'"),    # the settings an evaluation ran with (2.8.0)
 ]
 
 

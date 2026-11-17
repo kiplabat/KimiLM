@@ -34,6 +34,8 @@ p.add_argument("--device", "-dev")
 p.add_argument("-t", type=int, default=4)
 p.add_argument("-tb")      # declared so "-tb 12" is not read as "-t b"
 p.add_argument("--spec-type", default="none")
+p.add_argument("--slot-save-path")
+p.add_argument("--cache-ram", default="8192")
 # The engine's random API key can start with "-" (about 1 start in 64); argparse would then read it as a flag
 # and exit, which looked like a rare random test failure. Pass it as --api-key=VALUE. llama-server is not affected.
 argv = sys.argv[1:]
@@ -216,7 +218,8 @@ def structured(schema, body):
             return {"approach": "team", "reason": "three steps", "final": "all parts", "tasks": [
                 {"id": "t1", "name": "Find", "goal": "say hello" + (" then explode" if "explode-first" in users else ""),
                  "done_when": "a greeting"},
-                {"id": "t2", "name": "Summarise", "goal": "summarise what t1 found", "done_when": "one line"},
+                {"id": "t2", "name": "Summarise", "goal": "summarise what t1 found" + (" slowly" if "slow-steps" in users else ""),
+                 "done_when": "one line"},
                 {"id": "t3", "name": "Publish", "goal": "publish the summary", "done_when": "a report"}]}
         if "team" in allowed and ("direct" not in allowed or "as a team" in users):
             agents = props["tasks"]["items"]["properties"].get("agent", {}).get("enum")
@@ -248,6 +251,32 @@ CHECKED = {}
 HUNG = Path(args.m).with_suffix(".hung") if args.m else None
 
 
+@app.post("/slots/{slot}")
+async def slots(slot: int, request: Request):
+    """Like llama-server: 'save' writes what the slot holds to a file; 'restore' reads a file into the slot and
+    overwrites what it held (a prompt survives that only if a later request moved it to the in-memory cache)."""
+    body = await request.json()
+    action = request.query_params.get("action")
+    if not args.slot_save_path:
+        return JSONResponse({"error": {"message": "slot save path is not set"}}, 501)
+    path = Path(args.slot_save_path) / Path(body.get("filename") or "x").name
+    if action == "save":
+        if not CACHED:
+            return JSONResponse({"error": {"message": "empty slot"}}, 400)
+        path.write_text(CACHED[0], encoding="utf-8")
+        return {"id_slot": slot, "filename": path.name, "n_saved": len(CACHED[0]) // 4}
+    if action == "restore":
+        if not path.exists():
+            return JSONResponse({"error": {"message": "no such file"}}, 404)
+        text = path.read_text(encoding="utf-8")
+        if CACHED:
+            CACHED[0] = text
+        else:
+            CACHED.append(text)
+        return {"id_slot": slot, "filename": path.name, "n_restored": len(text) // 4}
+    return JSONResponse({"error": {"message": "unknown action"}}, 400)
+
+
 @app.post("/tokenize")
 async def tokenize(request: Request):
     body = await request.json()
@@ -261,6 +290,9 @@ async def chat(request: Request):
     if "hang-once" in said and HUNG is not None and not HUNG.exists():
         HUNG.write_text("hung once")
         time.sleep(40)                              # a stuck model: no bytes at all
+    if "slowly" in text_of(body["messages"][-1].get("content")).split("Done when")[0].split("Your task")[-1] \
+            and "Your task" in said:
+        time.sleep(4)                               # a step that takes a while (tests stop a run in the middle)
     if "explode" in text_of(body["messages"][-1].get("content")).split("Done when")[0].split("Your task")[-1] \
             and "Your task" in said:
         return JSONResponse({"error": {"message": "the fake model exploded"}}, 500)

@@ -46,7 +46,7 @@ from .providers import is_cloud
 from .runtime import RuntimeError_
 from .tools import GROUPS, Tool, ToolContext, ToolDenied, ToolError, builtin_tools
 
-TOOL_RESULT_LIMIT = 6000
+TOOL_RESULT_LIMIT = 6000      # characters of a tool result a model is given (online models, and the default)
 ROLES = ("worker", "strategist", "vision")
 ROLE_HELP = ("worker = a model on this computer for routine, well-defined parts; strategist = the strongest model "
              "(often online) for planning and hard reasoning; vision = a model that can see images and video.")
@@ -56,7 +56,7 @@ TEXT_TOOLCALL = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
 URL_RE = re.compile(r"https?://[^\s)>\]]+")
 
 BASE_PROMPT = """You are KimiLM, an assistant on the user's own computer. {where}
-Today is {today}. The computer runs {os}.
+The computer runs {os}. Today's date is given with each request.
 Be direct and practical. Use Markdown. Never invent file contents, numbers or sources: read, fetch or compute them."""
 
 AGENT_RULES = """You can use tools. Use one when it helps; otherwise just answer. After tool results, continue until \
@@ -538,7 +538,6 @@ class Turn:
                  f"This reply comes from a local model ({name}): nothing the user shares leaves this computer "
                  "unless a tool sends it (web pages, connectors).")
         parts = [BASE_PROMPT.format(where=where,
-                                    today=datetime.now().strftime("%A %d %B %Y"),  # date only: a changing prefix defeats prompt caching
                                     os=f"{platform.system()} {platform.release()}")]
         if self.chat.get("parent_chat_id"):
             # No agent name or task here: agents with the same harness and model then share this whole prompt
@@ -550,10 +549,11 @@ class Turn:
                             if "team_board" in self.tool_map else ""))
         if tools:
             parts.append(AGENT_RULES)
-            folders = self.folders()
-            parts.append("Folders you may use: " + ", ".join(dict.fromkeys(folders + [str(self.workspace)])) +
-                         f"\nRelative paths start in {folders[0] if folders else self.workspace}. "
-                         f"Files you create without a folder go to {self.workspace}.")
+            # Which folders this chat may use is given with each request (request_context), not here: the path of
+            # a chat's own folder is different for every chat, and anything that differs in the system prompt
+            # makes the model read the whole tool list again. Without it, every chat with the same harness,
+            # project and model shares one prompt, and one snapshot of it (snapshots.py).
+            parts.append("The folders you may use, and where new files go, are given with each request.")
         if self.harness.get("system_prompt"):
             parts.append(self.harness["system_prompt"].strip())
         if self.project and (self.project.get("instructions") or "").strip():
@@ -575,8 +575,6 @@ class Turn:
             names = sorted({t.label.split(':')[0] for t in self.connector_index})
             parts.append("Connected services: " + ", ".join(names) +
                          ". Use find_connector_tools then use_connector_tool to work with them.")
-        if self.chat.get("summary"):
-            parts.append("Summary of the earlier conversation:\n" + self.chat["summary"])
         return "\n\n".join(parts)
 
     def history(self):
@@ -708,7 +706,7 @@ class Turn:
             return
         mode = self.harness.get("mode", "agent")
         team_mode = self.db.setting("team_mode", "auto")
-        likely = mode == "team" or (mode in ("agent", "planner") and (
+        likely = mode == "team" or bool((self.job.get("payload") or {}).get("resume_run")) or (mode in ("agent", "planner") and (
             team_mode == "always" or (team_mode == "auto" and looks_multistep(self.last_user_text()))))
         if not likely:
             return
@@ -809,7 +807,7 @@ class Turn:
         self.db.update("chats", self.chat["id"], {"updated": now()})
         self.emit("assistant_end", content=content, meta=meta)
         if not error and not stopped and self.harness.get("learn", True) and self.harness.get("type") != "pipeline" \
-                and not self.chat.get("parent_chat_id"):
+                and not self.chat.get("parent_chat_id") and self.chat.get("origin") != "eval":
             self.app.memory.schedule_learning(self.chat["id"])
 
     def new_ctx(self):
@@ -849,7 +847,16 @@ class Turn:
         message, so the system prompt and tool list stay identical between turns and the model reuses them from
         its cache instead of re-reading them (on a laptop CPU that is minutes per turn)."""
         recall = getattr(self, "recall_blocks", {})
-        parts = []
+        # The date is here and not in the system prompt (2.6.0): the system prompt and tool list then stay the
+        # same from day to day, so their saved snapshot (snapshots.py) is good until they really change.
+        parts = [f"Today is {datetime.now().strftime('%A %d %B %Y')}."]
+        if self.tool_map:
+            folders = self.folders()
+            parts.append("Folders you may use: " + ", ".join(dict.fromkeys(folders + [str(self.workspace)])) +
+                         f"\nRelative paths start in {folders[0] if folders else self.workspace}. "
+                         f"Files you create without a folder go to {self.workspace}.")
+        if self.chat.get("summary"):
+            parts.append("Summary of the earlier conversation:\n" + self.chat["summary"])
         if recall.get("memory"):
             self.private.add("memory")
             parts.append(recall["memory"] + "\nUse these when relevant; the user can edit them on the Memory page.")
@@ -890,6 +897,8 @@ class Turn:
         mode = self.harness.get("mode", "agent")
         tools = await self.build_tools() if mode != "research" else []
         messages = await self.base_messages(tools)
+        if await self.continue_run(messages):
+            return
         if mode in ("agent", "planner") and tools and self.wants_team():
             orch = Orchestra(self, fit=self.run_fit)
             if await orch.plan(messages, allow_direct=self.db.setting("team_mode", "auto") != "always"):
@@ -912,6 +921,17 @@ class Turn:
             await self.agent_loop(messages, tools, steps)
 
     # ---- one model call, streaming text, collecting tool calls
+    def result_limit(self):
+        """How much of a tool result this model is given. Reading costs time in proportion to speed, so the
+        limit follows the reading speed measured on this computer: about `reading_budget_seconds` of reading
+        per result. A slow laptop gets the important first part quickly; a fast graphics card gets much more
+        than the old fixed 6,000 characters. Online models keep the fixed limit (they are billed per token)."""
+        budget = float(self.db.setting("reading_budget_seconds", 60) or 0)
+        speed = float(getattr(self.server, "read_tps", 0) or 0) if self.server is not None else 0
+        if is_cloud(self.model_id) or budget <= 0 or speed <= 0:
+            return TOOL_RESULT_LIMIT
+        return int(max(2500, min(24000, speed * budget * 3.6)))
+
     async def recover_model(self, exc):
         """The model hung or its server went away: stop that server and load a fresh one."""
         server = self.server
@@ -937,7 +957,8 @@ class Turn:
         end = None
         thinking = thinking or (self.route_role == "strategist" and is_cloud(self.model_id))
         try:
-            async for kind, value in self.app.llm.stream(messages, tools=[t.schema() for t in tools] if tools else None,
+            async for kind, value in self.app.llm.stream(messages, on_status=self.status,
+                                                         tools=[t.schema() for t in tools] if tools else None,
                                                          max_tokens=int(max_tokens or self.max_reply),
                                                          temperature=self.temperature, thinking=thinking,
                                                          server=self.server):
@@ -1008,6 +1029,7 @@ class Turn:
 
     async def complete(self, messages, **kw):
         await self.before_model_call(messages)
+        kw.setdefault("on_status", self.status)
         self.stats["model_calls"] += 1
         try:
             out = await self.app.llm.complete(messages, server=self.server, **kw)
@@ -1071,8 +1093,9 @@ class Turn:
         step.update(ok=ok, result=result[:4000])
         self.emit("tool_result", call_id=call["id"], ok=ok, result=result[:4000], declined=step.get("declined", False),
                   blocked=bool(blocked))
-        if len(result) > TOOL_RESULT_LIMIT:
-            result = result[:TOOL_RESULT_LIMIT] + f"\n…(trimmed; {len(result) - TOOL_RESULT_LIMIT:,} more characters)"
+        limit = self.result_limit()
+        if len(result) > limit:
+            result = result[:limit] + f"\n…(trimmed; {len(result) - limit:,} more characters)"
         return result
 
     def wants_team(self):
@@ -1098,12 +1121,29 @@ class Turn:
         self.note("Resumed.")
         await self.hold_model()
 
+    async def continue_run(self, messages):
+        """This turn continues a run that was stopped or cut off (the Resume button, or automatically when the
+        app starts): no new plan, accepted steps are kept, the rest runs. True when it did."""
+        run_id = (self.job.get("payload") or {}).get("resume_run")
+        row = self.db.get("runs", run_id) if run_id else None
+        if not row or not (row.get("state") or {}).get("tasks"):
+            return False
+        orch = Orchestra.restore(self, row, fit=self.run_fit)
+        try:
+            await orch.drive(messages)
+            await orch.final(messages)
+        finally:
+            orch.close()
+        return True
+
     async def run_orchestra(self):
         """Team harnesses and the composer's team builder: the planner always runs a team."""
         spec = [dict(a) for a in (self.job.get("payload", {}).get("team") or []) if a.get("name")]
         await self.hold_model()
         self.new_ctx()
         messages = await self.base_messages([])
+        if await self.continue_run(messages):
+            return
         orch = Orchestra(self, roster=spec or None, fit=self.run_fit)
         if spec and all((a.get("task") or "").strip() for a in spec):
             orch.preset([{"id": f"t{i}", "name": a["name"], "agent": a["name"], "goal": a["task"],

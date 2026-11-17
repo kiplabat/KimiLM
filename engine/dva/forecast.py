@@ -117,6 +117,60 @@ class Forecaster:
                                            "updated": now()}, key="key")
 
 
+    def judge(self, harness_id, model_id, passed, rounds=1):
+        """Record the verdict on a step: accepted complete, or not (failed, or kept as an incomplete best
+        attempt, or moved to a stronger model). This is what model choice learns from."""
+        key = self.key(harness_id, model_id)
+        row = self.db.get("step_stats", key, key="key")
+        if not row:
+            self.db.insert("step_stats", {"key": key, "harness": harness_id, "model_id": model_id, "runs": 0, "ok": 0,
+                                          "judged": 1, "passed": int(bool(passed)), "rounds": float(rounds),
+                                          "updated": now()})
+            return
+        n = int(row.get("judged") or 0)
+        self.db.update("step_stats", key, {
+            "judged": n + 1, "passed": int(row.get("passed") or 0) + int(bool(passed)),
+            "rounds": (float(row.get("rounds") or 0) * n + float(rounds)) / (n + 1), "updated": now()}, key="key")
+
+    def record_of(self, harness_id, model_id):
+        """How a harness has fared on a model: steps judged, share accepted complete, average seconds."""
+        row = self.row(harness_id, model_id) or {}
+        judged = int(row.get("judged") or 0)
+        return {"judged": judged, "passed": int(row.get("passed") or 0),
+                "rate": (int(row.get("passed") or 0) / judged) if judged else None,
+                "seconds": float(row.get("seconds") or 0), "rounds": float(row.get("rounds") or 0)}
+
+    def choose(self, harness_id, current, candidates, minimum=3):
+        """Pick the model for a step from what was measured on this computer. Returns (model id, reason) or
+        (current, None). Only models with at least `minimum` judged steps of this harness are compared; a model
+        that has never run this kind of step is never picked blind.
+          - the current model fails often (under half) and another passes clearly more: use the other
+          - the current model passes reliably (80%+) and another does too in under 70% of the time: use the faster"""
+        mine = self.record_of(harness_id, current)
+        rows = []
+        for mid in candidates:
+            if mid == current:
+                continue
+            rec = self.record_of(harness_id, mid)
+            if rec["judged"] >= minimum:
+                rows.append((mid, rec))
+        if not rows or mine["judged"] < minimum:
+            return current, None
+        if mine["rate"] < 0.5:
+            mid, rec = max(rows, key=lambda r: (r[1]["rate"], -r[1]["seconds"]))
+            if rec["rate"] >= mine["rate"] + 0.25:
+                return mid, (f"it passed {rec['passed']} of {rec['judged']} {harness_id} steps here; the usual model "
+                             f"passed {mine['passed']} of {mine['judged']}")
+            return current, None
+        if mine["rate"] >= 0.8 and mine["seconds"] > 0:
+            quick = [(mid, rec) for mid, rec in rows if rec["rate"] >= 0.8 and 0 < rec["seconds"] < mine["seconds"] * 0.7]
+            if quick:
+                mid, rec = min(quick, key=lambda r: r[1]["seconds"])
+                return mid, (f"it passes as reliably ({rec['passed']} of {rec['judged']}) in about "
+                             f"{pretty_seconds(rec['seconds'])} per step instead of {pretty_seconds(mine['seconds'])}")
+        return current, None
+
+
 def pretty_tokens(n):
     n = int(n or 0)
     return f"{n / 1000:.0f}k" if n >= 10000 else (f"{n / 1000:.1f}k" if n >= 1000 else str(n))
