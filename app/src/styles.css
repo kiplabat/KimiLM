@@ -323,3 +323,24 @@ label.menu-item { flex-direction: row; }
 .speed-why { margin: 6px 0 0 18px; padding: 0; color: var(--text-soft); }
 .speed details summary { cursor: pointer; color: var(--text-soft); }
 .speed .link { align-self: flex-start; }
+/* 2.5.0: a plan's steps in order, and the Progress panel ("Step 2 of 4") */
+.orch-seq { display: flex; flex-direction: column; gap: 8px; }
+.orch-seq-row { display: flex; gap: 8px; align-items: flex-start; min-width: 0; }
+.orch-seq-row .orch-task { flex: 1; }
+.orch-seq-n { flex-shrink: 0; width: 20px; height: 20px; margin-top: 8px; border-radius: 50%; border: 1px solid var(--line); display: inline-flex; align-items: center; justify-content: center; font-size: 11px; color: var(--text-soft); background: var(--surface); }
+.progress-chip { font-weight: 500; white-space: nowrap; } .progress-chip.on { border-color: var(--coral); }
+.progress-panel { width: 320px; }
+.progress-steps { position: relative; padding: 4px 12px 8px; display: flex; flex-direction: column; }
+.progress-steps::before { content: ""; position: absolute; left: 22px; top: 14px; bottom: 18px; width: 1px; background: var(--line); }
+.progress-step { position: relative; display: flex; gap: 10px; align-items: flex-start; padding: 7px 4px; border-radius: 8px; }
+.progress-step:hover { background: var(--surface-2); }
+.progress-icon { flex-shrink: 0; width: 20px; height: 20px; display: inline-flex; align-items: center; justify-content: center; background: var(--surface); border-radius: 50%; z-index: 1; }
+.progress-step:hover .progress-icon { background: var(--surface-2); }
+.progress-text { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.progress-name { font-size: 13.5px; line-height: 1.35; }
+.ps-waiting .progress-name, .ps-cancelled .progress-name { color: var(--text-soft); }
+.ps-running .progress-name, .ps-review .progress-name { font-weight: 600; }
+.ps-cancelled .progress-name { text-decoration: line-through; }
+.progress-last { padding-bottom: 8px; }
+.progress-used { border-top: 1px solid var(--line); margin-top: 4px; padding: 10px 0 8px; }
+.progress-used-title { font-weight: 600; padding: 0 12px 6px; }

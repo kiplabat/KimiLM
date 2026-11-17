@@ -6,10 +6,10 @@ Loop harnesses (mode):
   planner   short plan → each step with tools → final answer
   research  fixed stages run by code (plan searches → search → rank → read → download files → extract facts →
             cited report). The model only answers small questions, so it cannot loop.
-  team      a planner runs agents as a task graph (orchestrator.py): agents start when the results they need
-            are accepted, the planner reads every result and accepts, retries, messages, pauses or adds work, then
-            writes the answer. "agent" and "planner" turns hand multi-step requests to it automatically
-            (Settings → Teams), and the delegate tool uses it too.
+  team      a planner turns the request into a sequence of steps (orchestrator.py): steps run one after another,
+            each starts when the results it needs are accepted, every result is checked and sent round again
+            until it passes, then the planner writes the answer. "agent" and "planner" turns hand multi-step
+            requests to it automatically (Settings → Teams), and the delegate tool uses it too.
 Pipeline harnesses: a Python program run as a task; its output streams into the chat.
 
 Every tool-using turn has a loop guard: repeated or near-identical calls are refused (the model is told why), tools
@@ -20,7 +20,11 @@ The user can send follow-ups while a reply is being written: queued ones run rig
 to the agent at its next step.
 
 Each turn is saved as one assistant message whose meta.steps lists text, tool calls and results in order, so a
-reloaded chat looks exactly like the live one."""
+reloaded chat looks exactly like the live one.
+
+Recovery (2.5.0): a model call that hangs or loses its server (llm.LLMTimeout, llm.LLMUnreachable) restarts the
+model and is tried once more before the turn gives up with a clear message. Turns that belong to a planned run
+load their model with the context the run needs (orchestrator.RunFit), and give memory back when the run ends."""
 import asyncio
 import hashlib
 import json
@@ -35,9 +39,9 @@ from pathlib import Path
 from . import media, run_script as launcher
 from .cloud import USAGE, CloudError
 from .db import new_id, now
-from .llm import LLMError, estimate_tokens
+from .llm import LLMContextFull, LLMError, LLMTimeout, LLMUnreachable, estimate_tokens
 from .mcp import tool_key
-from .orchestrator import Orchestra, looks_multistep, team_tools
+from .orchestrator import Orchestra, RunFit, looks_multistep, team_tools
 from .providers import is_cloud
 from .runtime import RuntimeError_
 from .tools import GROUPS, Tool, ToolContext, ToolDenied, ToolError, builtin_tools
@@ -218,6 +222,11 @@ class Turn:
         self.stats = {"model_calls": 0, "prompt_tokens": 0, "output_tokens": 0, "seconds": 0, "cached_tokens": 0}
         self.tool_map = {}
         self.workspace = app.paths.workspace(chat_id)
+        team = app.team_of_chat.get(chat_id)
+        if team:      # agents of one run share the run's folder, so their prompts start the same (and are cached)
+            self.workspace = team[0].dir
+        self.run_fit = app.run_fit.get(chat_id)   # how a planned run loads its models (None: as set in Models)
+        self.unload_after = set()                 # models to unload when this turn ends
         self.auto_approve = bool(job.get("payload", {}).get("auto_approve")) or \
             self.db.setting(f"chat_auto_approve:{chat_id}", False)
         self.allowed_always = set(self.db.setting(f"chat_allow:{chat_id}", []) or [])
@@ -244,7 +253,12 @@ class Turn:
     # ------------------------------------------------------------------ model lease (released while waiting on others)
     async def hold_model(self):
         if self._lease is None:
-            self._lease = self.app.runtime.lease(self.model_id, on_wait=self.status)
+            overrides = None
+            if self.run_fit is not None and not is_cloud(self.model_id):
+                overrides = self.run_fit.overrides(self.app.runtime, self.model_id)
+            elif not is_cloud(self.model_id) and self.model_id:
+                overrides = self.app.runtime.keep(self.model_id, self.rough_need())
+            self._lease = self.app.runtime.lease(self.model_id, on_wait=self.status, overrides=overrides)
             try:
                 self.server = await self._lease.__aenter__()
             except RuntimeError_ as exc:
@@ -480,8 +494,9 @@ class Turn:
                        and h.get("mode") not in ("team",) and h.get("enabled", True)]
 
         async def delegate(ctx, tasks):
-            """Runs through the orchestrator: tasks that need others' results wait for them, and this agent (as the
-            planner) reads every result before accepting it, so helpers never run uncoordinated."""
+            """Runs through the orchestrator: steps run in order, each waits for the results it needs, and every
+            result is checked before it is accepted, so helpers never run uncoordinated. The helpers use this
+            agent's model as it is loaded (no resizing in the middle of its turn)."""
             if not isinstance(tasks, list) or not tasks:
                 raise ToolError("Give a list of tasks")
             items = [{"id": str(t.get("id") or f"t{i}"), "name": str(t.get("name") or f"Agent {i}")[:40],
@@ -501,9 +516,9 @@ class Turn:
             budget = max(1500, 9000 // max(1, len(orch.tasks)))
             return (f"{len(done)} of {len(orch.tasks)} tasks accepted.\n\n" + orch.results_text(budget) +
                     f"\n\nShared team folder: {orch.dir}")
-        return Tool("delegate", "Hand parts of the task to other agents, each in its own chat. Tasks without "
-                    "depends_on run at the same time; a task with depends_on starts when those tasks' results are "
-                    "ready and receives them. You read every result before it is accepted. Returns their results.",
+        return Tool("delegate", "Hand parts of the task to other agents, each in its own chat. They run one after "
+                    "another in the order given; a task with depends_on receives those tasks' results. Every "
+                    "result is checked against its done_when before it is accepted. Returns their results.",
                     {"type": "object", "required": ["tasks"], "properties": {"tasks": {"type": "array", "maxItems": 8,
                      "items": {"type": "object", "required": ["name", "task"], "properties": {
                          "id": {"type": "string", "description": "short id such as t1, used in depends_on"},
@@ -526,15 +541,17 @@ class Turn:
                                     today=datetime.now().strftime("%A %d %B %Y"),  # date only: a changing prefix defeats prompt caching
                                     os=f"{platform.system()} {platform.release()}")]
         if self.chat.get("parent_chat_id"):
-            parts.append(f"You are “{self.chat.get('agent_name') or 'an agent'}”, one agent in a team run by a "
-                         "planner. Do only your task, then reply with a clear, self-contained result (facts, numbers, "
-                         "file paths) that the planner can check and combine with the other agents' results."
-                         + (" You can read the team board, wait for a teammate's result, or ask the planner."
+            # No agent name or task here: agents with the same harness and model then share this whole prompt
+            # and the tool list, so the model reads them once per run and takes them from its cache afterwards.
+            parts.append("You are one agent in a plan run by a planner. Do only your task, then reply with a clear, "
+                         "self-contained result (facts, numbers, file paths) that the planner can check and combine "
+                         "with the other agents' results."
+                         + (" You can read the team board or ask the planner."
                             if "team_board" in self.tool_map else ""))
         if tools:
             parts.append(AGENT_RULES)
             folders = self.folders()
-            parts.append("Folders you may use: " + ", ".join(folders + [str(self.workspace)]) +
+            parts.append("Folders you may use: " + ", ".join(dict.fromkeys(folders + [str(self.workspace)])) +
                          f"\nRelative paths start in {folders[0] if folders else self.workspace}. "
                          f"Files you create without a folder go to {self.workspace}.")
         if self.harness.get("system_prompt"):
@@ -673,7 +690,57 @@ class Turn:
         return bool(rows)
 
     # ------------------------------------------------------------------ running
+    def rough_need(self):
+        """About how much context this turn needs (history, tools, its steps, the reply)."""
+        if self.chat.get("summary"):
+            history = 3000
+        else:
+            rows = self.db.all("SELECT content FROM messages WHERE chat_id=?", (self.chat["id"],))
+            history = sum(estimate_tokens(r["content"]) for r in rows)
+        tools = 0 if self.harness.get("mode") == "chat" else 3000 + 4500
+        return int((history + tools + self.max_reply) * 1.2)
+
+    def prefit(self):
+        """A request that will probably become a planned run loads its model sized for the run from the start
+        (one reply slot, the context its steps need) instead of the largest setting, so it is loaded once."""
+        if self.chat.get("parent_chat_id") or self.run_fit is not None or is_cloud(self.model_id) or \
+                not self.db.setting("fit_context", True) or (self.job.get("payload") or {}).get("no_team"):
+            return
+        mode = self.harness.get("mode", "agent")
+        team_mode = self.db.setting("team_mode", "auto")
+        likely = mode == "team" or (mode in ("agent", "planner") and (
+            team_mode == "always" or (team_mode == "auto" and looks_multistep(self.last_user_text()))))
+        if not likely:
+            return
+        fit = RunFit(sequence=self.db.setting("agent_order", "sequence") != "parallel")
+        fit.want(self.model_id, min(self.rough_need(), 24000))
+        self.run_fit = self.app.run_fit[self.chat["id"]] = fit
+
+    async def refit(self, messages, tools, max_steps):
+        """The request stays with one agent after all: size the context for that (history, tools, its steps)."""
+        if self.run_fit is None or is_cloud(self.model_id) or self.server is None:
+            return
+        size = sum(estimate_tokens(m["content"] if isinstance(m.get("content"), str) else
+                                   json.dumps(m.get("content"), default=str)) for m in messages)
+        size += estimate_tokens(json.dumps([t.schema() for t in tools])) if tools else 0
+        self.run_fit.want(self.model_id, int((size + min(max_steps * 900, 6000) + self.max_reply) * 1.3))
+        if self.run_fit.overrides(self.app.runtime, self.model_id).get("ctx") != self.server.plan.get("ctx"):
+            await self.drop_model()
+            await self.hold_model()
+
     async def run(self):
+        try:
+            await self._run()
+        finally:
+            if not self.chat.get("parent_chat_id"):
+                self.app.run_fit.pop(self.chat["id"], None)
+            if self.unload_after:              # the run's models are not needed any more: give the memory back
+                try:
+                    await self.app.runtime.release(only=self.unload_after)
+                except Exception as exc:
+                    self.app.log(f"unloading after a run: {type(exc).__name__}: {exc}")
+
+    async def _run(self):
         started = time.monotonic()
         USAGE.set({"chat_id": self.chat["id"], "job_id": self.job["id"],
                    "purpose": "agent" if self.chat.get("parent_chat_id") else
@@ -691,6 +758,7 @@ class Turn:
                 if not self.model_id or self.model_id == "auto":
                     raise TurnStopped("No model is installed yet. Open Models and download one (the recommended "
                                       "one is marked).")
+                self.prefit()
                 if self.harness.get("mode") == "team":
                     await self.run_orchestra()
                 else:
@@ -823,11 +891,16 @@ class Turn:
         tools = await self.build_tools() if mode != "research" else []
         messages = await self.base_messages(tools)
         if mode in ("agent", "planner") and tools and self.wants_team():
-            orch = Orchestra(self)
+            orch = Orchestra(self, fit=self.run_fit)
             if await orch.plan(messages, allow_direct=self.db.setting("team_mode", "auto") != "always"):
-                await orch.drive(messages)
-                return await orch.final(messages)
+                try:
+                    await orch.drive(messages)
+                    return await orch.final(messages)
+                finally:
+                    orch.close()
             self.status("Working…")
+        if mode in ("agent", "planner") and tools:
+            await self.refit(messages, tools, int(self.limits.get("max_steps") or self.harness.get("max_steps") or 10))
         if mode == "research":
             await self.run_research(messages)
         elif mode == "chat" or not tools:
@@ -839,7 +912,23 @@ class Turn:
             await self.agent_loop(messages, tools, steps)
 
     # ---- one model call, streaming text, collecting tool calls
-    async def stream_text(self, messages, tools, final=True, max_tokens=None):
+    async def recover_model(self, exc):
+        """The model hung or its server went away: stop that server and load a fresh one."""
+        server = self.server
+        self.note(f"The model stopped responding ({str(exc)[:160]}). Restarting it and trying again.")
+        self.app.log(f"restarting {self.model_id} in chat {self.chat['id']}: {type(exc).__name__}: {exc}")
+        await self.drop_model()
+        if server is not None:
+            await self.app.runtime.restart(server)
+        await self.hold_model()
+
+    @staticmethod
+    def gave_up(exc):
+        return TurnStopped(f"The model stopped responding twice in a row ({str(exc)[:200]}). It was restarted in "
+                           "between. Try again with a smaller context or a smaller model, or close other apps to "
+                           "free memory.")
+
+    async def stream_text(self, messages, tools, final=True, max_tokens=None, _retry=False):
         thinking = bool(self.chat.get("thinking")) or bool(self.harness.get("thinking"))
         buffer = []
         await self.before_model_call(messages)
@@ -865,6 +954,15 @@ class Turn:
                 raise
             await self.switch_to_local(f"the online model failed ({str(exc)[:160]})")
             return await self.stream_text(messages, tools, final=final, max_tokens=max_tokens)
+        except (LLMTimeout, LLMUnreachable) as exc:
+            if is_cloud(self.model_id):
+                raise
+            if _retry:
+                raise self.gave_up(exc) from exc
+            await self.recover_model(exc)
+            if buffer:                              # drop the half-written text; it is written again
+                self.emit("text_replace", text="")
+            return await self.stream_text(messages, tools, final=final, max_tokens=max_tokens, _retry=True)
         self._count(end)
         self._last_native = end.get("native")
         text = "".join(buffer)
@@ -898,6 +996,12 @@ class Turn:
                 self.stats["cost_estimated"] = True
         self.stats["prompt_tokens"] += int(timings.get("prompt_n") or 0)
         self.stats["cached_tokens"] += int(timings.get("cache_n") or 0)   # reused from the model's cache, not re-read
+        size = int(timings.get("prompt_n") or 0) + int(timings.get("cache_n") or 0)   # this call's whole prompt
+        if size:
+            self.stats.setdefault("first_prompt", size)       # system prompt + tools + the request (forecaster)
+            self.stats["peak_prompt"] = max(size, int(self.stats.get("peak_prompt") or 0))
+        if timings.get("prompt_per_second") and int(timings.get("prompt_n") or 0) >= 8:
+            self.stats["read_tps"] = round(timings["prompt_per_second"], 1)
         self.stats["output_tokens"] += int(timings.get("predicted_n") or 0)
         if timings.get("predicted_per_second"):
             self.stats["tokens_per_second"] = round(timings["predicted_per_second"], 1)
@@ -912,6 +1016,14 @@ class Turn:
                 raise
             await self.switch_to_local(f"the online model failed ({str(exc)[:160]})")
             out = await self.app.llm.complete(messages, server=self.server, **kw)
+        except (LLMTimeout, LLMUnreachable) as exc:
+            if is_cloud(self.model_id):
+                raise
+            await self.recover_model(exc)
+            try:
+                out = await self.app.llm.complete(messages, server=self.server, **kw)
+            except (LLMTimeout, LLMUnreachable) as again:
+                raise self.gave_up(again) from again
         self._count(out)
         return out
 
@@ -992,7 +1104,7 @@ class Turn:
         await self.hold_model()
         self.new_ctx()
         messages = await self.base_messages([])
-        orch = Orchestra(self, roster=spec or None)
+        orch = Orchestra(self, roster=spec or None, fit=self.run_fit)
         if spec and all((a.get("task") or "").strip() for a in spec):
             orch.preset([{"id": f"t{i}", "name": a["name"], "agent": a["name"], "goal": a["task"],
                           "harness": a.get("harness"), "model": a.get("model"), "limits": a.get("limits"),
@@ -1000,8 +1112,11 @@ class Turn:
             orch.logline(f"Your team: {len(orch.tasks)} agents with their own tasks.")
         else:
             await orch.plan(messages, allow_direct=False)
-        await orch.drive(messages)
-        await orch.final(messages)
+        try:
+            await orch.drive(messages)
+            await orch.final(messages)
+        finally:
+            orch.close()
 
     async def agent_loop(self, messages, tools, max_steps):
         use_json = self.harness.get("tool_mode") == "json"
@@ -1022,6 +1137,8 @@ class Turn:
                 try:
                     text, calls = await self.stream_text(messages, tools, final=True)
                 except LLMError as exc:
+                    if isinstance(exc, (LLMTimeout, LLMUnreachable, LLMContextFull)):
+                        raise
                     if "tool" in str(exc).lower() or "500" in str(exc):
                         self.status("This model's template has no native tool calling; switching to JSON mode")
                         use_json = True
@@ -1282,7 +1399,7 @@ class Turn:
         self.status("Writing the answer…")
         await self.stream_text(messages, None)
 
-    # ------------------------------------------------------------------ teams (agents in parallel)
+    # ------------------------------------------------------------------ planned runs: who runs each step
     def assign_models(self, agents):
         """Agents without a model get one by role: workers on this computer when possible, strategists on the
         strongest model. With a local lead and no roles, agents share the chat's model as before."""

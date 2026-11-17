@@ -169,7 +169,7 @@ def test_lead_and_local_workers(env):
     team = [s for s in msg["meta"]["steps"] if s["type"] == "orchestra"][0]
     assert team["tasks"] and all(t["model"] == env["local"] for t in team["tasks"]), team   # workers run locally
     assert all(t["status"] == "done" for t in team["tasks"])
-    assert any(line["text"].startswith("Planner accepted") for line in team["log"])          # the lead read them
+    assert any(line["text"].startswith("Accepted") for line in team["log"])                  # the lead checked them
 
 
 def test_online_failure_falls_back_to_local_under_auto(env):

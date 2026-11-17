@@ -7,6 +7,7 @@ from .cloud import Cloud
 from .db import DB, new_id, now
 from .embed import Embedder
 from .events import EventBus
+from .forecast import Forecaster
 from .harness import Harnesses
 from .jobs import Jobs
 from .knowledge import Knowledge
@@ -34,6 +35,10 @@ DEFAULT_SETTINGS = {
     "max_loaded_models": 3, "browser_search": True, "max_parallel_agents": 4, "turn_time_limit_minutes": 30,
     "cloud_privacy": "ask", "cloud_budget_monthly": 10.0, "cloud_max_parallel": 4,
     "team_mode": "auto", "max_team_tasks": 8, "team_time_limit_minutes": 120,
+    # 2.5.0: sequenced, looped runs. agent_order: sequence | parallel; step_rounds: tries per step before the best
+    # attempt is kept; fit_context: load a run's models with the context its steps need
+    "agent_order": "sequence", "step_rounds": 3, "verify_results": True, "plan_approval": False,
+    "fit_context": True, "unload_after_run": False, "stall_timeout_seconds": 180, "first_token_timeout_seconds": 0,
 }
 CHAT_LIMIT_KEYS = ("max_reply_tokens", "max_steps", "time_limit_minutes", "temperature", "max_searches",
                    "max_tool_calls")
@@ -74,6 +79,8 @@ class App:
         self.pauses = {}          # chat id -> {"event", "reason"}: paused agent loops (orchestrator.pause_chat)
         self.orchestras = {}      # chat id -> running Orchestra (a team led from that chat)
         self.team_of_chat = {}    # agent chat id -> (Orchestra, task id)
+        self.run_fit = {}         # chat id -> orchestrator.RunFit: how a planned run loads its models
+        self.forecaster = Forecaster(self)
         self._bg = []
         for key, value in DEFAULT_SETTINGS.items():
             if self.db.setting(key) is None:

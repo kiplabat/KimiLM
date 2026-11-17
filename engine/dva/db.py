@@ -71,6 +71,10 @@ CREATE INDEX IF NOT EXISTS kb_chunks_project ON kb_chunks(project_id);
 CREATE TABLE IF NOT EXISTS msg_vec (message_id TEXT PRIMARY KEY, chat_id TEXT, vec BLOB);
 CREATE INDEX IF NOT EXISTS msg_vec_chat ON msg_vec(chat_id);
 CREATE TABLE IF NOT EXISTS mem_vec (memory_id TEXT PRIMARY KEY, text TEXT, vec BLOB);
+CREATE TABLE IF NOT EXISTS step_stats (
+  key TEXT PRIMARY KEY, harness TEXT, model_id TEXT, runs INTEGER DEFAULT 0, ok INTEGER DEFAULT 0,
+  calls REAL DEFAULT 0, fixed REAL DEFAULT 0, growth REAL DEFAULT 0, output REAL DEFAULT 0, seconds REAL DEFAULT 0,
+  read_tps REAL DEFAULT 0, write_tps REAL DEFAULT 0, updated TEXT);
 """
 
 # Full-text search (SQLite FTS5) over messages and knowledge passages, kept in step by triggers. If this SQLite has

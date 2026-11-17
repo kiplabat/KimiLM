@@ -5,11 +5,18 @@ once; 'write' → write_file; then answers. JSON-schema requests get a minimal v
 
 Planner (2.4.0): a plan request answers 'team' when the conversation says "as a team" (or when 'direct' is not
 allowed) with two tasks, t2 depending on t1; a checkpoint asks t1 to fix its work once when the request says
-"retry-me", and answers agents' questions; agents call ask_lead when their task says "ask the planner"."""
+"retry-me", and answers agents' questions; agents call ask_lead when their task says "ask the planner".
+
+Sequenced runs (2.5.0): "forgetful plan" gives three steps without depends_on (t2 only names t1 in its goal), like a
+small planner does; "explode" in a step's goal makes its agent fail with a server error; the result check
+('met') fails once for goals with "retry-me" and always for goals with "never-pass"; "hang-once" makes the
+server send nothing for a long time, once per model file (a file beside the model remembers it, because the
+engine restarts this process); /tokenize counts four characters per token."""
 import argparse
 import json
 import sys
 import time
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -27,7 +34,14 @@ p.add_argument("--device", "-dev")
 p.add_argument("-t", type=int, default=4)
 p.add_argument("-tb")      # declared so "-tb 12" is not read as "-t b"
 p.add_argument("--spec-type", default="none")
-args, _ = p.parse_known_args()
+# The engine's random API key can start with "-" (about 1 start in 64); argparse would then read it as a flag
+# and exit, which looked like a rare random test failure. Pass it as --api-key=VALUE. llama-server is not affected.
+argv = sys.argv[1:]
+for i, a in enumerate(argv[:-1]):
+    if a == "--api-key":
+        argv[i:i + 2] = [f"--api-key={argv[i + 1]}"]
+        break
+args, _ = p.parse_known_args(argv)
 if not args.list_devices and args.device != "none":     # report placement like llama.cpp does (read by the runtime)
     on_gpu = 33 if args.ngl in ("auto", "all") else min(33, int(args.ngl))
     print(f"load_tensors: offloaded {on_gpu}/33 layers to GPU", flush=True)
@@ -198,10 +212,17 @@ def structured(schema, body):
     users = " ".join(text_of(m.get("content")) for m in body["messages"] if m["role"] == "user").lower()
     if "approach" in props and "tasks" in props:
         allowed = props["approach"]["enum"]
+        if "team" in allowed and "forgetful plan" in users:
+            return {"approach": "team", "reason": "three steps", "final": "all parts", "tasks": [
+                {"id": "t1", "name": "Find", "goal": "say hello" + (" then explode" if "explode-first" in users else ""),
+                 "done_when": "a greeting"},
+                {"id": "t2", "name": "Summarise", "goal": "summarise what t1 found", "done_when": "one line"},
+                {"id": "t3", "name": "Publish", "goal": "publish the summary", "done_when": "a report"}]}
         if "team" in allowed and ("direct" not in allowed or "as a team" in users):
             agents = props["tasks"]["items"]["properties"].get("agent", {}).get("enum")
+            marks = "".join(f" ({m})" for m in ("retry-me", "never-pass") if m in users)
             return {"approach": "team", "reason": "two steps", "final": "both parts", "tasks": [
-                {"id": "t1", "name": "Collect", "goal": "say hello" + (" and ask the planner" if "ask the planner" in users else ""),
+                {"id": "t1", "name": "Collect", "goal": "say hello" + marks + (" and ask the planner" if "ask the planner" in users else ""),
                  "done_when": "a greeting", "agent": (agents or ["Collector"])[0], "role": "worker", "harness": "agent"},
                 {"id": "t2", "name": "Summarise", "goal": "summarise t1", "done_when": "one line",
                  "depends_on": ["t1"], "agent": (agents or ["Collector", "Writer"])[-1], "role": "worker", "harness": "agent"}]}
@@ -209,20 +230,51 @@ def structured(schema, body):
     if "actions" in props:
         last = text_of(body["messages"][-1].get("content"))
         actions = []
-        if "retry-me" in users and "### t1" in last and "(attempt 1)" in last:
-            actions.append({"do": "retry", "task": "t1", "text": "add a second greeting"})
         if "Question from t1" in last:
             actions.append({"do": "answer", "task": "t1", "text": "use English"})
         return {"actions": actions}
+    if "met" in props and "reason" in props:        # the strict check of one step's result
+        task = text_of(body["messages"][-1].get("content")).split("Acceptance test")[0]
+        CHECKED[task] = CHECKED.get(task, 0) + 1
+        if "never-pass" in task:
+            return {"reason": "the second greeting is still missing", "met": False}
+        if "retry-me" in task and CHECKED[task] == 1:
+            return {"reason": "add a second greeting", "met": False}
+        return {"reason": "complete", "met": True}
     return minimal(schema)
+
+
+CHECKED = {}
+HUNG = Path(args.m).with_suffix(".hung") if args.m else None
+
+
+@app.post("/tokenize")
+async def tokenize(request: Request):
+    body = await request.json()
+    return {"tokens": list(range(len(body.get("content") or "") // 4))}
 
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
     body = await request.json()
+    said = " ".join(text_of(m.get("content")) for m in body["messages"] if m["role"] == "user")
+    if "hang-once" in said and HUNG is not None and not HUNG.exists():
+        HUNG.write_text("hung once")
+        time.sleep(40)                              # a stuck model: no bytes at all
+    if "explode" in text_of(body["messages"][-1].get("content")).split("Done when")[0].split("Your task")[-1] \
+            and "Your task" in said:
+        return JSONResponse({"error": {"message": "the fake model exploded"}}, 500)
     rf = body.get("response_format")
     if rf:
         content = json.dumps(structured(rf["json_schema"]["schema"], body))
+        if body.get("stream"):                      # llama-server streams schema answers like any other reply
+            def one():
+                yield "data: " + json.dumps({"choices": [{"index": 0, "delta": {"role": "assistant", "content": content},
+                                                          "finish_reason": None}]}) + "\n\n"
+                yield "data: " + json.dumps({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}) + "\n\n"
+                yield "data: " + json.dumps({"choices": [], "timings": timings(body), "usage": {}}) + "\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(one(), media_type="text/event-stream")
         return {"choices": [{"message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
                 "timings": timings(body)}
     d = decide(body)

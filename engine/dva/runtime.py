@@ -5,7 +5,12 @@ Several models can be loaded at once (one llama-server each) when memory allows,
 different models in parallel. A chat or task "leases" a model for as long as it needs it; when memory is short,
 idle models are unloaded first, and if every loaded model is busy the new request waits. Requests to the same model
 share its server (its "simultaneous replies" setting decides how many run at the same time; the rest queue).
-Models never leave this computer: servers listen on 127.0.0.1 only and need a random API key."""
+Models never leave this computer: servers listen on 127.0.0.1 only and need a random API key.
+
+Memory comes first (2.5.0). A run of agents sizes the context it loads a model with to what its steps need
+(Runtime.fit) instead of the largest context for every reply slot, releases a model the moment no remaining step
+uses it (Runtime.release), and can stop a model server that no longer answers so the next call loads a fresh
+one (Runtime.restart)."""
 import asyncio
 import contextvars
 import json
@@ -64,6 +69,8 @@ class Server:
         self.last_used = time.monotonic()
         self.loaded_at = None
         self.need_bytes = 0
+        self.read_tps = 0.0         # tokens per second measured on this server (reading the prompt / writing)
+        self.write_tps = 0.0
 
     @property
     def base_url(self):
@@ -92,6 +99,8 @@ PLAN_KEYS = ("compute", "backend", "ctx", "parallel", "mmproj", "gpu_layers", "k
              "hybrid")
 KV_TYPES = {"f16": 2.0, "q8_0": 1.0625, "q4_0": 0.5625}          # bytes per value in the context cache
 PRIORITY = {"normal": 0, "medium": 1, "high": 2}
+# context sizes a run may ask for: few steps, so a model is not reloaded for every small change in need
+CTX_STEPS = (4096, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072, 196608, 262144)
 SPEC_TYPES = ("none", "ngram", "mtp", "draft")
 HYBRID_CHECKPOINTS = 8          # saved states per reply slot for hybrid models …
 HYBRID_CHECKPOINT_STEP = 256    # … at most this many tokens apart, so a follow-up re-reads little
@@ -503,6 +512,9 @@ class Runtime:
                 await self._stop_server(server)
                 raise RuntimeError_("The model took more than 10 minutes to load")
         server.loaded_at = time.time()
+        bench = model.get("bench") or {}          # speeds from the model's benchmark until this server is measured
+        server.read_tps = float(bench.get("prompt_per_second") or 0)
+        server.write_tps = float(bench.get("predicted_per_second") or 0)
         server.placement = self._read_placement(log_start)
         self.servers[model["id"]] = server
         self.status = {"state": "ready", "model_id": model["id"], "backend": plan["backend"],
@@ -537,6 +549,7 @@ class Runtime:
                  "ctx": s.plan["ctx"], "parallel": s.plan["parallel"], "users": s.users,
                  "vision": bool(s.plan.get("mmproj")), "memory_mb": s.need_bytes // 2**20,
                  "placement": getattr(s, "placement", {}), "note": s.plan.get("note"),
+                 "read_tps": round(s.read_tps, 1), "write_tps": round(s.write_tps, 2),
                  "kv_on": s.plan.get("kv_on"), "moe_cpu": s.plan.get("moe_cpu"),
                  "speed": {k: s.plan.get(k) for k in ("threads", "threads_batch", "kv_type", "spec", "priority")}}
                 for s in self.servers.values()]
@@ -602,10 +615,12 @@ class Runtime:
             await self._stop_server(idle.pop(0))
 
     @asynccontextmanager
-    async def lease(self, model_id, compute=None, on_wait=None, overrides=None):
+    async def lease(self, model_id, compute=None, on_wait=None, overrides=None, as_loaded=False):
         """Use a model for the duration of a block; yields its Server. Loads it if needed (alongside the models
         already loaded when memory allows), otherwise waits for a busy model to finish. Online models
-        ("cloud:…") are leased from cloud.Cloud: nothing to load."""
+        ("cloud:…") are leased from cloud.Cloud: nothing to load.
+        as_loaded: small background work (learning from a chat) uses the model the way it is loaded right now
+        instead of reloading it with its full settings; if it is not loaded, it gets a small context."""
         if self.cloud is not None and str(model_id or "").startswith("cloud:"):
             async with self.cloud.lease(model_id, on_wait=on_wait) as server:
                 yield server
@@ -614,6 +629,12 @@ class Runtime:
         if not model:
             raise RuntimeError_(f"Model {model_id!r} is not installed. Download it in Models.")
         async with self.cond:
+            current = self.servers.get(model_id)
+            if as_loaded and overrides is None:
+                if current and current.alive:
+                    overrides = {"ctx": current.plan["ctx"], "parallel": current.plan["parallel"]}
+                else:
+                    overrides = self.fit(model_id, 8192, 1)
             plan = self.plan(model, compute, overrides)
             waited = False
             while True:
@@ -629,6 +650,7 @@ class Runtime:
                 if not server and await self._make_room(self._need_bytes(model, plan)):
                     try:
                         server = await self._start(model, plan)
+                        server.fitted = bool(overrides and "ctx" in overrides)   # sized for a run, not by its setting
                     except RuntimeError_:
                         if not plan.get("mmproj"):
                             raise
@@ -694,6 +716,78 @@ class Runtime:
 
     def is_loaded(self, model_id):
         return model_id in self.servers
+
+    # ------------------------------------------------------------------ memory-first loading (2.5.0)
+    def ceiling(self, model_id):
+        """The largest context a run may use for this model: the context the user set for it."""
+        model = self.db.get("models", model_id) or {}
+        return int((model.get("settings") or {}).get("ctx") or self.db.setting("default_ctx", 8192))
+
+    def fit(self, model_id, need_tokens, parallel=1):
+        """Settings for loading a model for a run that needs `need_tokens` of context per reply: the smallest
+        step that holds it (never more than the user's own setting), and only as many reply slots as the run
+        uses. A model that is already loaded a little larger is kept as it is, so it is not loaded twice."""
+        top = self.ceiling(model_id)
+        want = next((c for c in CTX_STEPS if c >= need_tokens), CTX_STEPS[-1])
+        want = max(min(want, top), min(4096, top))
+        parallel = max(1, int(parallel or 1))
+        s = self.servers.get(model_id)
+        if s and s.alive and s.plan.get("parallel") == parallel and want <= int(s.plan.get("ctx") or 0) <= want * 2:
+            want = int(s.plan["ctx"])
+        return {"ctx": want, "parallel": parallel}
+
+    def keep(self, model_id, need_tokens):
+        """A model that a run loaded with a smaller context stays as it is for the chats that follow, as long as
+        it is large enough for them: no reload back to the full setting until something needs it."""
+        s = self.servers.get(model_id)
+        if s and s.alive and getattr(s, "fitted", False) and int(s.plan.get("ctx") or 0) >= need_tokens:
+            return {"ctx": s.plan["ctx"], "parallel": s.plan["parallel"]}
+        return None
+
+    def need_for(self, model_id, overrides=None):
+        """Bytes of memory this model needs when loaded with these settings (0 for online or unknown models)."""
+        model = self.db.get("models", model_id) if model_id else None
+        if not model:
+            return 0
+        try:
+            return self._need_bytes(model, self.plan(model, None, overrides))
+        except Exception:
+            return 0
+
+    def memory(self, model_id=None, overrides=None):
+        """Free memory now, what idle models would give back, and what loading `model_id` would take."""
+        idle = sum(s.need_bytes for s in self.servers.values() if s.users == 0 and s.model_id != model_id)
+        loaded = self.servers.get(model_id) if model_id else None
+        need = 0
+        same = bool(loaded and loaded.alive and all(loaded.plan.get(k) == v for k, v in (overrides or {}).items()
+                                                    if k in ("ctx", "parallel")))
+        if model_id and not same:
+            need = self.need_for(model_id, overrides)
+            if loaded and loaded.users == 0:
+                idle += loaded.need_bytes            # it restarts with the new settings: its memory comes back
+        return {"free": self._free_bytes(), "reclaimable": idle, "need": need}
+
+    async def release(self, only=None, keep=()):
+        """Unload idle models now (those in `only`, or all), except the ones in `keep`. Returns what was unloaded."""
+        gone = []
+        async with self.cond:
+            for s in list(self.servers.values()):
+                if s.users == 0 and s.model_id not in keep and (only is None or s.model_id in only):
+                    await self._stop_server(s)
+                    gone.append(s.model_id)
+            if gone:
+                self.cond.notify_all()
+        return gone
+
+    async def restart(self, server):
+        """Stop a model server that no longer answers; the next lease loads a fresh one. A server other replies
+        still use is left alone unless its process has died."""
+        async with self.cond:
+            if self.servers.get(server.model_id) is server and (server.users <= 0 or not server.alive):
+                await self._stop_server(server)
+                self.cond.notify_all()
+                return True
+        return False
 
     async def unload(self, model_id=None):
         async with self.cond:

@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle, Ban, Brain, Check, CheckCircle2, ChevronDown, ChevronRight, Circle, Clock, Cloud, Copy, CornerDownRight,
-  Eye, ExternalLink, FileText, FolderOpen, Loader2, MoreHorizontal, Paperclip, Pause, Pin, Play, RotateCcw, Send,
+  Cpu, Eye, ExternalLink, FileText, FolderOpen, ListChecks, Loader2, MoreHorizontal, Paperclip, Pause, Pin, Play, RotateCcw, Send,
   ShieldCheck, Sparkles, Trash2, Users, Workflow, X, XCircle,
 } from "lucide-react";
 import { api, desktop, fileUrl, fmtBytes, fmtTime } from "../api";
@@ -125,7 +125,18 @@ function TeamCards({ agents }: any) {
   );
 }
 
-const TASK_LABEL: any = { waiting: "waiting", paused: "paused", running: "working", review: "being checked", done: "accepted", failed: "failed", cancelled: "cancelled" };
+const TASK_LABEL: any = { waiting: "waiting", paused: "paused", running: "working", review: "being checked", done: "accepted", failed: "failed", cancelled: "not run" };
+
+const fmtTokens = (n: number) => !n ? "0" : n >= 10000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+const fmtDuration = (s: number) => s < 90 ? `${Math.max(1, Math.round(s))} s` : s < 5400 ? `${Math.round(s / 60)} min` : `${(s / 3600).toFixed(1)} h`;
+
+// What a step is forecast to need before it runs, and what it really used afterwards.
+function taskCost(t: any) {
+  if (t.used?.tokens) return `used ${fmtTokens(t.used.tokens)} tokens · ${fmtDuration(t.used.seconds || 0)}`;
+  const f = t.forecast;
+  if (!f?.tokens) return "";
+  return `about ${fmtTokens(f.tokens)} tokens · ${fmtDuration(f.seconds || 0)}${f.learned ? "" : " (first estimate)"}`;
+}
 
 function taskIcon(t: any) {
   if (t.paused && t.status === "running") return <Pause size={14} className="warn-c" />;
@@ -159,14 +170,16 @@ function OrchestraTask({ t, live }: any) {
         </span>
       </div>
       <div className="small muted ellipsis">
-        {TASK_LABEL[t.status] || t.status}{t.attempts > 1 ? ` · attempt ${t.attempts}` : ""} · {t.agent ? `${t.agent} · ` : ""}{t.harness}
+        {t.partial ? "kept as best attempt" : TASK_LABEL[t.status] || t.status}{t.attempts > 1 || (t.status === "running" && t.rounds > 1) ? ` · round ${Math.max(1, t.attempts)}${t.rounds ? ` of ${t.rounds}` : ""}` : ""} · {t.agent ? `${t.agent} · ` : ""}{t.harness}
         {t.model_name ? <> · {t.online ? <Cloud size={11} /> : null} {t.model_name}</> : null}
       </div>
-      {t.depends_on?.length > 0 && <div className="small muted">after {t.depends_on.join(", ")}</div>}
+      {(t.depends_on?.length > 0 || taskCost(t)) && <div className="small muted">
+        {t.depends_on?.length > 0 ? `uses ${t.depends_on.join(", ")}` : ""}{t.depends_on?.length > 0 && taskCost(t) ? " · " : ""}{taskCost(t)}
+      </div>}
       <div className="small clamp-2" title={t.goal}>{t.goal}</div>
       {t.status === "running" && t.progress && <div className="small accent ellipsis">{t.paused ? "paused" : t.progress}</div>}
       {t.status === "waiting" && t.wait_reason && <div className="small muted">{t.wait_reason}</div>}
-      {t.note && <div className="small orch-note">Planner: {t.note}</div>}
+      {t.note && <div className="small orch-note">{t.status === "failed" || t.partial || t.status === "running" ? "Check: " : ""}{t.note}</div>}
       {t.output && (
         <div className="orch-output">
           <button className="link small" onClick={() => setOpen(!open)}>{open ? "Hide result" : "Show result"}</button>
@@ -193,26 +206,36 @@ function OrchestraCard({ step, live }: any) {
   tasks.forEach((t) => level(t));
   const lanes: any[][] = [];
   tasks.forEach((t) => { (lanes[depth[t.id]] = lanes[depth[t.id]] || []).push(t); });
-  const done = tasks.filter((t) => ["done", "failed", "cancelled"].includes(t.status)).length;
+  const done = tasks.filter((t) => t.status === "done").length;
+  const failed = tasks.filter((t) => t.status === "failed").length;
+  const skipped = tasks.filter((t) => t.status === "cancelled").length;
   const running = tasks.filter((t) => t.status === "running").length;
+  const sequence = step.mode === "sequence";
   return (
     <div className="orch">
       <div className="orch-head">
-        <span className="row gap-s"><Workflow size={14} /> <b>Team</b>
-          <span className="muted small">{done} of {tasks.length} done{running ? ` · ${running} working` : ""}</span></span>
+        <span className="row gap-s"><Workflow size={14} /> <b>{sequence ? "Plan" : "Team"}</b>
+          <span className="muted small">{done} of {tasks.length} done{failed ? ` · ${failed} failed` : ""}{skipped ? ` · ${skipped} not run` : ""}{running ? ` · ${running} working` : ""}{sequence ? " · one step at a time" : ""}
+            {step.totals?.tokens ? ` · ${fmtTokens(step.totals.tokens)} tokens` : ""}</span></span>
         <span className="row gap-s">
           {step.log?.length > 0 && <button className="link small" onClick={() => setShowLog(!showLog)}>{showLog ? "Hide the planner's log" : `Planner's log (${step.log.length})`}</button>}
           {desktop && step.folder && <button className="icon-btn" title="Open the shared team folder" onClick={() => desktop.openPath(step.folder)}><FolderOpen size={13} /></button>}
         </span>
       </div>
-      <div className="orch-lanes">
+      {sequence ? (
+        <div className="orch-seq">
+          {tasks.map((t, i) => (
+            <div key={t.id} className="orch-seq-row"><span className="orch-seq-n">{i + 1}</span><OrchestraTask t={t} live={live} /></div>
+          ))}
+        </div>
+      ) : <div className="orch-lanes">
         {lanes.map((lane, i) => (
           <div key={i} className="orch-lane">
             <div className="orch-lane-title">{i === 0 ? "Start" : `Then (${i})`}</div>
             {lane.map((t) => <OrchestraTask key={t.id} t={t} live={live} />)}
           </div>
         ))}
-      </div>
+      </div>}
       {showLog && <div className="orch-log">{step.log.map((l: any, i: number) => <div key={i}><span className="muted">{Math.round(l.at)}s</span> {l.text}</div>)}</div>}
     </div>
   );
@@ -291,6 +314,78 @@ function LiveTurn({ live, onDecide }: any) {
   );
 }
 
+// The plan of the reply being written (or of the last reply): a planned run's steps, or a Planner harness's plan.
+function progressOf(live: any, lastAssistant: any) {
+  const orch = live ? live.orchestra : [...(lastAssistant?.meta?.steps || [])].reverse().find((s: any) => s.type === "orchestra");
+  if (orch?.tasks?.length) {
+    const items = orch.tasks.map((t: any) => ({
+      id: t.id, name: t.name, status: t.paused && t.status === "running" ? "paused" : t.status, partial: t.partial,
+      detail: t.status === "running" ? (t.progress || "working") : t.status === "waiting" ? (t.wait_reason || "") : t.note || "",
+      sub: [t.attempts > 1 ? `round ${t.attempts}${t.rounds ? ` of ${t.rounds}` : ""}` : "", taskCost(t)].filter(Boolean).join(" · "),
+      chat_id: t.chat_id,
+    }));
+    const files: string[] = Array.from(new Set(orch.tasks.flatMap((t: any) => [...(t.files || []), ...(t.result_file ? [t.result_file] : [])])));
+    return { items, files, models: orch.models || [], folder: orch.folder, totals: orch.totals, log: orch.log || [] };
+  }
+  const plan = live ? live.plan : lastAssistant?.meta?.plan;
+  if (plan?.length) {
+    return { items: plan.map((s: any, i: number) => ({ id: String(i + 1), name: s.title, detail: s.detail || "",
+      status: s.state === "done" ? "done" : s.state === "doing" || (live && live.current === i) ? "running" : s.state === "skipped" ? "cancelled" : "waiting" })),
+      files: [], models: [], log: [] };
+  }
+  return null;
+}
+
+function progressLabel(p: any) {
+  const n = p.items.length;
+  const settled = p.items.filter((i: any) => ["done", "failed", "cancelled"].includes(i.status)).length;
+  const at = p.items.findIndex((i: any) => ["running", "review", "paused"].includes(i.status));
+  if (at >= 0) return `Step ${at + 1} of ${n}`;
+  if (settled === n) return `${p.items.filter((i: any) => i.status === "done").length} of ${n} done`;
+  return `Step ${Math.min(settled + 1, n)} of ${n}`;
+}
+
+function ProgressPanel({ progress, onClose }: any) {
+  const open = (path: string) => desktop ? desktop.openPath(path) : window.open(fileUrl(path));
+  const base = (path: string) => path.split(/[\\/]/).pop();
+  const lastLog = progress.log?.length ? progress.log[progress.log.length - 1] : null;
+  return (
+    <div className="side-panel progress-panel">
+      <div className="panel-head"><b>Progress</b><button className="icon-btn" title="Close" onClick={onClose}><X size={16} /></button></div>
+      <div className="panel-list">
+        <div className="progress-steps">
+          {progress.items.map((it: any) => (
+            <div key={it.id} className={`progress-step ps-${it.status}`} onClick={() => it.chat_id && go("chat", it.chat_id)}
+              title={it.chat_id ? "Open this step's agent chat" : undefined} style={{ cursor: it.chat_id ? "pointer" : "default" }}>
+              <span className="progress-icon">{taskIcon(it)}</span>
+              <div className="progress-text">
+                <div className="progress-name">{it.name}</div>
+                {it.sub && <div className="small muted">{it.sub}</div>}
+                {it.detail && <div className={`small ${it.status === "running" ? "accent" : "muted"} clamp-2`}>{it.partial ? "Incomplete: " : ""}{it.detail}</div>}
+              </div>
+            </div>
+          ))}
+        </div>
+        {lastLog && <div className="small muted pad-x progress-last">{lastLog.text}</div>}
+        {(progress.models.length > 0 || progress.files.length > 0 || progress.folder) && <div className="progress-used">
+          <div className="small progress-used-title">Used in this run</div>
+          {progress.totals?.tokens ? <div className="small muted pad-x">{fmtTokens(progress.totals.tokens)} tokens · {fmtDuration(progress.totals.seconds || 0)}</div> : null}
+          {progress.models.map((m: any) => (
+            <div key={m.id} className="file-row" style={{ cursor: "default" }} title={m.loaded ? "In memory now" : "Not in memory: it is loaded only while a step needs it"}>
+              {m.online ? <Cloud size={14} /> : <Cpu size={14} />}<span className="ellipsis">{m.name}</span>
+              <span className="muted small">{m.online ? "online" : m.loaded ? `loaded${m.ctx ? ` · ${fmtTokens(m.ctx)} context` : ""}${m.memory_mb ? ` · ${(m.memory_mb / 1024).toFixed(1)} GB` : ""}` : "not loaded"}</span>
+            </div>
+          ))}
+          {progress.folder && desktop && <div className="file-row" onClick={() => desktop.openPath(progress.folder)}><FolderOpen size={14} /><span className="ellipsis">Shared folder</span></div>}
+          {progress.files.map((f: string) => (
+            <div key={f} className="file-row" onClick={() => open(f)} title={f}><FileText size={14} /><span className="ellipsis">{base(f)}</span></div>
+          ))}
+        </div>}
+      </div>
+    </div>
+  );
+}
+
 function FilesPanel({ chatId, onClose }: any) {
   const [data, setData] = useState<any>(null);
   const load = () => api.get(`/chats/${chatId}/files`).then(setData);
@@ -341,6 +436,7 @@ export default function ChatView({ chatId }: { chatId: string }) {
   const [live, setLive] = useState<any>(null);
   const [learned, setLearned] = useState<any[]>([]);
   const [showFiles, setShowFiles] = useState(false);
+  const [showProgress, setShowProgress] = useState(false);
   const [menu, setMenu] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
   const bottom = useRef<HTMLDivElement>(null);
@@ -444,6 +540,7 @@ export default function ChatView({ chatId }: { chatId: string }) {
   const project = projects.find((p: any) => p.id === chat.project_id);
   const running = !!live || !!chat.running_job;
   const lastAssistant = [...chat.messages].reverse().find((m: any) => m.role === "assistant");
+  const progress = progressOf(live, lastAssistant);
   const pending = chat.messages.filter((m: any) => m.meta?.pending);
   const settled = chat.messages.filter((m: any) => !m.meta?.pending);
 
@@ -468,7 +565,9 @@ export default function ChatView({ chatId }: { chatId: string }) {
             {running && (chat.paused
               ? <Button small icon={<Play size={13} />} onClick={() => api.post(`/chats/${chatId}/resume`)} title="Continue from where it paused">Resume</Button>
               : <Button small kind="ghost" icon={<Pause size={13} />} onClick={() => api.post(`/chats/${chatId}/pause`, { reason: "paused by you" })} title="Pause at the next step (a team pauses all its agents); the model is freed while paused">Pause</Button>)}
-            <button className="icon-btn" title="Chat files" onClick={() => setShowFiles(!showFiles)}><Paperclip size={16} /></button>
+            {progress && <button className={`chip progress-chip${showProgress ? " on" : ""}`} title="Show the plan and its progress" onClick={() => { setShowProgress(!showProgress); setShowFiles(false); }}>
+              <ListChecks size={14} /> {progressLabel(progress)}</button>}
+            <button className="icon-btn" title="Chat files" onClick={() => { setShowFiles(!showFiles); setShowProgress(false); }}><Paperclip size={16} /></button>
             <div className="popover-wrap">
               <button className="icon-btn" onClick={() => setMenu(!menu)}><MoreHorizontal size={18} /></button>
               {menu && (
@@ -515,6 +614,7 @@ export default function ChatView({ chatId }: { chatId: string }) {
             </>} />
         </div>
       </div>
+      {showProgress && progress && <ProgressPanel progress={progress} onClose={() => setShowProgress(false)} />}
       {showFiles && <FilesPanel chatId={chatId} onClose={() => setShowFiles(false)} />}
     </div>
   );
