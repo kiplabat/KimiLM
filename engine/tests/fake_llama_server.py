@@ -114,7 +114,9 @@ def decide(body):
                                ("search knowledge for ", "search_knowledge", "query"),
                                ("note decision: ", "update_project_notes", "text"),
                                ("read resource ", "read_connector_resource", "uri"),
-                               ("paint a picture of ", "generate_image", "prompt")):
+                               ("paint a picture of ", "generate_image", "prompt"),
+                               ("say aloud: ", "speak", "text"), ("write down what is said in ", "transcribe_audio", "path"),
+                               ("compose music: ", "generate_music", "prompt")):
         if trigger in text and tool in tools and not after_tool:
             args = {key: text.split(trigger, 1)[1].strip()}
             if tool == "update_project_notes":

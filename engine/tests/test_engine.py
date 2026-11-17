@@ -58,7 +58,8 @@ def engine():
     port = free_port()
     token = "test-token"
     env = {**os.environ, "DVA_TEST_CPU": "6x12", "DVA_TOKEN": token, "DVA_LLAMA_SERVER": str(wrapper), "DVA_SECRETS": "file",
-           "DVA_SD_CLI": str(painter),
+           "DVA_SD_CLI": str(painter), "DVA_SOUND_WORKER": str(TESTS / "fake_sound_worker.py"),
+           "DVA_SOUND_LIBRARY": "2.0.1", "DVA_SOUND_LOG": str(tmp / "sound-jobs.log"),
            "PYTHONPATH": str(ENGINE), "OLLAMA_MODELS": str(tmp / "ollama"), "HF_HOME": str(tmp / "hf")}
     log = tmp / "engine-output.log"
     proc = subprocess.Popen([sys.executable, "-m", "dva", "serve", "--port", str(port), "--data-dir", str(tmp / "data")],
@@ -2220,3 +2221,311 @@ def test_the_image_engine_is_chosen_by_the_cards_and_memory_is_shared_with_text_
     assert "ran out of memory" in images.Images._explain(["ggml_aligned_malloc: failed to allocate 9000 MB"], 1, row)
     assert "did not accept its options" in images.Images._explain(["error: unknown argument: --nope"], 1, row)
     assert "unsupported model" in images.Images._explain(["loading", "[ERROR] load failed: unsupported model"], 1, row)
+
+
+# ---------------------------------------------------------------------------------------------- sound (2.12.0)
+def wait_sound(c, job, timeout=60):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        state = next(j for j in c.get("/api/sound").json()["jobs"] if j["id"] == job["id"])
+        if state["state"] != "running":
+            return state
+        time.sleep(0.1)
+    raise AssertionError(f"sound job still running: {state}")
+
+
+def sound_jobs(tmp, kind=None):
+    log = tmp / "sound-jobs.log"
+    rows = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+    return [r for r in rows if not kind or r["kind"] == kind]
+
+
+def model_folder(tmp, name):
+    folder = tmp / "sound-models" / name
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "model.onnx").write_bytes(b"\0" * 2048)
+    return str(folder)
+
+
+def test_speech_voices_and_transcription_on_this_computer(engine):
+    c, tmp = engine["client"], engine["tmp"]
+    start = c.get("/api/sound").json()
+    assert start["library"] == "2.0.1" and not start["espeak"] and not any(start["can"].values())
+    assert "English and Chinese" in start["note"] and "does not speak" in start["claude"]
+    catalog = {m["key"]: m for m in start["catalog"]}
+    assert catalog["kokoro-v1"]["usable"] and catalog["kokoro-v1"]["recommended"] and catalog["kokoro-v1"]["voices"] == 54
+    assert catalog["pocket-tts"]["role"] == "clone" and catalog["whisper-base"]["role"] == "stt"
+    # models that pronounce through the component the library's 2.x versions left out are not offered
+    assert not catalog["kitten-nano"]["usable"] and not catalog["piper-sw-cd"]["usable"]
+    assert c.post("/api/sound/catalog/kitten-nano/download").status_code == 400
+    none = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "speak", "text": "hello"}).json())
+    assert none["state"] == "failed" and "No voice is set up" in none["error"]
+    assert c.post("/api/sound/jobs", json={"kind": "speak", "text": " "}).status_code == 400
+    assert c.post("/api/sound/models", json={"key": "kokoro-v1", "path": str(tmp / "nowhere")}).status_code == 400
+
+    kokoro = c.post("/api/sound/models", json={"key": "kokoro-v1", "path": model_folder(tmp, "kokoro")}).json()
+    assert kokoro["ready"] and kokoro["role"] == "tts" and kokoro["family"] == "kokoro"
+    state = c.get("/api/sound").json()
+    voices = {v["id"]: v for v in state["voices"]}
+    assert state["can"] == {"tts": True, "stt": False, "music": False, "clone": False}
+    assert len(voices) == 36 and {v["language"] for v in voices.values()} == {"English (US)", "English (UK)", "Chinese"}
+    assert state["default_voice"] == "kokoro-v1:af_heart" and voices["kokoro-v1:bm_george"]["gender"] == "man"
+    # one text: numbers are spelled out, because a voice that reads from a dictionary would skip them
+    one = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "speak", "text": "In 2026, 3 stoves cost $45.", "speed": 1.2}).json())
+    assert one["state"] == "done", one
+    rec = one["result"]
+    assert rec["kind"] == "audio" and rec["name"].endswith(".mp3") and Path(rec["path"]).parent == tmp / "data" / "sound"
+    assert rec["params"]["seconds"] > 1 and rec["params"]["voices"] == {"Voice": "Heart"} and rec["source"] == "local"
+    asked = sound_jobs(tmp, "speak")[-1]
+    assert asked["segments"] == [{"model": "kokoro-v1", "text": "In twenty twenty-six, three stoves cost forty-five dollars.",
+                                  "speaker": "", "speed": 1.2, "sid": 3}]
+    assert asked["models"] == {"kokoro-v1": {"family": "kokoro", "dir": kokoro["path"]}}
+    assert c.get("/api/file", params={"path": rec["path"]}).headers["content-type"].startswith("audio/")
+    # a script: every speaker gets a voice (the second one sounds different), in one recording with the times
+    script = "Host: Welcome to the show.\nGuest: Thank you.\nIt is good to be here.\nHost: Let us begin."
+    pod = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "speak", "text": script, "name": "Episode 1", "format": "wav"}).json())
+    p = pod["result"]["params"]
+    assert pod["state"] == "done" and p["mode"] == "script" and p["voices"] == {"Host": "Heart", "Guest": "Michael"}, pod
+    assert [(s["speaker"], s["text"]) for s in p["segments"]] == [
+        ("Host", "Welcome to the show."), ("Guest", "Thank you. It is good to be here."), ("Host", "Let us begin.")]
+    assert p["segments"][1]["start"] > p["segments"][0]["end"] and pod["result"]["name"].startswith("episode-1-")
+    assert [s["sid"] for s in sound_jobs(tmp, "speak")[-1]["segments"]] == [3, 16, 3]
+    cast = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "speak", "text": script, "voices": {"Guest": "George"},
+                                                         "voice": "Emma"}).json())
+    assert cast["result"]["params"]["voices"] == {"Host": "Emma", "Guest": "George"}
+    wrong = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "speak", "text": "hello", "voice": "Pavarotti"}).json())
+    assert wrong["state"] == "failed" and "no voice called 'Pavarotti'" in wrong["error"] and "Heart" in wrong["error"]
+    odd = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "speak", "text": "an unpronounceable text"}).json())
+    assert odd["state"] == "failed" and "could not pronounce" in odd["error"]
+    assert c.put("/api/sound/settings", json={"voice": "kokoro-v1:bf_emma"}).json()["default_voice"] == "kokoro-v1:bf_emma"
+    assert c.put("/api/sound/settings", json={"voice": "nobody"}).status_code == 409
+
+    # a voice from a recording: your own after you confirm it, someone else's only with their recorded consent
+    c.post("/api/sound/models", json={"key": "pocket-tts", "path": model_folder(tmp, "pocket")})
+    up = c.post("/api/sound/upload", files={"file": ("me.wav", Path(pod["result"]["path"]).read_bytes(), "audio/wav")}).json()
+    for consent, message in (({}, "your own voice or another person's"), ({"whose": "mine"}, "Confirm"),
+                             ({"whose": "other", "person": "Amina"}, "recording in which they agree"),
+                             ({"whose": "other", "consent_audio": up["path"]}, "whose voice")):
+        r = c.post("/api/sound/voices", json={"name": "A voice", "audio": up["path"], "consent": consent})
+        assert r.status_code == 400 and message in r.json()["error"], r.json()
+    short = c.post("/api/sound/upload", files={"file": ("short.mp3", Path(rec["path"]).read_bytes(), "audio/mpeg")}).json()
+    r = c.post("/api/sound/voices", json={"name": "Short", "audio": short["path"], "consent": {"whose": "mine", "confirmed": True}})
+    assert r.status_code == 400 and "shorter than 5 seconds" in r.json()["error"]
+    long_text = "Speaker: " + " ".join(["word"] * 40)
+    long = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "speak", "text": long_text, "format": "wav"}).json())["result"]
+    mine = c.post("/api/sound/voices", json={"name": "My voice", "audio": long["path"], "transcript": "word word",
+                                             "consent": {"whose": "mine", "confirmed": True}}).json()
+    assert mine["kind"] == "recording" and mine["ready"] and mine["whose"] == "mine" and mine["id"].startswith("voice:vc_")
+    other = c.post("/api/sound/voices", json={"name": "Amina", "audio": long["path"],
+                                              "consent": {"whose": "other", "person": "Amina W.", "consent_audio": up["path"]}}).json()
+    assert other["whose"] == "other" and len(list((tmp / "data" / "voices").glob("*-consent.wav"))) == 1
+    spoken = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "speak", "text": "This is me.", "voice": "My voice"}).json())
+    assert spoken["state"] == "done" and spoken["result"]["model_name"] == "My voice", spoken
+    seg = sound_jobs(tmp, "speak")[-1]
+    assert seg["models"]["pocket-tts"]["family"] == "pocket" and seg["segments"][0]["ref_text"] == "word word"
+    assert Path(seg["segments"][0]["ref_audio"]).parent == tmp / "data" / "voices" and "sid" not in seg["segments"][0]
+    c.delete(f"/api/sound/voices/{other['id']}")
+    assert not list((tmp / "data" / "voices").glob("*-consent.wav")) and len([v for v in c.get("/api/sound").json()["voices"] if v["kind"] == "recording"]) == 1
+
+    # transcription: the words with times, saved as text and as subtitles
+    c.post("/api/sound/models", json={"key": "whisper-base", "path": model_folder(tmp, "whisper")})
+    (tmp / "data" / "models" / "sound").mkdir(parents=True, exist_ok=True)
+    (tmp / "data" / "models" / "sound" / "silero_vad.onnx").write_bytes(b"\0" * 64)
+    heard = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "transcribe", "audio": pod["result"]["path"], "language": "sw"}).json())
+    res = heard["result"]
+    assert heard["state"] == "done" and res["text"].startswith("These are the words of episode-1") and "Language: sw." in res["text"], heard
+    assert Path(res["file"]).read_text().strip() == res["text"] and "00:00:01,500 --> 00:00:02,400" in Path(res["subtitles"]).read_text()
+    assert sound_jobs(tmp, "transcribe")[-1]["model"] == {"family": "whisper", "dir": str(tmp / "sound-models" / "whisper"), "language": "sw"}
+    missing = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "transcribe", "audio": str(tmp / "nope.wav")}).json())
+    assert missing["state"] == "failed" and "no file" in missing["error"]
+    # mixing: a voice over a quieter second track, as long as the voice (plus the fade)
+    mix = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "mix", "name": "Voice over", "tracks": [
+        {"path": rec["path"]}, {"path": long["path"], "volume": 0.2, "start": 0.5}]}).json())
+    assert mix["state"] == "done" and abs(mix["result"]["params"]["seconds"] - (rec["params"]["seconds"] + 2)) < 0.3, mix
+    items = c.get("/api/sound/library").json()["items"]
+    assert items[0]["params"]["mode"] == "mix" and {"speech", "script", "mix"} <= {i["params"]["mode"] for i in items}
+    c.delete(f"/api/sound/library/{items[0]['id']}", params={"file": 1})
+    assert not Path(items[0]["path"]).exists()
+    assert c.get("/api/sound").json()["can"] == {"tts": True, "stt": True, "music": False, "clone": True}
+    c.put("/api/sound/settings", json={"voice": ""})
+
+
+def test_an_agent_speaks_and_writes_down_a_recording(engine):
+    c, tmp = engine["client"], engine["tmp"]
+    folder = tmp / "sound-project"
+    folder.mkdir()
+    chat = c.post("/api/chats", json={"harness": "agent", "folders": [str(folder)]}).json()
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "say aloud: Welcome to KimiLM 2.12"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
+    assert step["name"] == "speak" and step["ok"] and step["label"] == "Speak", step
+    clip = step["media"][0]
+    assert clip["kind"] == "audio" and Path(clip["path"]).parent == folder / "sound" and clip["path"] in step["result"]
+    assert "segments" not in clip["params"] and clip["params"]["seconds"] > 0 and "Voice: Heart" in step["result"]
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": f"write down what is said in {clip['path']}"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
+    assert step["name"] == "transcribe_audio" and step["ok"] and "These are the words of welcome-to-k" in step["result"], step
+    assert len(list((folder / "sound" / "transcripts").glob("*.srt"))) == 1
+    # music has no model here: the tool is not offered, so the request is answered in words
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "compose music: a calm piano piece"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    assert not [s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool"]
+
+
+def test_sound_helpers_numbers_scripts_files_and_the_catalogue(tmp_path):
+    import numpy as np
+    from dva.sound import CATALOG, ONLINE, RELEASES, Sound, read_pcm, seconds_of, spell_english, srt, write_audio
+    assert spell_english("In 2026, 3 stoves cost $45.50 & 12% less") == \
+        "In twenty twenty-six, three stoves cost forty-five point five zero dollars and twelve percent less"
+    assert spell_english("1,250,000 people; $3m; 1999; 2005; call 0712") == ("one million two hundred and fifty thousand people; "
+                                                                           "three million dollars; nineteen ninety-nine; twenty oh five; call zero seven one two")
+    assert spell_english("No numbers here.") == "No numbers here."
+    parse = Sound.parse_script(None, "Host: Hello there.\n\n**Guest**: Hi.\nMore from the guest.\nHost: Bye.")
+    assert parse == [{"speaker": "Host", "text": "Hello there."}, {"speaker": "Guest", "text": "Hi. More from the guest."},
+                     {"speaker": "Host", "text": "Bye."}]
+    plain = Sound.parse_script(None, "A plain text.\nNote: this is not a speaker.\nSecond line.", "v")
+    assert plain == [{"speaker": "", "text": "A plain text. Note: this is not a speaker. Second line.", "voice": "v"}]
+    assert srt([{"start": 0, "end": 1.5, "text": "One"}, {"start": 3661.25, "end": 3662, "text": "Two"}]) == \
+        "1\n00:00:00,000 --> 00:00:01,500\nOne\n\n2\n01:01:01,250 --> 01:01:02,000\nTwo\n"
+    # sound files: written and read back in every format the app saves
+    t = np.arange(44100) / 44100
+    stereo = np.stack([0.4 * np.sin(2 * np.pi * 440 * t), 0.4 * np.sin(2 * np.pi * 660 * t)], axis=1).astype("float32")
+    for ext in ("wav", "mp3", "m4a"):
+        path = write_audio(tmp_path / f"tone.{ext}", stereo, 44100)
+        back = read_pcm(path, 44100, 2)
+        assert abs(len(back) - 44100) < 4000 and 0.2 < float(np.abs(back).max()) <= 1.0, ext
+        assert abs(seconds_of(path) - 1.0) < 0.15, ext
+    assert read_pcm(tmp_path / "tone.mp3", 16000, 1).shape[1] == 1
+    with pytest.raises(RuntimeError, match="can be saved as"):
+        write_audio(tmp_path / "tone.xyz", stereo, 44100)
+    # the catalogue: where each model comes from, its licence, and voices that match the models' own lists
+    for m in CATALOG:
+        assert m["url"].startswith(RELEASES) and m["url"].endswith(".tar.bz2") and m["licence"] and m["page"].startswith("https://")
+        assert m["role"] in ("tts", "stt", "clone") and [v["sid"] for v in m["voices"]] == list(range(len(m["voices"])))
+    kokoro = next(m for m in CATALOG if m["key"] == "kokoro-v1")["voices"]
+    assert (kokoro[3]["speaker"], kokoro[26]["speaker"], kokoro[53]["speaker"]) == ("af_heart", "bm_george", "em_santa")
+    assert sum(not v.get("needs_espeak") for v in kokoro) == 36 and kokoro[28]["language"] == "Spanish"
+    assert set(ONLINE["google"]) >= {"tts", "stt", "music"} and "music" not in ONLINE["openai"] and len(ONLINE["google"]["voices"]) == 30
+
+
+@pytest.mark.skipif(not os.environ.get("DVA_TEST_SOUND_MODELS"), reason="needs real speech models (DVA_TEST_SOUND_MODELS=folder)")
+def test_real_voices_speak_and_real_whisper_reads_them_back(tmp_path):
+    """With the real library and models: a two-voice script and a voice from a recording, transcribed back."""
+    models = Path(os.environ["DVA_TEST_SOUND_MODELS"])
+
+    def worker(job):
+        spec = tmp_path / "job.json"
+        spec.write_text(json.dumps(job))
+        out = subprocess.run([sys.executable, "-m", "dva.sound_worker", str(spec)], cwd=str(ENGINE), capture_output=True, text=True)
+        last = json.loads(out.stdout.strip().splitlines()[-1])
+        assert last.get("done"), (last, out.stderr[-600:])
+        return last
+    said = worker({"kind": "speak", "out": str(tmp_path / "talk.wav"),
+                   "models": {"k": {"family": "kokoro", "dir": str(models / "kokoro-multi-lang-v1_0")},
+                              "p": {"family": "pocket", "dir": str(models / "sherpa-onnx-pocket-tts-int8-2026-01-26")}},
+                   "segments": [{"model": "k", "sid": 3, "speaker": "Host", "text": "Welcome to the show about clean cooking."},
+                                {"model": "k", "sid": 26, "speaker": "Guest", "text": "Thank you for inviting me today."},
+                                {"model": "p", "speaker": "Clone", "text": "This voice comes from a short recording.",
+                                 "ref_audio": str(models / "sherpa-onnx-pocket-tts-int8-2026-01-26" / "test_wavs" / "bria.wav")}]})
+    assert said["seconds"] > 6 and [s["speaker"] for s in said["segments"]] == ["Host", "Guest", "Clone"]
+    heard = worker({"kind": "transcribe", "audio": str(tmp_path / "talk.wav"), "vad": str(models / "silero_vad.onnx"),
+                    "model": {"family": "whisper", "dir": str(models / "sherpa-onnx-whisper-tiny"), "language": "en"}})
+    text = heard["text"].lower()
+    assert all(w in text for w in ("welcome", "clean cooking", "thank you", "short recording")), text
+    assert len(heard["segments"]) >= 2 and heard["segments"][0]["start"] < 1
+
+
+def test_models_for_pictures_and_sound_really_download_and_can_be_cancelled(tmp_path, monkeypatch):
+    """The downloads of 2.11.0 failed on the first real try ("'function' object has no attribute 'is_set'"):
+    this runs them with the real downloader against a local server."""
+    import asyncio
+    import tarfile
+    import threading
+    import types
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from dva import images, sound
+    from dva.db import DB
+    bundle = tmp_path / "voice.tar.bz2"
+    (tmp_path / "voice-model").mkdir()
+    (tmp_path / "voice-model" / "model.onnx").write_bytes(b"\1" * 5000)
+    (tmp_path / "voice-model" / "tokens.txt").write_text("a 1\n")
+    with tarfile.open(bundle, "w:bz2") as tar:
+        tar.add(tmp_path / "voice-model", arcname="voice-model")
+    asked = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            asked.append(self.path)
+            data = bundle.read_bytes() if self.path.endswith(".tar.bz2") else (b"\2" * 300_000 if "big" in self.path else b"\3" * 4000)
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+    monkeypatch.setenv("DVA_SOUND_LIBRARY", "2.0.1")
+    events = []
+    paths = types.SimpleNamespace(data=tmp_path / "data", models_dir=lambda settings=None: tmp_path / "models")
+    (tmp_path / "data").mkdir()
+    app = types.SimpleNamespace(db=DB(tmp_path / "t.sqlite3"), paths=paths, log=lambda m: events.append(("log", m)),
+                                bus=types.SimpleNamespace(publish=lambda kind, **k: events.append((kind, k))),
+                                secrets=types.SimpleNamespace(get=lambda k: None),
+                                providers=types.SimpleNamespace(ready=lambda p: False), runtime=None)
+
+    async def listing(url, headers=None):
+        repo = url.split("/api/models/")[1].split("/tree/")[0]
+        return [{"type": "file", "path": "weights/big-model-Q4_K.gguf", "size": 300_000},
+                {"type": "file", "path": "vae/ae.safetensors", "size": 4000}, {"type": "file", "path": "README.md", "size": 10}] \
+            if repo.startswith("test/") else []
+    monkeypatch.setattr(images, "fetch_json", listing)
+    monkeypatch.setattr(images, "HF", base)
+    recipe = {"key": "tiny", "name": "Tiny model", "licence": "MIT", "edit": "img2img",
+              "defaults": {"steps": 4, "cfg": 1.0, "width": 512, "height": 512, "args": ""},
+              "parts": [{"slot": "diffusion_model", "sources": [{"repo": "test/tiny", "match": r"\.gguf$"}], "prefer": ["Q4_K"]},
+                        {"slot": "vae", "sources": [{"repo": "test/tiny", "match": r"vae/.*\.safetensors$"}]}]}
+
+    async def run():
+        im = images.Images(app)
+        state = {"key": "tiny", "name": "Tiny model", "state": "starting", "done": 0, "total": 0, "file": "", "error": None, "cancel": False}
+        await im._download(recipe, state)
+        assert state["state"] == "done" and state["done"] == 304_000, state
+        row = im.models()[0]
+        assert row["recipe"] == "tiny" and row["size"] == 304_000 and row["default"]
+        assert Path(row["files"]["diffusion_model"]) == tmp_path / "models" / "image" / "tiny" / "big-model-Q4_K.gguf"
+        assert Path(row["files"]["vae"]).read_bytes() == b"\3" * 4000
+        assert "/test/tiny/resolve/main/weights/big-model-Q4_K.gguf?download=true" in asked
+        json.dumps(im.recipes())                                  # what the window is sent stays plain data
+        # cancelled: nothing is added, and the state says so instead of "failed"
+        im.remove(row["id"], delete_files=True)
+        stopped = {**state, "state": "starting", "cancel": True}
+        await im._download(recipe, stopped)
+        assert stopped["state"] == "cancelled" and not im.models(), stopped
+        missing = {**state, "state": "starting", "cancel": False}
+        await im._download({**recipe, "parts": [{"slot": "model", "sources": [{"repo": "nobody/none", "match": r"\.x$"}]}]}, missing)
+        assert missing["state"] == "failed" and "was not found in nobody/none" in missing["error"]
+
+        so = sound.Sound(app)
+        entry = {"key": "test-voice", "role": "tts", "family": "kokoro", "name": "Test voice", "mb": 1, "licence": "MIT",
+                 "url": f"{base}/voice.tar.bz2", "voices": []}
+        s = {"key": "test-voice", "name": "Test voice", "state": "starting", "done": 0, "total": 1, "error": None, "cancel": False}
+        await so._download(entry, s)
+        assert s["state"] == "done", s
+        folder = tmp_path / "models" / "sound" / "test-voice"
+        assert (folder / "model.onnx").stat().st_size == 5000 and not (tmp_path / "models" / "sound" / "voice.tar.bz2").exists()
+        assert so.get("test-voice")["path"] == str(folder) and so.get("test-voice")["size"] > 5000
+        s2 = {**s, "state": "starting", "cancel": True}
+        await so._download({**entry, "key": "other-voice"}, s2)
+        assert s2["state"] == "cancelled" and not so.get("other-voice")
+        json.dumps(so.catalog())
+    try:
+        asyncio.run(run())
+    finally:
+        server.shutdown()
+    assert not [e for e in events if e[0] == "log" and "is_set" in e[1]]

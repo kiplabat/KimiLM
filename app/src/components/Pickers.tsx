@@ -3,6 +3,7 @@ import { Bot, ChevronDown, Cloud, Cpu, CornerDownRight, Eye, FolderOpen, Gauge, 
 import { api, desktop, fmtBytes } from "../api";
 import { useApp } from "../store";
 import { Button, Toggle } from "./ui";
+import { DictateButton } from "./Audio";
 
 function Popover({ label, icon, children, title }: any) {
   const [open, setOpen] = useState(false);
@@ -260,6 +261,7 @@ export function Composer({ onSend, running, onStop, status, placeholder, autoFoc
       <div className="composer-bar">
         <div className="row gap-s wrap">
           <button className="icon-btn" title="Attach files" onClick={() => fileRef.current?.click()}><Paperclip size={16} /></button>
+          <DictateButton onText={(said: string) => setText((t: string) => (t ? t.trimEnd() + " " : "") + said)} />
           <input ref={fileRef} type="file" multiple hidden onChange={(e) => { setFiles([...files, ...Array.from(e.target.files || [])]); e.target.value = ""; }} />
           {options}
         </div>

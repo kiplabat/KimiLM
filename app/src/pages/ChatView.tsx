@@ -5,7 +5,7 @@ import {
   ShieldCheck, Sparkles, Trash2, Users, Workflow, X, XCircle,
 } from "lucide-react";
 import { api, desktop, fileUrl, fmtBytes, fmtTime } from "../api";
-import { PictureGrid } from "../components/Pictures";
+import { MediaStrip, ReadAloud } from "../components/Audio";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, Markdown, Spinner, Toggle } from "../components/ui";
 import { Composer, ConnectorPicker, FolderPicker, HarnessPicker, LimitsPicker, ModelPicker, TeamPicker, ThinkingToggle, uploadAll } from "../components/Pickers";
@@ -24,7 +24,7 @@ function ToolCard({ step, approval, onDecide }: any) {
         {state === "declined" && <Badge>declined</Badge>}
         {state === "blocked" && <Badge kind="warn" title="The loop guard stopped a repeated or over-limit call">repeat stopped</Badge>}
       </div>
-      {step.media?.length > 0 && <div className="tool-media"><PictureGrid items={step.media} large={step.media.length === 1} /></div>}
+      <MediaStrip items={step.media} />
       {approval && (
         <div className="approval">
           {approval.tool === "send_to_online_model" ? <>
@@ -328,6 +328,7 @@ function AssistantMessage({ msg, isLast, onRetry }: any) {
         {stats.tokens_per_second ? <span>· {stats.tokens_per_second} tok/s</span> : null}
         {stats.cached_tokens ? <span title={`${stats.cached_tokens.toLocaleString()} prompt tokens came from the model's cache; ${(stats.prompt_tokens || 0).toLocaleString()} were read`}>· {Math.round(100 * stats.cached_tokens / Math.max(1, stats.cached_tokens + (stats.prompt_tokens || 0)))}% from cache</span> : null}
         <button className="icon-btn" title="Copy" onClick={() => navigator.clipboard.writeText(msg.content || "")}><Copy size={13} /></button>
+        <ReadAloud text={msg.content || ""} />
         {isLast && <button className="icon-btn" title="Retry" onClick={onRetry}><RotateCcw size={13} /></button>}
       </div>
     </div>

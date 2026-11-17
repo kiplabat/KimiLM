@@ -20,3 +20,5 @@ python-dotenv==1.2.4
 pypdf==7.1.0
 pillow==13.0.0
 av==19.0.2
+# speech and transcription on this computer (2.12.0): ONNX models on the processor, run in a process per request
+sherpa-onnx==2.0.1

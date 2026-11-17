@@ -215,6 +215,8 @@ KIT_WORDS = {
     "vision": r"image|photo|picture|screenshot|video|diagram|scan",
     "images": r"image|picture|illustrat|logo|poster|draw|artwork|icon\b|banner|cover art|thumbnail|wallpaper|"
               r"photo of|retouch|inpaint|change the background",
+    "sound": r"audio|sound|voice|speak|speech|narrat|podcast|music|song|jingle|transcri|recording|subtitle|read aloud|"
+             r"dictat|\bmp3\b|\bwav\b",
 }
 
 

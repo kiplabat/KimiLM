@@ -426,6 +426,8 @@ class Turn:
             groups.discard("vision")
         if not self.app.images.available():   # no image model is set up: the picture tools would only fail
             groups.discard("images")
+        if not self.app.sound.available():
+            groups.discard("sound")
         if self.chat.get("parent_chat_id"):   # agents in a team do not start their own teams
             groups.discard("agents")
         return groups
@@ -435,6 +437,9 @@ class Turn:
             return []
         groups = self.tool_groups()
         tools = [t for t in builtin_tools() if t.group in groups]
+        if "sound" in groups:                      # only the sound tools that have a model to work with
+            hidden = self.app.sound.hidden_tools()
+            tools = [t for t in tools if t.name not in hidden]
         if "agents" in groups:
             tools.append(self._delegate_tool())
         team = self.app.team_of_chat.get(self.chat["id"])

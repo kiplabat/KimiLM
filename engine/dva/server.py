@@ -404,6 +404,110 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         A().images.forget(media_id, delete_file=bool(file))
         return {"ok": True}
 
+    # ------------------------------------------------------------------ sound (2.12.0)
+    @api.get("/api/sound")
+    async def sound_overview():
+        return await asyncio.to_thread(A().sound.status)
+
+    @api.put("/api/sound/settings")
+    async def sound_settings(request: Request):
+        a = A()
+        data = await body(request)
+        if "voice" in data:
+            if data["voice"]:
+                a.sound.voice(data["voice"])                 # must be a voice that exists
+            a.db.set_setting("sound_voice", data["voice"] or "")
+        a.bus.publish("sound_changed")
+        return await asyncio.to_thread(a.sound.status)
+
+    @api.post("/api/sound/catalog/{key}/download")
+    async def sound_download(key: str):
+        return {k: v for k, v in A().sound.start_download(key).items() if k != "cancel"}
+
+    @api.delete("/api/sound/catalog/{key}/download")
+    async def sound_download_cancel(key: str):
+        A().sound.cancel_download(key)
+        return {"ok": True}
+
+    @api.get("/api/sound/online/{provider}/{role}/models")
+    async def sound_online_models(provider: str, role: str):
+        a = A()
+        if provider in ("openai", "google") and not a.providers.ready(provider):
+            raise ValueError("Add the provider's key first")
+        return await a.sound.online_candidates(provider, role)
+
+    @api.post("/api/sound/models")
+    async def sound_model_add(request: Request):
+        data = await body(request)
+        if data.get("path"):
+            return A().sound.add_folder(data.get("key"), data.get("path"))
+        return A().sound.add_online(data.get("provider"), data.get("role"), data.get("remote_id"))
+
+    @api.put("/api/sound/models/{model_id}")
+    async def sound_model_update(model_id: str, request: Request):
+        return A().sound.update(model_id, await body(request))
+
+    @api.delete("/api/sound/models/{model_id}")
+    async def sound_model_remove(model_id: str):
+        A().sound.remove(model_id)
+        return {"ok": True}
+
+    @api.post("/api/sound/voices")
+    async def sound_voice_add(request: Request):
+        data = await body(request)
+        return await A().sound.create_voice(data.get("name"), data.get("audio"), data.get("transcript") or "",
+                                            data.get("consent"))
+
+    @api.delete("/api/sound/voices/{voice_id}")
+    async def sound_voice_remove(voice_id: str):
+        A().sound.delete_voice(voice_id)
+        return {"ok": True}
+
+    @api.post("/api/sound/jobs")
+    async def sound_job(request: Request):
+        data = await body(request)
+        kind = data.get("kind")
+        if kind == "speak" and not (str(data.get("text") or "").strip() or data.get("lines")):
+            raise ValueError("Write what should be said")
+        if kind == "music" and not str(data.get("prompt") or "").strip():
+            raise ValueError("Describe the music")
+        if kind == "transcribe" and not data.get("audio"):
+            raise ValueError("Choose a recording")
+        if kind not in ("speak", "transcribe", "music", "mix"):
+            raise ValueError("kind must be speak, transcribe, music or mix")
+        return A().sound.start_job(kind, data)
+
+    @api.delete("/api/sound/jobs/{job_id}")
+    async def sound_job_stop(job_id: str):
+        A().sound.stop_job(job_id)
+        return {"ok": True}
+
+    @api.post("/api/sound/upload")
+    async def sound_upload(file: UploadFile = File(...)):
+        """A recording from the Sound window or the microphone (kept in the app's own folder)."""
+        folder = A().paths.data / "sound" / "uploads"
+        folder.mkdir(parents=True, exist_ok=True)
+        dest = folder / (new_id("rec_") + (Path(file.filename or "recording.webm").suffix.lower() or ".webm"))
+        size = 0
+        with dest.open("wb") as f:
+            while chunk := await file.read(1 << 20):
+                size += len(chunk)
+                if size > 500 * 2**20:
+                    f.close()
+                    dest.unlink(missing_ok=True)
+                    raise ValueError("Recordings up to 500 MB")
+                f.write(chunk)
+        return {"path": str(dest), "name": file.filename}
+
+    @api.get("/api/sound/library")
+    async def sound_library(limit: int = 80, chat_id: str = ""):
+        return {"items": A().sound.audio_library(max(1, min(300, limit)), chat_id or None)}
+
+    @api.delete("/api/sound/library/{media_id}")
+    async def sound_forget(media_id: str, file: int = 0):
+        A().sound.forget(media_id, delete_file=bool(file))
+        return {"ok": True}
+
     # ------------------------------------------------------------------ long-running tasks (2.9.0)
     @api.get("/api/busy")
     async def busy():
@@ -411,6 +515,7 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         a = A()
         rows = [a.db.get("jobs", jid) or {} for jid in list(a.jobs.tasks)]
         rows += [{"title": "Making a picture"} for _ in a.images.tasks]
+        rows += [{"title": "Working on sound"} for _ in a.sound.tasks]
         return {"active": len(rows), "titles": [r.get("title") or "Task" for r in rows][:6],
                 "waiting": sum(r.get("status") == "waiting" for r in rows)}
 
