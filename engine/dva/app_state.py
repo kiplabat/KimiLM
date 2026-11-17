@@ -31,7 +31,7 @@ STATE = None
 DEFAULT_SETTINGS = {
     "default_harness": "agent", "default_compute": "auto", "default_ctx": 8192, "max_reply_tokens": 2048,
     "unload_after_minutes": 20, "memory_enabled": True, "learn_enabled": True, "learn_delay_seconds": 45,
-    "allow_python": True, "approval_timeout_minutes": 360, "max_native_tools": 28, "python_timeout_seconds": 180,
+    "allow_python": True, "approval_timeout_minutes": 360, "max_native_tools": 36, "python_timeout_seconds": 180,
     "max_loaded_models": 3, "browser_search": True, "max_parallel_agents": 4, "turn_time_limit_minutes": 30,
     "cloud_privacy": "ask", "cloud_budget_monthly": 10.0, "cloud_max_parallel": 4,
     "team_mode": "auto", "max_team_tasks": 8, "team_time_limit_minutes": 120,
@@ -50,6 +50,9 @@ DEFAULT_SETTINGS = {
     "writing_budget_seconds": 180,
     # 2.8.0: learned_model_choice: a step whose model nobody fixed runs on the model that did such steps best here
     "learned_model_choice": True, "runs_kept": 300,
+    # 2.9.0: long-running tasks. Default limits of a new task (hours of work, steps, minutes one step may take);
+    # mission_auto_resume: a task that was cut off by a restart or a crash continues by itself at start
+    "mission_hours": 8, "mission_steps": 40, "mission_step_minutes": 45, "mission_auto_resume": True,
 }
 CHAT_LIMIT_KEYS = ("max_reply_tokens", "max_steps", "time_limit_minutes", "temperature", "max_searches",
                    "max_tool_calls")
@@ -98,6 +101,11 @@ class App:
         for key, value in DEFAULT_SETTINGS.items():
             if self.db.setting(key) is None:
                 self.db.set_setting(key, value)
+        # 2.9.0 adds seven browser tools. The earlier default of 28 tools would push every connector's tools
+        # behind the find/use pair, so the default moves with the tool list (a value the user chose is kept).
+        if self.db.setting("max_native_tools") == 28 and not self.db.setting("native_tools_2_9"):
+            self.db.set_setting("max_native_tools", 36)
+        self.db.set_setting("native_tools_2_9", True)
 
     def _release_pending_after_restart(self):
         """Follow-ups queued while a reply was running are not sent if the app closed meanwhile: they show as
@@ -129,18 +137,32 @@ class App:
                     asyncio.create_task(self.knowledge.loop())]
         self.log(f"engine started; data {self.paths.data}; secrets backend {self.secrets.backend}")
         # runs that were going when the app closed or crashed can be continued (2.7.0)
-        cut = self.db.all("SELECT id, chat_id, resumes FROM runs WHERE status='running'")
+        cut = self.db.all("SELECT id, chat_id, resumes, kind FROM runs WHERE status='running'")
         for row in cut:
             self.db.update("runs", row["id"], {"status": "interrupted", "updated": now()})
-        if cut and self.db.setting("resume_runs", "ask") == "auto":
-            self._bg.append(asyncio.create_task(self._resume_cut_runs(cut)))
+        # a planned run continues by itself only if the user asked for that; a long-running task does unless
+        # the user switched it off (2.9.0): it is meant to keep going until it is done
+        again = [r for r in cut if (self.db.setting("mission_auto_resume", True) if r.get("kind") == "mission"
+                                    else self.db.setting("resume_runs", "ask") == "auto")]
+        if again:
+            self._bg.append(asyncio.create_task(self._resume_cut_runs(again)))
 
     async def _resume_cut_runs(self, rows):
         await asyncio.sleep(float(self.db.setting("resume_delay_seconds", 20)))
         for row in rows:
-            if int(row.get("resumes") or 0) >= 2:        # a run that keeps cutting the app off is left alone
-                continue
             try:
+                if row.get("kind") == "mission":
+                    # counted since the last accepted step, so a task that works for days may be continued after
+                    # every restart, while one that cuts the app off again and again is left alone
+                    full = self.db.get("runs", row["id"]) or {}
+                    state = full.get("state") or {}
+                    mission = state.get("mission") or {}
+                    if int(mission.get("auto_resumes") or 0) >= 3:
+                        continue
+                    mission["auto_resumes"] = int(mission.get("auto_resumes") or 0) + 1
+                    self.db.update("runs", row["id"], {"state": {**state, "mission": mission}})
+                elif int(row.get("resumes") or 0) >= 2:  # a run that keeps cutting the app off is left alone
+                    continue
                 self.resume_run(row["chat_id"])
             except Exception as exc:
                 self.log(f"continuing run {row['id']}: {type(exc).__name__}: {exc}")
@@ -151,7 +173,7 @@ class App:
         tasks = state.get("tasks") or []
         used = [t.get("used") or {} for t in tasks]
         return {"id": row["id"], "chat_id": row["chat_id"], "title": title, "status": row["status"],
-                "created": row.get("created"), "updated": row.get("updated"), "resumes": row.get("resumes") or 0,
+                "kind": row.get("kind") or "run", "created": row.get("created"), "updated": row.get("updated"), "resumes": row.get("resumes") or 0,
                 "request": (state.get("overall") or "")[:240], "total": len(tasks),
                 "done": sum(t.get("status") == "done" for t in tasks),
                 "failed": sum(t.get("status") == "failed" for t in tasks),
@@ -192,9 +214,17 @@ class App:
     def open_run(self, chat_id):
         """The chat's latest run if it can be continued (stopped, or cut off by a crash or restart)."""
         row = self.db.one("SELECT * FROM runs WHERE chat_id=? ORDER BY created DESC, rowid DESC LIMIT 1", (chat_id,))
-        if not row or row["status"] not in ("interrupted", "stopped") or self.jobs.running_for_chat(chat_id):
+        if not row or row["status"] not in ("interrupted", "stopped", "paused") or self.jobs.running_for_chat(chat_id):
             return None
         tasks = (row.get("state") or {}).get("tasks") or []
+        if row.get("kind") == "mission":
+            # a long-running task is open until it is finished, also between two steps (2.9.0)
+            m = (row.get("state") or {}).get("mission") or {}
+            return {"id": row["id"], "status": row["status"], "mission": True, "total": len(tasks),
+                    "done": sum(t.get("status") == "done" for t in tasks), "updated": row.get("updated"),
+                    "pause": m.get("pause"), "limits": m.get("limits"), "spent": m.get("spent"),
+                    "next": next((t.get("name") for t in tasks if t.get("status") not in
+                                  ("done", "failed", "cancelled")), None)}
         left = [t for t in tasks if t.get("status") not in ("done", "failed")]
         if not tasks or not left:
             return None
@@ -217,8 +247,60 @@ class App:
                                payload={"resume_run": info["id"], "auto_approve": auto})
 
     def dismiss_run(self, chat_id):
-        self.db.run("UPDATE runs SET status='dismissed' WHERE chat_id=? AND status IN ('interrupted','stopped')",
-                        (chat_id,))
+        self.db.run("UPDATE runs SET status='dismissed' WHERE chat_id=? AND status IN "
+                    "('interrupted','stopped','paused')", (chat_id,))
+
+    # ------------------------------------------------------------------ long-running tasks (2.9.0)
+    def missions(self, limit=80):
+        from .missions import summary
+        rows = self.db.all("SELECT * FROM runs WHERE kind='mission' AND status NOT IN ('superseded','dismissed') "
+                           "ORDER BY created DESC LIMIT ?", (limit,))
+        return [summary(self, r) for r in rows]
+
+    def start_mission(self, text, setup=None, project_id=None, model=None, folders=None, connectors=None,
+                      origin="user", schedule_id=None, chat_id=None, kind="chat", notify=False, reason=None):
+        """Start a long-running task in a chat of its own (or in `chat_id`). The set-up's permissions become
+        the chat's unattended policy, so its agents may do those things without asking and nothing else."""
+        from .missions import clean_setup
+        setup = clean_setup(setup, self)
+        text = (text or setup["goal"]).strip()
+        if not text:
+            raise ValueError("Describe the task first")
+        if not chat_id:
+            chat = self.create_chat(project_id=project_id, title=setup["name"] or " ".join(text.split())[:70],
+                                    model=model or None, harness="long-task", connectors=connectors,
+                                    folders=folders, origin=origin, schedule_id=schedule_id)
+            chat_id = chat["id"]
+        elif (self.db.get("chats", chat_id) or {}).get("harness") != "long-task":
+            self.db.update("chats", chat_id, {"harness": "long-task"})
+        self.db.set_setting(f"chat_policy:{chat_id}", {"allow": setup["allow"]} if setup["allow"] else None)
+        # later sessions of this chat keep the team, the limits and the permissions (not the task's wording)
+        self.db.set_setting(f"chat_mission:{chat_id}", {k: setup[k] for k in ("name", "team", "limits", "allow")})
+        payload = {"mission": setup, "policy": {"allow": setup["allow"]} if setup["allow"] else None}
+        if reason:
+            payload["reason"] = reason
+        return self.start_turn(chat_id, text, kind=kind, schedule_id=schedule_id, notify=notify, payload=payload)
+
+    def set_mission_limits(self, run_id, values):
+        """Change a task's limits while it runs or while it is paused."""
+        from .missions import clean_limits
+        row = self.db.get("runs", run_id)
+        if not row or row.get("kind") != "mission":
+            raise KeyError(run_id)
+        live = self.orchestras.get(row["chat_id"])
+        if live is not None and live.id == run_id:
+            live.limits = clean_limits(values, live.limits)
+            live.save()
+            live.publish()
+            return live.limits
+        state = row.get("state") or {}
+        mission = state.get("mission") or {}
+        mission["limits"] = clean_limits(values, mission.get("limits"))
+        self.db.update("runs", run_id, {"state": {**state, "mission": mission}, "updated": now()})
+        cfg = self.db.setting(f"chat_mission:{row['chat_id']}", None)
+        if cfg:
+            self.db.set_setting(f"chat_mission:{row['chat_id']}", {**cfg, "limits": mission["limits"]})
+        return mission["limits"]
 
     async def stop(self):
         for t in self._bg:

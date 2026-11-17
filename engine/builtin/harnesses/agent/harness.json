@@ -1,11 +1,12 @@
 {
   "name": "Agent",
-  "description": "Works step by step with tools: your folders, the web, Python, images, skills, connectors, schedules and helper agents.",
+  "description": "Works step by step with tools: your folders, the web, a real browser, Python, images, skills, connectors, schedules and helper agents.",
   "type": "loop",
   "mode": "agent",
   "tools": [
     "files",
     "web",
+    "browser",
     "python",
     "memory",
     "skills",

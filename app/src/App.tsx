@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import {
   Activity as ActivityIcon, BookOpen, Brain, CalendarClock, Cpu, FolderKanban, MessageSquarePlus, Plug, Search,
-  Settings as SettingsIcon, Workflow, Loader2, Pin, WifiOff,
+  Settings as SettingsIcon, Workflow, Loader2, Pin, Rocket, WifiOff,
 } from "lucide-react";
 import { api } from "./api";
 import { go, useApp } from "./store";
@@ -15,12 +15,14 @@ import Skills from "./pages/Skills";
 import Harnesses from "./pages/Harnesses";
 import Schedules from "./pages/Schedules";
 import ActivityPage from "./pages/Activity";
+import Missions from "./pages/Missions";
 import Memory from "./pages/Memory";
 import Settings from "./pages/Settings";
 import Onboarding from "./pages/Onboarding";
 
 const NAV = [
   { page: "activity", label: "Activity", icon: ActivityIcon },
+  { page: "tasks", label: "Long-running tasks", icon: Rocket },
   { page: "schedules", label: "Schedules", icon: CalendarClock },
   { page: "models", label: "Models", icon: Cpu },
   { page: "plugins", label: "Plugins & connectors", icon: Plug },
@@ -136,6 +138,7 @@ export default function App() {
     case "harnesses": page = <Harnesses selected={route.id} />; break;
     case "schedules": page = <Schedules />; break;
     case "activity": page = <ActivityPage />; break;
+    case "tasks": page = <Missions />; break;
     case "memory": page = <Memory />; break;
     case "settings": page = <Settings />; break;
     default: page = <Home projectId={route.page === "home" ? route.id : undefined} />;

@@ -80,7 +80,8 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         a = A()
         settings = {r["key"]: r["value"] for r in a.db.all("SELECT * FROM settings")
                     if not r["key"].startswith(("chat_allow:", "chat_auto_approve:", "connector_approval:",
-                                                "chat_online:", "cloud_price_list", "cloud_budget_warned"))}
+                                                "chat_online:", "cloud_price_list", "cloud_budget_warned",
+                                                "chat_policy:", "chat_mission:"))}
         return {"version": VERSION, "settings": settings, "data_dir": str(a.paths.data),
                 "models_dir": str(a.paths.models_dir({"models_dir": a.db.setting("models_dir")})),
                 "secrets_backend": a.secrets.backend, "secrets_secure": a.secrets.secure,
@@ -287,6 +288,43 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         data = await body(request) if request.headers.get("content-length") not in (None, "0") else {}
         await A().runtime.unload((data or {}).get("model_id"))
         return {"ok": True}
+
+    # ------------------------------------------------------------------ long-running tasks (2.9.0)
+    @api.get("/api/busy")
+    async def busy():
+        """What is running right now (the desktop shell keeps the computer awake while this is not empty)."""
+        a = A()
+        rows = [a.db.get("jobs", jid) or {} for jid in list(a.jobs.tasks)]
+        return {"active": len(rows), "titles": [r.get("title") or "Task" for r in rows][:6],
+                "waiting": sum(r.get("status") == "waiting" for r in rows)}
+
+    @api.post("/api/missions/plan")
+    async def missions_plan(request: Request):
+        """A sentence → a proposed set-up (team, limits, what it may do without asking; with scheduled=true
+        also when it runs). Nothing is started or saved: the window shows it for the user to change or confirm."""
+        from .missions import ALLOWABLE, plan_setup
+        data = await body(request)
+        setup = await plan_setup(A(), data.get("text"), scheduled=bool(data.get("scheduled")),
+                                 model=data.get("model"))
+        return {"setup": setup, "allowable": ALLOWABLE}
+
+    @api.get("/api/missions")
+    async def missions_list():
+        from .missions import ALLOWABLE, default_limits
+        a = A()
+        return {"missions": a.missions(), "allowable": ALLOWABLE, "default_limits": default_limits(a.db)}
+
+    @api.post("/api/missions")
+    async def missions_start(request: Request):
+        a, data = A(), await body(request)
+        job = a.start_mission(data.get("text") or "", setup=data.get("setup"), project_id=data.get("project_id"),
+                              model=data.get("model"), folders=data.get("folders"),
+                              connectors=data.get("connectors"))
+        return {"job_id": job["id"], "chat_id": job["chat_id"]}
+
+    @api.put("/api/missions/{run_id}/limits")
+    async def missions_limits(run_id: str, request: Request):
+        return {"limits": A().set_mission_limits(run_id, await body(request))}
 
     @api.get("/api/runs")
     async def runs_list(limit: int = 60):

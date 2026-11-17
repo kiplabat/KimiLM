@@ -8,6 +8,9 @@ type "loop"      the model works in a loop with tools. mode = chat (no tools) | 
                  harness may set lead_role "strategist" (the planner is the strongest model, often online) and
                  worker_role (the role agents get a model by: "worker" runs them on this computer when possible).
                  review is kept for older harness files: the planner always reads every result now.
+                 mission (2.9.0, missions.py) is a long-running task: the planner keeps a written understanding
+                 of the problem, gives one step at a time to an agent, reads the handoff that agent leaves, and
+                 decides the next step from it, until the task is done or a limit is reached.
 type "pipeline"  a fixed sequence of steps written in Python (like the Datavera dataset publisher). The model is
                  asked only bounded questions inside it; the engine runs it as a task and streams its progress.
 
@@ -30,7 +33,7 @@ SCHEMA = {
         "name": {"type": "string", "minLength": 2, "maxLength": 60},
         "description": {"type": "string", "maxLength": 400},
         "type": {"enum": ["loop", "pipeline"]},
-        "mode": {"enum": ["chat", "agent", "planner", "research", "team"]},
+        "mode": {"enum": ["chat", "agent", "planner", "research", "team", "mission"]},
         "tools": {"type": "array", "items": {"type": "string"}},
         "connectors": {"type": "boolean"},
         "max_steps": {"type": "integer", "minimum": 1, "maximum": 60},

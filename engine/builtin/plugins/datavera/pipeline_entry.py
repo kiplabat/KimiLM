@@ -18,7 +18,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 CODE = HERE / "pipeline"                       # copied here when the installer is built
 if not (CODE / "agent.py").exists():
-    CODE = HERE.parents[3]                     # development: the repository root (…/datavera-agent)
+    CODE = HERE.parents[3]                     # development: the repository root (…/KimiLM)
 ACCOUNT_URL = "https://api.datavera.io/v1/mcp/account"
 
 

@@ -372,4 +372,15 @@ label.menu-item { flex-direction: row; }
 .eval-cmp-row { display: grid; grid-template-columns: 1.6fr 1fr 1fr .8fr; gap: 10px; padding: 6px 12px; border-top: 1px solid var(--line); align-items: center; }
 .eval-cmp-row.eval-head { border-top: none; background: var(--surface-2); }
 .eval-row input[type="checkbox"] { margin-right: 8px; }
-
+/* 2.9.0: long-running tasks and the set-up of a task (team, limits, permissions) */
+.setup-card { display: flex; flex-direction: column; gap: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-2); margin: 6px 0 12px; }
+.setup-title { display: flex; gap: 8px; align-items: center; font-weight: 600; font-size: 13.5px; flex-wrap: wrap; }
+.setup-title .muted { font-weight: 400; }
+.setup-member { display: flex; gap: 8px; align-items: center; }
+.setup-allow { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 6px 16px; }
+.setup-allow label { cursor: pointer; }
+.mission-row { display: flex; flex-direction: column; gap: 6px; }
+.mission-row h3 { margin: 0; }
+.mission-pause { padding: 6px 10px; border-radius: 8px; background: rgba(255, 171, 64, .14); }
+.mission-sum { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; border-radius: 8px; background: var(--surface-2); }
+.section-title { margin: 22px 0 10px; font-size: 14px; color: var(--text-soft); }

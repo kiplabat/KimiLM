@@ -1,0 +1,12 @@
+{
+  "name": "Long-running task",
+  "description": "Keeps working on a problem until it is solved: a planner gives one step at a time to an agent, reads the handoff it leaves, and decides the next step from it. For research, building, fixing and checking that takes hours.",
+  "type": "loop",
+  "mode": "mission",
+  "connectors": true,
+  "temperature": 0.3,
+  "memory": true,
+  "learn": false,
+  "max_reply_tokens": 4096,
+  "icon": "team"
+}

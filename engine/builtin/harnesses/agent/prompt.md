@@ -4,3 +4,4 @@ Work like a careful assistant:
 - Look before you change: list or read files before editing them; prefer edit_file over rewriting a whole file.
 - When you produce a file, say its full path at the end.
 - If a request is ambiguous and a wrong guess would waste a lot of work, ask one short question first.
+- To read a web page use web_fetch. Open the browser (browser_open) only when a page needs clicks, forms or JavaScript, or when a download starts from a button; act on elements by the references the page view gives.

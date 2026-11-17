@@ -115,6 +115,7 @@ export default function Settings() {
           <h3>Running in the background</h3>
           <Toggle checked={shell.openAtLogin} onChange={(v: boolean) => setShellPref({ openAtLogin: v })} label="Start KimiLM when I sign in to Windows (in the tray) — needed for schedules" />
           <Toggle checked={shell.keepInTray} onChange={(v: boolean) => setShellPref({ keepInTray: v })} label="Closing the window keeps the app running in the tray" />
+          <Toggle checked={shell.keepAwake !== false} onChange={(v: boolean) => setShellPref({ keepAwake: v })} label="Keep the computer awake while a task is running (the screen may still turn off; closing a laptop's lid still follows Windows' own setting)" />
         </div>
       )}
       <div className="card stack-s">
@@ -188,6 +189,14 @@ export default function Settings() {
         <Toggle checked={s.plan_approval ?? false} onChange={(v: boolean) => set({ plan_approval: v })} label="Ask me before a plan starts (scheduled tasks and auto-approved chats start right away)" />
         <Toggle checked={s.unload_after_run ?? false} onChange={(v: boolean) => set({ unload_after_run: v })} label="Unload the planner's model as well when a run ends (scheduled runs always do)" />
         <Toggle checked={(s.resume_runs || "ask") === "auto"} onChange={(v: boolean) => set({ resume_runs: v ? "auto" : "ask" })} label="Continue runs that were cut off (app closed, restart, crash) by themselves when the app starts; otherwise the chat offers a Continue button" />
+        <Toggle checked={s.mission_auto_resume ?? true} onChange={(v: boolean) => set({ mission_auto_resume: v })} label="Continue long-running tasks by themselves after a restart or a crash (a task that cuts the app off three times in a row is left alone)" />
+        <Field label="Default limits of a new long-running task" help="Reaching a limit pauses the task between two steps and tells you. Each task's own limits can be changed when it is set up and while it runs (Long-running tasks → Limits).">
+          <div className="row gap-m wrap">
+            <label className="row gap-s small">hours of work <input className="input narrow" type="number" min={0.5} step={0.5} value={s.mission_hours ?? 8} onChange={(e) => set({ mission_hours: Number(e.target.value) })} /></label>
+            <label className="row gap-s small">steps <input className="input narrow" type="number" min={1} value={s.mission_steps ?? 40} onChange={(e) => set({ mission_steps: Number(e.target.value) })} /></label>
+            <label className="row gap-s small">minutes a step <input className="input narrow" type="number" min={5} value={s.mission_step_minutes ?? 45} onChange={(e) => set({ mission_step_minutes: Number(e.target.value) })} /></label>
+          </div>
+        </Field>
         <Toggle checked={s.lean_tools ?? true} onChange={(v: boolean) => set({ lean_tools: v })} label="Give each step only the tools its goal calls for (all of them on a fresh attempt)" />
         <Toggle checked={s.learned_model_choice ?? true} onChange={(v: boolean) => set({ learned_model_choice: v })} label="Choose each step's model from how such steps went on this computer (Activity → Models' record); models you fix yourself are never changed" />
         <Toggle checked={s.escalate_models ?? true} onChange={(v: boolean) => set({ escalate_models: v })} label="Move a step to a stronger model when it fails the same way twice" />

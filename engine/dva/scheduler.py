@@ -1,5 +1,10 @@
 """Scheduled tasks: run a prompt (or a pipeline harness) on a schedule, in its own chat, while the app is open
-(it can start with Windows and sit in the tray). Missed runs can catch up once when the app starts again."""
+(it can start with Windows and sit in the tray). Missed runs can catch up once when the app starts again.
+
+2.9.0: a scheduled task can carry a set-up (missions.plan_setup writes one from a sentence; the user confirms
+it): kind "mission" runs it as a long-running task with that team and those limits, and "allow" lists what the
+run may do without asking (tool groups). Anything else still asks and notifies, so "approve everything" is no
+longer the only way to run unattended."""
 import asyncio
 import re
 from datetime import datetime, timedelta, timezone
@@ -118,17 +123,27 @@ class Scheduler:
                "inputs": data.get("inputs") or {}, "chat_mode": data.get("chat_mode", "new"),
                "connectors": data.get("connectors") or [], "auto_approve": int(bool(data.get("auto_approve"))),
                "catch_up": int(data.get("catch_up", 1)), "only_on_ac": int(bool(data.get("only_on_ac"))),
-               "max_runs_per_day": int(data.get("max_runs_per_day") or 0),
+               "max_runs_per_day": int(data.get("max_runs_per_day") or 0), "setup": self._setup(data.get("setup")),
                "next_run": next_after(cron).isoformat(timespec="seconds"), "created": now(), "updated": now()}
         self.db.insert("schedules", row)
         self.app.bus.publish("schedules_changed")
         return self.db.get("schedules", sid)
+
+    def _setup(self, setup):
+        """The set-up as stored: empty for a plain scheduled prompt."""
+        if not isinstance(setup, dict) or not setup:
+            return {}
+        from .missions import clean_setup
+        clean = clean_setup(setup, self.app)
+        return {k: clean[k] for k in ("kind", "goal", "done_when", "team", "limits", "allow", "outline")}
 
     def update(self, sid, data):
         row = self.db.get("schedules", sid)
         if not row:
             raise KeyError(sid)
         values = {}
+        if "setup" in data:
+            values["setup"] = self._setup(data["setup"])
         for key in ("name", "prompt", "harness", "model", "project_id", "inputs", "chat_mode", "connectors"):
             if key in data:
                 values[key] = data[key]
@@ -174,9 +189,17 @@ class Scheduler:
             if s["chat_mode"] == "same":
                 self.db.update("schedules", sid, {"chat_id": chat_id})
         prompt = s.get("prompt") or "Run."
-        job = self.app.start_turn(chat_id, prompt, kind="schedule", schedule_id=sid, notify=True,
-                                  payload={"auto_approve": bool(s["auto_approve"]), "inputs": s.get("inputs") or {},
-                                           "reason": reason})
+        setup = s.get("setup") or {}
+        policy = {"allow": setup["allow"]} if setup.get("allow") else None
+        if setup.get("kind") == "mission":     # a long-running task with the team and limits of its set-up
+            job = self.app.start_mission(prompt, setup={**setup, "name": s["name"]}, chat_id=chat_id,
+                                         kind="schedule", schedule_id=sid, notify=True, reason=reason)
+            if s["auto_approve"]:
+                self.db.set_setting(f"chat_auto_approve:{chat_id}", True)
+        else:
+            job = self.app.start_turn(chat_id, prompt, kind="schedule", schedule_id=sid, notify=True,
+                                      payload={"auto_approve": bool(s["auto_approve"]), "policy": policy,
+                                               "inputs": s.get("inputs") or {}, "reason": reason})
         self.db.update("schedules", sid, {"last_run": now()})
         return job
 
@@ -210,6 +233,7 @@ class Scheduler:
                 continue
             try:
                 self.run_now(s["id"], reason="catch-up" if missed else "schedule")
-            except ValueError:
+            except ValueError as exc:          # e.g. its previous run is still going: say so instead of nothing
+                self.app.log(f"schedule {s['name']}: not started ({exc})")
                 continue
         self.app.bus.publish("schedules_tick")

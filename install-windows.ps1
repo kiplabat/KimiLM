@@ -1,6 +1,6 @@
 # Datavera local agent - Windows installer (also updates an existing install).
 # Run it by pasting this ONE line into PowerShell:
-#   powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/kiplabat/datavera-agent/main/install-windows.ps1 | iex"
+#   powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/kiplabat/KimiLM/main/install-windows.ps1 | iex"
 # It installs Python 3.12, Node.js and Ollama if missing (using winget), downloads the agent into
 # %USERPROFILE%\DataveraAgent, downloads the AI model, connects your Datavera account, and puts a
 # "Datavera Agent" icon on your desktop. Your key, settings and history are kept when you run it again.
@@ -9,7 +9,7 @@ function Install-DataveraAgent {
     $ErrorActionPreference = 'Stop'
     $ProgressPreference = 'SilentlyContinue'
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $Repo = 'https://github.com/kiplabat/datavera-agent/archive/refs/heads/main.zip'
+    $Repo = 'https://github.com/kiplabat/KimiLM/archive/refs/heads/main.zip'
     $Model = 'qwen3.5:4b'
     $Dest = if ($env:DATAVERA_AGENT_DIR) { $env:DATAVERA_AGENT_DIR } else { Join-Path $env:USERPROFILE 'DataveraAgent' }
     $Total = 8
@@ -92,7 +92,7 @@ function Install-DataveraAgent {
     New-Item -ItemType Directory -Path $tmp | Out-Null
     Invoke-WebRequest -Uri $Repo -OutFile (Join-Path $tmp 'agent.zip') -UseBasicParsing
     Expand-Archive -Path (Join-Path $tmp 'agent.zip') -DestinationPath $tmp -Force
-    $src = Get-ChildItem $tmp -Directory | Where-Object { $_.Name -like 'datavera-agent*' } | Select-Object -First 1
+    $src = Get-ChildItem $tmp -Directory | Where-Object { $_.Name -like 'KimiLM*' -or $_.Name -like 'datavera-agent*' } | Select-Object -First 1
     if (-not (Test-Path $Dest)) { New-Item -ItemType Directory -Path $Dest | Out-Null }
     $backup = Join-Path $Dest ('backup_' + (Get-Date -Format 'yyyyMMdd_HHmmss'))
     Get-ChildItem $src.FullName -Recurse -File | ForEach-Object {

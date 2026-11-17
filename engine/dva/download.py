@@ -7,7 +7,9 @@ from pathlib import Path
 
 import httpx
 
-USER_AGENT = "KimiLM/2.2 (+https://github.com/kiplabat/datavera-agent)"
+from . import VERSION
+
+USER_AGENT = f"KimiLM/{VERSION} (+https://github.com/kiplabat/KimiLM)"
 
 
 class DownloadCancelled(Exception):

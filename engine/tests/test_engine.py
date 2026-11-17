@@ -1453,3 +1453,319 @@ def test_model_choice_learns_from_measured_steps(tmp_path):
     assert fc.choose("writer", "small", ["small", "big"]) == ("small", None)          # no record for this harness
     rec = fc.record_of("coder", "quick")
     assert rec["judged"] == 10 and rec["passed"] == 9 and abs(rec["rate"] - 0.9) < 1e-9
+
+
+# ---------------------------------------------------------------- 2.9.0: long-running tasks, set-ups, browser
+def start_task(c, text, setup=None, timeout=150, approve="allow"):
+    made = c.post("/api/missions", json={"text": text, "setup": setup or {}}).json()
+    status = wait_job(c, made["job_id"], timeout=timeout, approve=approve)["status"]
+    return made["chat_id"], status, last_assistant(c, made["chat_id"])
+
+
+def test_a_long_task_is_a_relay_of_handoffs(engine):
+    """The planner gives one step at a time. Each agent works in a fresh chat, gets the planner's understanding
+    and the handoff of the step before it, and leaves a handoff of its own."""
+    c = engine["client"]
+    chat_id, status, msg = start_task(c, "Long task: a relay of greetings.")
+    assert status == "done"
+    team = team_of(msg)
+    tasks = team["tasks"]
+    assert [t["name"] for t in tasks] == ["Survey", "Draft", "Polish"] and all(t["status"] == "done" for t in tasks)
+    assert len({t["chat_id"] for t in tasks}) == 3                      # a fresh agent for every step
+    m = team["mission"]
+    assert [h["id"] for h in m["handoffs"]] == ["s1", "s2", "s3"] and m["handoffs"][0]["next"].startswith("do the next")
+    assert "3 steps are done" in m["understanding"] and m["spent"]["steps"] == 3
+    first, second = first_user_text(c, tasks[0]["chat_id"]), first_user_text(c, tasks[1]["chat_id"])
+    assert "Handoff from the step before yours" not in first and "## Handoff" in first
+    assert "Handoff from the step before yours" in second and "### s1 Survey (done)" in second
+    assert "Next: do the next part after Survey" in second and "1 steps are done" in second    # the understanding
+    assert "Earlier steps:" in first_user_text(c, tasks[2]["chat_id"])
+    assert any(line["text"].startswith("The planner finished the task") for line in team["log"])
+    row = next(r for r in c.get("/api/missions").json()["missions"] if r["chat_id"] == chat_id)
+    assert row["status"] == "done" and (row["done"], row["steps"]) == (3, 3) and row["last"]["id"] == "s3"
+    assert c.get(f"/api/chats/{chat_id}").json()["open_run"] is None
+    assert c.get(f"/api/chats/{chat_id}").json()["harness"] == "long-task"
+    kinds = {r["chat_id"]: r["kind"] for r in c.get("/api/runs").json()["runs"]}
+    assert kinds[chat_id] == "mission"
+
+
+def test_a_long_task_changes_its_plan_when_a_step_finds_a_problem(engine):
+    c = engine["client"]
+    _, status, msg = start_task(c, "Long task that hits a blocker on the way.")
+    assert status == "done"
+    team = team_of(msg)
+    assert [t["name"] for t in team["tasks"]] == ["Fetch", "Workaround"]
+    m = team["mission"]
+    assert m["changes"] == 1 and m["outline"][0] == "Use the saved copy instead"
+    assert any(line["text"].startswith("The plan changed: the site is down") for line in team["log"]), team["log"]
+    assert "blocker" in m["handoffs"][0]["found"]
+    # the planner created the kind of agent it needed
+    assert team["tasks"][1]["agent"] == "Archivist" and any(a["name"] == "Archivist" for a in m["team"])
+    assert any("added an agent to the team: Archivist" in line["text"] for line in team["log"])
+
+
+def test_a_long_task_pauses_at_its_limit_and_continues_when_it_is_raised(engine):
+    c = engine["client"]
+    chat_id, status, msg = start_task(c, "Long task: a relay of greetings, kept short.", {"limits": {"steps": 2}})
+    assert status == "done"                                   # the session ended cleanly; the task is paused
+    assert msg["content"].startswith("**Paused:** it has used its 2 steps")
+    run = c.get(f"/api/chats/{chat_id}").json()["open_run"]
+    assert run["mission"] and run["status"] == "paused" and run["pause"]["kind"] == "limit" and run["done"] == 2
+    row = next(r for r in c.get("/api/missions").json()["missions"] if r["chat_id"] == chat_id)
+    assert row["status"] == "paused" and row["limits"]["steps"] == 2
+    assert c.put(f"/api/missions/{run['id']}/limits", json={"steps": 6}).json()["limits"]["steps"] == 6
+    again = c.post(f"/api/chats/{chat_id}/run/resume").json()
+    assert wait_job(c, again["job_id"], timeout=120)["status"] == "done"
+    team = team_of(last_assistant(c, chat_id))
+    assert [t["name"] for t in team["tasks"]] == ["Survey", "Draft", "Polish"]
+    assert [t["attempts"] for t in team["tasks"]] == [1, 1, 1]                 # nothing was done twice
+    assert team["mission"]["pause"] is None and team["mission"]["limits"]["steps"] == 6
+    assert c.get(f"/api/chats/{chat_id}").json()["open_run"] is None
+    users = [m for m in c.get(f"/api/chats/{chat_id}").json()["messages"] if m["role"] == "user"]
+    assert len(users) == 1
+
+
+def test_a_long_task_asks_and_goes_on_with_the_answer(engine):
+    c = engine["client"]
+    chat_id, status, msg = start_task(c, "Long task that needs my answer before the second step.")
+    assert status == "done" and "Which colour should it be?" in msg["content"]
+    run = c.get(f"/api/chats/{chat_id}").json()["open_run"]
+    assert run["pause"]["kind"] == "question"
+    job = c.post(f"/api/chats/{chat_id}/messages", json={"text": "teal"}).json()     # an ordinary reply in the chat
+    assert wait_job(c, job["job_id"], timeout=120)["status"] == "done"
+    team = team_of(last_assistant(c, chat_id))
+    assert [t["name"] for t in team["tasks"]] == ["Prepare", "Paint teal"]
+    assert any("You answered the planner's question: teal" in line["text"] for line in team["log"])
+
+
+def test_the_relay_moves_on_the_last_handoff_when_the_planner_cannot_be_asked(engine):
+    c = engine["client"]
+    _, status, msg = start_task(c, "Long task where the planner breaks after the first step.")
+    assert status == "done"
+    team = team_of(msg)
+    assert [t["name"] for t in team["tasks"]] == ["Survey", "Continue"]
+    assert team["tasks"][1]["goal"].startswith("do the next part after Survey")
+    assert any("follows the last agent's handoff" in line["text"] for line in team["log"]), team["log"]
+
+
+def test_a_stopped_long_task_continues_where_it_was(engine):
+    c = engine["client"]
+    made = c.post("/api/missions", json={"text": "Long task: a relay of greetings (slow-steps)."}).json()
+    chat_id = made["chat_id"]
+    for _ in range(400):                                   # until the second agent has started
+        if len(c.get(f"/api/chats/{chat_id}").json()["agents"]) >= 2:
+            break
+        time.sleep(0.05)
+    c.post(f"/api/jobs/{made['job_id']}/cancel")
+    assert wait_job(c, made["job_id"])["status"] == "cancelled"
+    run = c.get(f"/api/chats/{chat_id}").json()["open_run"]
+    assert run["mission"] and run["status"] == "stopped" and run["done"] == 1 and run["next"] == "Draft"
+    first = [a["id"] for a in c.get(f"/api/chats/{chat_id}").json()["agents"]]
+    again = c.post(f"/api/chats/{chat_id}/run/resume").json()
+    assert wait_job(c, again["job_id"], timeout=120)["status"] == "done"
+    team = team_of(last_assistant(c, chat_id))
+    tasks = team["tasks"]
+    assert [t["name"] for t in tasks] == ["Survey", "Draft", "Polish"] and all(t["status"] == "done" for t in tasks)
+    assert tasks[0]["chat_id"] == first[0] and tasks[0]["attempts"] == 1 and tasks[1]["attempts"] == 1
+    assert [h["id"] for h in team["mission"]["handoffs"]] == ["s1", "s2", "s3"]
+
+
+def approvals_seen(c, job_id, chat_id, timeout=120):
+    """Wait for a task, allowing what its agents ask for. Returns (status, the tools that asked)."""
+    asked, deadline = [], time.time() + timeout
+    while time.time() < deadline:
+        job = c.get(f"/api/jobs/{job_id}").json()
+        if job["status"] in ("done", "failed", "cancelled"):
+            return job["status"], asked
+        for ap in c.get(f"/api/chats/{chat_id}").json()["pending_approvals"]:
+            asked.append(ap["tool"])
+            c.post(f"/api/approvals/{ap['approval_id']}", json={"allow": True})
+        time.sleep(0.2)
+    raise AssertionError("the task did not end")
+
+
+def test_a_task_does_without_asking_only_what_its_setup_allows(engine):
+    c = engine["client"]
+    made = c.post("/api/missions", json={"text": "Long task with a note-step first.", "setup": {"allow": ["files"]}}).json()
+    status, asked = approvals_seen(c, made["job_id"], made["chat_id"])
+    assert status == "done" and asked == []                    # writing files was agreed when it was set up
+    team = team_of(last_assistant(c, made["chat_id"]))
+    note = next(m for m in c.get(f"/api/chats/{team['tasks'][0]['chat_id']}").json()["messages"] if m["role"] == "assistant")
+    assert any(s["type"] == "tool" and s["name"] == "write_file" and s["ok"] for s in note["meta"]["steps"])
+    made = c.post("/api/missions", json={"text": "Long task with a note-step first.", "setup": {"allow": ["browser"]}}).json()
+    status, asked = approvals_seen(c, made["job_id"], made["chat_id"])
+    assert status == "done" and asked == ["write_file"]        # not agreed: it asked (and the user allowed it)
+
+
+def test_a_planner_sets_up_a_task_and_code_repairs_the_setup(engine):
+    c = engine["client"]
+    out = c.post("/api/missions/plan", json={"text": "Study greetings and report on them."}).json()
+    s = out["setup"]
+    assert s["name"] == "Greeting study" and s["kind"] == "mission" and s["planned_by"]
+    assert [m["name"] for m in s["team"]] == ["Researcher", "Writer"]         # the duplicate is dropped
+    assert s["team"][1]["harness"] == "writer"
+    assert s["limits"]["hours"] == 240 and s["limits"]["steps"] == 1 and s["limits"]["step_minutes"] == 5
+    assert s["allow"] == ["files"] and "files" in out["allowable"] and s["outline"] == ["Collect", "Write"]
+    sched = c.post("/api/missions/plan", json={"text": "Each morning, study greetings.", "scheduled": True}).json()["setup"]
+    assert sched["cron"] == "30 7 * * *" and sched["when"] == "Every day at 07:30"
+    assert c.post("/api/missions/plan", json={"text": " "}).status_code == 400
+
+
+def test_a_scheduled_task_can_be_a_long_task_with_its_setup(engine):
+    c = engine["client"]
+    setup = {"kind": "mission", "team": [{"name": "Greeter", "harness": "agent", "about": "says hello"}],
+             "limits": {"hours": 1, "steps": 9}, "allow": ["files"]}
+    s = c.post("/api/schedules", json={"name": "Nightly relay", "when": "every day at 02:00",
+                                       "prompt": "Long task: a relay of greetings at night.", "setup": setup}).json()
+    assert s["setup"]["kind"] == "mission" and s["setup"]["limits"]["steps"] == 9
+    run = c.post(f"/api/schedules/{s['id']}/run").json()
+    assert wait_job(c, run["job_id"], timeout=150)["status"] == "done"
+    chat = c.get(f"/api/chats/{run['chat_id']}").json()
+    assert chat["origin"] == "schedule" and chat["harness"] == "long-task"
+    team = team_of(last_assistant(c, run["chat_id"]))
+    assert len(team["tasks"]) == 3 and team["mission"]["limits"]["steps"] == 9
+    assert {t["agent"] for t in team["tasks"]} == {"Greeter"} and team["mission"]["allow"] == ["files"]
+    row = next(r for r in c.get("/api/missions").json()["missions"] if r["chat_id"] == run["chat_id"])
+    assert row["schedule_id"] == s["id"]
+    plain = c.put(f"/api/schedules/{s['id']}", json={"setup": {}}).json()
+    assert plain["setup"] == {}
+    assert c.get("/api/busy").json()["active"] == 0
+
+
+def test_handoffs_limits_and_tool_kits_in_code():
+    from dva.missions import clean_limits, parse_handoff
+    from dva.orchestrator import lean_kit
+    h = parse_handoff("I looked at three files.\n\n## Handoff\nDone: read a.csv, 12 rows\nFound: nothing new\n"
+                      "Next: chart the rows\nand save it")
+    assert h == {"done": "read a.csv, 12 rows", "found": "nothing new", "next": "chart the rows\nand save it"}
+    h = parse_handoff("**Handoff**\n- **Done:** fixed the test\n- **Next:** nothing: the task is complete")
+    assert h["done"] == "fixed the test" and h["next"].startswith("nothing") and h["found"] == ""
+    assert parse_handoff("Just an answer without the block.")["done"] == "Just an answer without the block."
+    assert clean_limits({"hours": "2.5", "steps": 10**9, "tokens": -5, "cost": "x"}) == \
+        {"hours": 2.5, "steps": 400, "step_minutes": 45, "tokens": 0, "cost": 0.0}
+    assert "browser" in lean_kit("Log in to the portal and click the Export button")
+    assert "browser" not in lean_kit("Read notes.txt and list the names")
+
+
+def test_the_browser_tools_click_type_and_download_in_a_real_browser(tmp_path):
+    """With a real Chrome and the bundled browser helper (skipped where there is none): open a page, type into
+    a field, click a button, follow a download, take a screenshot — each answer shows the page afterwards."""
+    import asyncio
+    import functools
+    import http.server
+    import shutil
+    import threading
+    cli = ENGINE.parent / "app" / "node_modules" / "@playwright" / "mcp" / "cli.js"
+    chrome = shutil.which("google-chrome") or shutil.which("chrome")
+    node = shutil.which("node")
+    if not (cli.exists() and chrome and node) or os.name == "nt":
+        pytest.skip("needs Node, the browser helper (app/node_modules) and Chrome")
+    site = tmp_path / "site"
+    (site / "files").mkdir(parents=True)
+    (site / "index.html").write_text(
+        "<!doctype html><title>Test shop</title><h1>Test shop</h1><a href='prices.html'>Price list</a>"
+        "<form onsubmit=\"document.getElementById('out').textContent='Hello, '+document.getElementById('n').value;"
+        "return false\"><label for='n'>Your name</label><input id='n'><button>Greet</button></form><p id='out'></p>"
+        "<a href='/files/prices.csv'>Download prices</a>"
+        "<select aria-label='Colour'><option>Red</option><option>Blue</option></select>")
+    (site / "prices.html").write_text("<!doctype html><title>Price list</title><h1>Price list</h1><p>Tea 4.50</p>")
+    (site / "files" / "prices.csv").write_text("item,price\ntea,4.50\n")
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def end_headers(self):
+            if self.path.endswith(".csv"):
+                self.send_header("Content-Disposition", "attachment; filename=prices.csv")
+            super().end_headers()
+
+        def log_message(self, *a):
+            pass
+    port = free_port()
+    web = http.server.ThreadingHTTPServer(("127.0.0.1", port), functools.partial(Handler, directory=str(site)))
+    threading.Thread(target=web.serve_forever, daemon=True).start()
+    env = {"DVA_NODE": node, "DVA_PLAYWRIGHT_MCP": str(cli), "DVA_BROWSER_ARGS": "--no-sandbox", "DVA_SECRETS": "file"}
+    old = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    os.environ.pop("DVA_NODE_IS_ELECTRON", None)
+
+    async def scenario():
+        from dva.app_state import App
+        from dva.tools import ToolContext, ToolError, browser
+        app = App(str(tmp_path / "data"))
+        app.db.set_setting("browser_channel", "chrome")
+        app.db.set_setting("browser_headless", True)
+        events = []
+        ctx = ToolContext(app=app, chat={"id": "chat_x"}, project=None, workspace=tmp_path / "work", folders=[],
+                          readonly=[], emit=lambda kind, **d: events.append((kind, d)), approve=None)
+        (tmp_path / "work").mkdir()
+        try:
+            page = await browser.browser_open(ctx, f"http://127.0.0.1:{port}/index.html")
+            assert "Page: Test shop" in page and 'textbox "Your name"' in page and 'button "Greet"' in page
+            ref = lambda label: re.search(re.escape(label) + r".*?\[ref=(\w+)\]", page).group(1)   # noqa: E731
+            typed = await browser.browser_type(ctx, ref('textbox "Your name"'), "Labatt", submit=True)
+            assert "Hello, Labatt" in typed
+            chosen = await browser.browser_select(ctx, ref('combobox "Colour"'), "Blue")
+            assert 'option "Blue" [selected]' in chosen
+            got = await browser.browser_click(ctx, ref('link "Download prices"'), "Download prices")
+            saved = tmp_path / "work" / "downloads" / "prices.csv"
+            assert "Downloaded:" in got and saved.read_text().startswith("item,price")
+            assert ("file_changed", {"path": str(saved), "action": "downloaded"}) in events
+            other = await browser.browser_click(ctx, ref('link "Price list"'), "Price list")
+            assert "Page: Price list" in other and "Tea 4.50" in other
+            assert "Tea 4.50" in await browser.browser_look(ctx, "Tea")
+            shot = await browser.browser_screenshot(ctx)
+            files = list((tmp_path / "work" / "screenshots").glob("*.png"))
+            assert len(files) == 1 and files[0].stat().st_size > 1000 and str(files[0]) in shot
+            with pytest.raises(ToolError, match="browser_look"):
+                await browser.browser_click(ctx, "e999")          # a reference from an older page
+            with pytest.raises(ToolError):
+                await browser.browser_open(ctx, "file:///etc/passwd")
+        finally:
+            await app.services.shutdown()
+    import re
+    try:
+        asyncio.run(scenario())
+    finally:
+        web.shutdown()
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_a_cut_off_long_task_continues_by_itself_but_not_forever(tmp_path, monkeypatch):
+    """After a restart a long-running task goes on without being asked (a planned run only if the user chose
+    that). One that cuts the app off three times in a row since its last accepted step is left alone."""
+    import asyncio
+    from dva.app_state import App
+    from dva.db import now
+    monkeypatch.setenv("DVA_SECRETS", "file")
+
+    async def scenario():
+        app = App(str(tmp_path / "data"))
+        app.db.set_setting("resume_delay_seconds", 0)
+        for rid, kind, tries in (("r_task", "mission", 0), ("r_plan", "run", 0), ("r_loop", "mission", 3)):
+            chat = app.create_chat(title=rid)
+            app.db.insert("runs", {"id": rid, "chat_id": chat["id"], "status": "running", "kind": kind,
+                                   "state": {"tasks": [], "mission": {"auto_resumes": tries}}, "created": now(),
+                                   "updated": now()})
+        resumed = []
+        monkeypatch.setattr(app, "resume_run", lambda chat_id: resumed.append(app.db.get("chats", chat_id)["title"]))
+        await app.start()
+        await asyncio.sleep(0.3)
+        rows = {r["id"]: r for r in app.db.all("SELECT * FROM runs")}
+        assert all(r["status"] == "interrupted" for r in rows.values())
+        assert resumed == ["r_task"]                       # not the planned run, not the task that keeps failing
+        assert rows["r_task"]["state"]["mission"]["auto_resumes"] == 1
+        app.db.set_setting("mission_auto_resume", False)
+        app.db.update("runs", "r_task", {"status": "running"})
+        for t in app._bg:
+            t.cancel()
+        await app.start()
+        await asyncio.sleep(0.3)
+        assert resumed == ["r_task"]                       # switched off in Settings: it waits for Continue
+        for t in app._bg:
+            t.cancel()
+        await app.runtime.shutdown()
+    asyncio.run(scenario())
+

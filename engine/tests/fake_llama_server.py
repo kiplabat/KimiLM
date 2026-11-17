@@ -11,9 +11,17 @@ Sequenced runs (2.5.0): "forgetful plan" gives three steps without depends_on (t
 small planner does; "explode" in a step's goal makes its agent fail with a server error; the result check
 ('met') fails once for goals with "retry-me" and always for goals with "never-pass"; "hang-once" makes the
 server send nothing for a long time, once per model file (a file beside the model remembers it, because the
-engine restarts this process); /tokenize counts four characters per token."""
+engine restarts this process); /tokenize counts four characters per token.
+
+Long-running tasks (2.9.0): a "next move" request (schema with decision + steps) is scripted from the number of
+steps done, which the prompt states: three steps Survey → Draft → Polish, then finish. Words in the request
+change the script: "hits a blocker" (the first agent reports one, the planner changes the plan), "needs my
+answer" (the planner asks after the first step), "planner breaks" (the second move fails with a server error),
+"note-step" (the first step writes a file), "slow-steps". An agent whose brief asks for a handoff ends its reply
+with one. A set-up request (schema with team + limits) answers with values out of range, to be repaired."""
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -136,10 +144,76 @@ def decide(body):
             if name:
                 return {"tool": (name, {})}
     if after_tool:
-        return {"text": f"Done. The tool said: {msgs[-1]['content'][:60]}"}
+        return {"text": f"Done. The tool said: {msgs[-1]['content'][:60]}" + handoff(text)}
     # memory chosen for the request arrives in a <context> block on the latest message (2.4.2)
     ctx = text.split("</context>")[0] if "<context>" in text else ""
-    return {"text": "Hello from the fake model. " + ("I remember: " + ctx[-80:] if "remembered" in ctx else "")}
+    return {"text": "Hello from the fake model. " + ("I remember: " + ctx[-80:] if "remembered" in ctx else "")
+            + handoff(text)}
+
+
+def step_goal(last, said=None):
+    """The agent's own task in a brief of a planned run ("Your task …") or a long-running task ("Your step …").
+    In a later round of the same step the last message is the planner's objection: all of it counts then."""
+    for mark in ("Your task", "Your step"):
+        if mark in (said if said is not None else last):
+            return last.split("Done when")[0].split(mark)[-1]
+    return ""
+
+
+def handoff(text):
+    """Agents of a long-running task end with a handoff block (their brief asks for it)."""
+    m = re.search(r"Your step \((s\d+) “(.+?)”\)", text)
+    if not m or "## Handoff" not in text:
+        return ""
+    found = "blocker: the site is down" if "report a blocker" in step_goal(text) else "nothing new"
+    return (f"\n\n## Handoff\nDone: finished {m.group(2)} with a greeting\nFound: {found}\n"
+            f"Next: do the next part after {m.group(2)}")
+
+
+def mission_move(body, users):
+    """The planner of a long-running task: what happens after `n` steps."""
+    last = text_of(body["messages"][-1].get("content"))
+    n = int((re.search(r"Steps done so far: (\d+)", last) or [0, 0])[1])
+    slow = " slowly" if "slow-steps" in users else ""
+    move = {"understanding": f"The task is a relay of greetings; {n} steps are done so far.",
+            "reason": f"after {n} steps", "decision": "continue", "steps": [],
+            "outline": ["Survey", "Draft", "Polish"]}
+    step = lambda name, goal, **kw: {"name": name, "goal": goal, "done_when": "a greeting", **kw}  # noqa: E731
+    if "hits a blocker" in users:
+        if n == 0:
+            move["steps"] = [step("Fetch", "say hello and report a blocker")]
+        elif n == 1 and "blocker: the site is down" in last:
+            move.update(reason="the site is down, so use the saved copy", changed=True,
+                        outline=["Use the saved copy instead", "Report"],
+                        steps=[step("Workaround", "say hello from the saved copy", agent="Archivist", harness="agent")])
+        else:
+            move["decision"] = "finish"
+        return move
+    if "needs my answer" in users:
+        if n == 0:
+            move["steps"] = [step("Prepare", "say hello before painting")]
+        elif n == 1 and "My latest message to you:" not in last:
+            move.update(decision="ask", question="Which colour should it be?")
+        elif n == 1:
+            colour = last.split("My latest message to you:", 1)[1].split("\n")[0].strip()
+            move["steps"] = [step(f"Paint {colour}"[:40], f"say hello in {colour}")]
+        else:
+            move["decision"] = "finish"
+        return move
+    if "planner breaks" in users and n == 1:
+        return None
+    if "note-step" in users and n == 0:
+        move["steps"] = [step("Note", "write a note for the user")]
+        return move
+    plan = [("Survey", "say hello: survey the notes"), ("Draft", "say hello: draft from the survey" + slow),
+            ("Polish", "say hello: polish the draft")]
+    if "note-step" in users or "planner breaks" in users:
+        plan = plan[:2]
+    if n < len(plan):
+        move["steps"] = [step(*plan[n])]
+    else:
+        move["decision"] = "finish"
+    return move
 
 
 @app.get("/health")
@@ -212,6 +286,21 @@ def structured(schema, body):
     """Planner answers for the orchestrator; everything else gets a minimal valid object."""
     props = schema.get("properties", {})
     users = " ".join(text_of(m.get("content")) for m in body["messages"] if m["role"] == "user").lower()
+    if "decision" in props and "steps" in props:      # a long-running task's next move (2.9.0)
+        return mission_move(body, users)
+    if "team" in props and "limits" in props:         # the set-up of a task, with values to be repaired
+        harnesses = props["team"]["items"]["properties"]["harness"]["enum"]
+        out = {"name": "Greeting study", "goal": "Collect greetings and write them up, without asking anything.",
+               "done_when": "a report of the greetings exists", "kind": "reply" if "single-reply-task" in users else "mission",
+               "team": [{"name": "Researcher", "harness": "agent", "role": "worker", "about": "finds greetings"},
+                        {"name": "Writer", "harness": "writer" if "writer" in harnesses else "agent",
+                         "about": "writes the report"},
+                        {"name": "researcher", "harness": "agent", "about": "a duplicate to be dropped"}],
+               "limits": {"hours": 5000, "steps": 0, "step_minutes": 1}, "allow": ["files", "files"],
+               "outline": ["Collect", "Write"]}
+        if "when" in props:
+            out["when"] = "every day at 07:30"
+        return out
     if "approach" in props and "tasks" in props:
         allowed = props["approach"]["enum"]
         if "team" in allowed and "forgetful plan" in users:
@@ -290,15 +379,17 @@ async def chat(request: Request):
     if "hang-once" in said and HUNG is not None and not HUNG.exists():
         HUNG.write_text("hung once")
         time.sleep(40)                              # a stuck model: no bytes at all
-    if "slowly" in text_of(body["messages"][-1].get("content")).split("Done when")[0].split("Your task")[-1] \
-            and "Your task" in said:
+    goal = step_goal(text_of(body["messages"][-1].get("content")), said)
+    if "slowly" in goal:
         time.sleep(4)                               # a step that takes a while (tests stop a run in the middle)
-    if "explode" in text_of(body["messages"][-1].get("content")).split("Done when")[0].split("Your task")[-1] \
-            and "Your task" in said:
+    if "explode" in goal:
         return JSONResponse({"error": {"message": "the fake model exploded"}}, 500)
     rf = body.get("response_format")
     if rf:
-        content = json.dumps(structured(rf["json_schema"]["schema"], body))
+        answer = structured(rf["json_schema"]["schema"], body)
+        if answer is None:                          # a planner call that fails (tests: the relay still moves)
+            return JSONResponse({"error": {"message": "the fake planner broke"}}, 500)
+        content = json.dumps(answer)
         if body.get("stream"):                      # llama-server streams schema answers like any other reply
             def one():
                 yield "data: " + json.dumps({"choices": [{"index": 0, "delta": {"role": "assistant", "content": content},
