@@ -1,6 +1,9 @@
 """Plugins bundle connectors (MCP servers), skills, harnesses, setup steps, actions and schedule templates.
 
-A plugin is a folder with plugin.json. Settings marked "secret" are kept in the OS credential store. A plugin may
+A plugin is a folder with plugin.json. Its MCP servers can be written the way other apps write them, under
+"mcpServers" (2.10.0; see mcp_config.py), next to the older "connectors" list. An MCP bundle (.mcpb: a zip with
+manifest.json and the server's files) installs as a plugin too: its manifest is turned into plugin.json, its
+user_config into settings. Settings marked "secret" are kept in the OS credential store. A plugin may
 ship a setup script (run with the app's Python) that checks the settings and returns choices or updates, and
 actions (buttons) that run scripts, e.g. "Sync my catalogue"."""
 import asyncio
@@ -15,7 +18,7 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator
 
-from . import run_script as launcher
+from . import mcp_config, run_script as launcher
 from .db import now
 from .paths import BUILTIN
 
@@ -31,6 +34,8 @@ SCHEMA = {
             "type": {"enum": ["text", "secret", "select", "boolean", "textarea", "folder"]},
             "required": {"type": "boolean"}, "default": {}, "options": {"type": "array"}}}},
         "connectors": {"type": "array", "items": {"type": "object", "required": ["id", "name", "transport"]}},
+        "mcpServers": {"type": "object", "additionalProperties": {"type": "object"}},
+        "bundle": {"type": "object"},
         "setup": {"type": "string"},
         "actions": {"type": "array", "items": {"type": "object", "required": ["id", "label", "run"]}},
         "schedule_templates": {"type": "array"},
@@ -203,6 +208,31 @@ class Plugins:
                 else:
                     conf["ready"] = True
                 out.append(conf)
+            servers = plugin.get("mcpServers") or {}
+            for name, raw in servers.items():           # the standard shape (2.10.0)
+                entry = mcp_config.normalise(name, raw)
+                if not entry:
+                    continue
+                if values is None:
+                    values = self.settings(plugin, reveal=True)
+                # ${__dirname} and ${user_config.key} as in MCP bundles; ${key} for a setting of the plugin
+                fill = lambda v: mcp_config.expand_vars(  # noqa: E731
+                    mcp_config.fill_bundle_vars(v, plugin["dir"], values),
+                    {k: v for k, v in values.items() if isinstance(v, str)})
+                cid = re.sub(r"[^a-z0-9]+", "-", str(name).lower()).strip("-") or "server"
+                conf = {**entry, "id": f"{plugin['id']}:{cid}",
+                        "name": plugin["name"] if len(servers) == 1 else f"{plugin['name']}: {name}",
+                        "description": entry["description"] or plugin.get("description", ""),
+                        "source": f"plugin:{plugin['id']}", "plugin": plugin["id"],
+                        "enabled": self.db.item_enabled("connector", f"{plugin['id']}:{cid}"),
+                        "command": fill(entry["command"]) if entry["command"] else "",
+                        "args": [fill(a) for a in entry["args"]], "url": fill(entry["url"]) if entry["url"] else "",
+                        "env": {k: fill(v) for k, v in entry["env"].items()},
+                        "headers": {k: fill(v) for k, v in entry["headers"].items()},
+                        "cwd": fill(entry["cwd"]) if entry["cwd"] else "",
+                        "token": fill(entry["token"]) if entry["token"] else "",
+                        "ready": self.configured(plugin)}
+                out.append(conf)
         return out
 
     # ------------------------------------------------------------------ install / create / export
@@ -210,10 +240,17 @@ class Plugins:
         with zipfile.ZipFile(io.BytesIO(data)) as z:
             names = [n for n in z.namelist() if not n.endswith("/")]
             pj = sorted((n for n in names if n.endswith("plugin.json")), key=lambda n: n.count("/"))
-            if not pj:
-                raise ValueError("The zip has no plugin.json")
-            prefix = pj[0][: -len("plugin.json")]
-            manifest = json.loads(z.read(pj[0]).decode("utf-8"))
+            bundle = sorted((n for n in names if Path(n).name == "manifest.json"), key=lambda n: n.count("/"))
+            generated = False
+            if pj:
+                prefix = pj[0][: -len("plugin.json")]
+                manifest = json.loads(z.read(pj[0]).decode("utf-8"))
+            elif bundle:                                   # an MCP bundle (.mcpb): make its plugin.json
+                prefix = bundle[0][: -len("manifest.json")]
+                manifest = mcp_config.bundle_to_plugin(mcp_config.loads(z.read(bundle[0]).decode("utf-8")))
+                generated = True
+            else:
+                raise ValueError("The file has no plugin.json (a KimiLM plugin) and no manifest.json (an MCP bundle)")
             errors = list(VALIDATOR.iter_errors(manifest))
             if errors:
                 raise ValueError(f"plugin.json: {errors[0].message}")
@@ -230,6 +267,8 @@ class Plugins:
                     raise ValueError("Unsafe path inside the zip")
                 (tmp / rel).parent.mkdir(parents=True, exist_ok=True)
                 (tmp / rel).write_bytes(z.read(n))
+            if generated:
+                (tmp / "plugin.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
             if dest.exists():
                 backup = self.paths.data / "plugins" / f".backup-{manifest['id']}-{now().replace(':', '')}"
                 shutil.move(str(dest), str(backup))

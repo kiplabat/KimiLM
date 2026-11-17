@@ -384,3 +384,8 @@ label.menu-item { flex-direction: row; }
 .mission-pause { padding: 6px 10px; border-radius: 8px; background: rgba(255, 171, 64, .14); }
 .mission-sum { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; border-radius: 8px; background: var(--surface-2); }
 .section-title { margin: 22px 0 10px; font-size: 14px; color: var(--text-soft); }
+/* 2.10.0: connectors taken over from other apps' MCP configurations */
+.found-group { display: flex; flex-direction: column; gap: 6px; margin: 12px 0; }
+.found-server { display: flex; gap: 10px; align-items: flex-start; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; cursor: pointer; }
+.found-server:hover { background: var(--surface-2); }
+.found-server input { margin-top: 4px; }

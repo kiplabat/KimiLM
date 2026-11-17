@@ -161,8 +161,8 @@ function Plugins_({ }: any) {
   return (
     <div className="stack">
       <div className="row gap-s">
-        <label className="btn btn-default"><Upload size={14} /><span>Install from zip</span>
-          <input type="file" accept=".zip" hidden onChange={async (e) => {
+        <label className="btn btn-default"><Upload size={14} /><span>Install a plugin or MCP bundle (.zip, .mcpb)</span>
+          <input type="file" accept=".zip,.mcpb,.dxt" hidden onChange={async (e) => {
             const f = e.target.files?.[0]; e.target.value = "";
             if (f) try { await api.upload("/plugins-upload", f); toast("Plugin installed", "ok"); load(); } catch (err: any) { toast(err.message, "error"); }
           }} /></label>
@@ -174,33 +174,146 @@ function Plugins_({ }: any) {
   );
 }
 
-function ConnectorForm({ preset, onClose, onDone }: any) {
+// "NAME=value" lines ⇄ an object. Values are never sent back by the engine, so an existing name shows as
+// "NAME=" and an empty value means "keep what is saved".
+const toLines = (o: any, sep: string) => Object.entries(o || {}).map(([k, v]) => `${k}${sep}${v || ""}`).join("\n");
+const fromLines = (text: string, sep: string) => Object.fromEntries(text.split("\n").map((l) => l.trim()).filter(Boolean)
+  .map((l) => { const i = l.indexOf(sep.trim()); return i < 0 ? [l, ""] : [l.slice(0, i).trim(), l.slice(i + sep.trim().length).trim()]; }).filter(([k]) => k));
+const splitArgs = (text: string) => (text ? (text.match(/(?:[^\s"]+|"[^"]*")+/g) || []).map((a: string) => a.replace(/^"|"$/g, "")) : []);
+
+function ConnectorForm({ preset, edit, onClose, onDone }: any) {
   const { toast } = useApp();
-  const [f, setF] = useState<any>({ name: preset.name.replace(/ \(.*\)/, ""), transport: preset.transport, url: preset.url || "",
-    command: preset.command || "", args: (preset.args || []).join(" "), auth: preset.auth || "none", token: "", description: preset.description || "" });
+  const src = edit || preset;
+  const [f, setF] = useState<any>({ name: edit ? edit.name : preset.name.replace(/ \(.*\)/, ""), transport: src.transport, type: src.type || "http", url: src.url || "",
+    command: src.command || "", args: (src.args || []).map((a: string) => (/\s/.test(a) ? `"${a}"` : a)).join(" "), auth: src.auth || "none", token: "",
+    env: toLines(src.env, "="), headers: toLines(src.headers, ": "), cwd: src.cwd || "", description: src.description || "" });
+  const [busy, setBusy] = useState(false);
   const save = async () => {
+    setBusy(true);
     try {
-      const body = { ...f, args: f.args ? f.args.match(/(?:[^\s"]+|"[^"]*")+/g).map((a: string) => a.replace(/^"|"$/g, "")) : [] };
-      const c = await api.post("/connectors", body);
+      const body: any = { ...f, args: splitArgs(f.args), env: fromLines(f.env, "="), headers: fromLines(f.headers, ":") };
+      if (!body.token) delete body.token;
+      const c = edit ? await api.put(`/connectors/${enc(edit.id)}/config`, body) : await api.post("/connectors", body);
       const t = await api.post(`/connectors/${enc(c.id)}/test`);
       toast(t.ok ? `Connected: ${t.tools.length} tools` : `Saved, but the test failed: ${t.error}`, t.ok ? "ok" : "error");
       onDone(); onClose();
     } catch (e: any) { toast(e.message, "error"); }
+    setBusy(false);
   };
   return (
-    <Modal title={`Add connector: ${preset.name}`} onClose={onClose} footer={<Button kind="primary" onClick={save}>Save and test</Button>}>
-      <p className="muted small">{preset.description}</p>
+    <Modal wide title={edit ? `Edit connector: ${edit.name}` : `Add connector: ${preset.name}`} onClose={onClose}
+      footer={<Button kind="primary" busy={busy} onClick={save}>{f.transport === "http" && f.auth === "oauth" ? "Save and sign in" : "Save and test"}</Button>}>
+      {!edit && <p className="muted small">{preset.description}</p>}
       <Field label="Name"><input className="input" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></Field>
       {f.transport === "http" ? <>
         <Field label="Server URL" help="Must start with https://"><input className="input" value={f.url} onChange={(e) => setF({ ...f, url: e.target.value })} placeholder="https://example.com/mcp" /></Field>
-        <Field label="Authentication">
-          <select className="input" value={f.auth} onChange={(e) => setF({ ...f, auth: e.target.value })}><option value="none">None</option><option value="bearer">API key / bearer token</option></select>
-        </Field>
-        {f.auth === "bearer" && <Field label="Key or token" help="Stored in Windows Credential Manager."><input className="input" type="password" value={f.token} onChange={(e) => setF({ ...f, token: e.target.value })} /></Field>}
+        <div className="row gap-m wrap">
+          <Field label="How it is reached" help="Streamable HTTP is the current way; choose SSE only for an older server whose address ends in /sse.">
+            <select className="input" value={f.type} onChange={(e) => setF({ ...f, type: e.target.value })}><option value="http">Streamable HTTP</option><option value="sse">SSE (older servers)</option></select>
+          </Field>
+          <Field label="Signing in" help={f.auth === "oauth" ? "Your browser opens on the service's own sign-in page; KimiLM keeps the sign-in on this computer and renews it." : undefined}>
+            <select className="input" value={f.auth} onChange={(e) => setF({ ...f, auth: e.target.value })}>
+              <option value="none">None (or only the headers below)</option><option value="bearer">API key / bearer token</option><option value="oauth">Sign in with the browser (OAuth)</option></select>
+          </Field>
+        </div>
+        {f.auth === "bearer" && <Field label="Key or token" help={edit?.has_token ? "A key is saved. Paste a new one to replace it." : "Stored in Windows Credential Manager."}><input className="input" type="password" value={f.token} onChange={(e) => setF({ ...f, token: e.target.value })} /></Field>}
+        <Field label="Extra headers" help="One per line as Name: value. Values are stored in Windows Credential Manager; ${NAME} takes the value of an environment variable. An empty value keeps what is saved.">
+          <textarea className="input mono" rows={2} value={f.headers} onChange={(e) => setF({ ...f, headers: e.target.value })} placeholder="X-Api-Key: …" /></Field>
       </> : <>
-        <Field label="Command" help="{node} = the app's built-in Node, {python} = the app's Python. npx/uvx need Node.js/uv installed."><input className="input" value={f.command} onChange={(e) => setF({ ...f, command: e.target.value })} placeholder="npx" /></Field>
-        <Field label="Arguments"><input className="input" value={f.args} onChange={(e) => setF({ ...f, args: e.target.value })} placeholder="-y @some/mcp-server" /></Field>
+        <Field label="Command" help="As in other apps' configurations: npx, uvx, node, python, docker or a full path. If Node.js is not installed, “node” runs on the app's own Node and “python” on the app's Python; npx and uvx need Node.js / uv."><input className="input mono" value={f.command} onChange={(e) => setF({ ...f, command: e.target.value })} placeholder="npx" /></Field>
+        <Field label="Arguments"><input className="input mono" value={f.args} onChange={(e) => setF({ ...f, args: e.target.value })} placeholder="-y @some/mcp-server" /></Field>
+        <Field label="Environment" help="One per line as NAME=value (keys, tokens, settings the server reads). Values are stored in Windows Credential Manager; an empty value keeps what is saved.">
+          <textarea className="input mono" rows={2} value={f.env} onChange={(e) => setF({ ...f, env: e.target.value })} placeholder="API_KEY=…" /></Field>
+        <Field label="Working folder (optional)"><input className="input mono" value={f.cwd} onChange={(e) => setF({ ...f, cwd: e.target.value })} /></Field>
       </>}
+    </Modal>
+  );
+}
+
+const serverLine = (s: any) => s.transport === "http" ? `${s.type === "sse" ? "SSE" : "HTTP"} · ${s.url}${s.auth === "oauth" ? " · signs in with the browser" : s.auth === "bearer" ? " · key" : ""}` : `${s.command} ${(s.args || []).join(" ")}`;
+
+// Take servers over: from a pasted configuration (the "mcpServers" JSON other apps use), or from the apps on
+// this computer that already have some. Secrets are read by the engine from the file itself, never shown here.
+function ImportServers({ mode, onClose, onDone }: any) {
+  const { toast } = useApp();
+  const [text, setText] = useState("");
+  const [groups, setGroups] = useState<any[] | null>(mode === "found" ? null : []);
+  const [error, setError] = useState("");
+  const [picked, setPicked] = useState<Record<string, boolean>>({});
+  useEffect(() => { if (mode === "found") api.get("/connectors-found").then((r) => { setGroups(r.found); setPicked(Object.fromEntries(r.found.flatMap((g: any, i: number) => g.servers.map((s: any) => [`${i}:${s.name}`, true])))); }).catch((e) => setError(e.message)); }, []);
+  useEffect(() => {
+    if (mode !== "paste") return;
+    if (!text.trim()) { setGroups([]); setError(""); return; }
+    const t = setTimeout(() => api.post("/connectors-preview", { text }).then((r) => { setGroups([{ app: "Pasted configuration", servers: r.servers }]); setPicked(Object.fromEntries(r.servers.map((s: any) => [`0:${s.name}`, true]))); setError(""); })
+      .catch((e) => { setGroups([]); setError(e.message); }), 350);
+    return () => clearTimeout(t);
+  }, [text]);
+  const count = Object.values(picked).filter(Boolean).length;
+  const add = async () => {
+    try {
+      let added: any[] = [], skipped: any[] = [];
+      for (const [i, g] of (groups || []).entries()) {
+        const names = g.servers.filter((s: any) => picked[`${i}:${s.name}`]).map((s: any) => s.name);
+        if (!names.length) continue;
+        const r = await api.post("/connectors-import", mode === "paste" ? { text, names } : { path: g.path, app: g.app, names });
+        added = added.concat(r.added); skipped = skipped.concat(r.skipped);
+      }
+      const signIn = added.filter((a) => a.auth === "oauth").length;
+      toast(`Added ${added.length} connector${added.length === 1 ? "" : "s"}${skipped.length ? `, ${skipped.length} already here` : ""}${signIn ? `. ${signIn} need${signIn === 1 ? "s" : ""} you to sign in: press Sign in on ${signIn === 1 ? "it" : "them"}.` : ". Press Test on each to connect."}`, added.length ? "ok" : "info");
+      onDone(); onClose();
+    } catch (e: any) { toast(e.message, "error"); }
+  };
+  return (
+    <Modal wide title={mode === "paste" ? "Add connectors from a configuration" : "MCP servers found on this computer"} onClose={onClose}
+      footer={<Button kind="primary" disabled={!count} onClick={add}>Add {count || ""} connector{count === 1 ? "" : "s"}</Button>}>
+      {mode === "paste" && <Field label="Paste the configuration" help='The JSON that Claude Desktop, Claude Code, Cursor, VS Code, Windsurf and most server instructions use: an "mcpServers" (or "servers") section, or one server with "command" or "url".'>
+        <textarea className="input mono" rows={8} autoFocus value={text} onChange={(e) => setText(e.target.value)}
+          placeholder={'{\n  "mcpServers": {\n    "example": { "command": "npx", "args": ["-y", "@scope/server"], "env": { "API_KEY": "…" } }\n  }\n}'} /></Field>}
+      {error && <div className="error-line">{error}</div>}
+      {groups === null && <Spinner />}
+      {groups !== null && mode === "found" && groups.length === 0 && !error && <p className="muted">No other app on this computer has MCP servers set up (looked for Claude Desktop, Claude Code, Cursor, VS Code, Windsurf, LM Studio, Gemini CLI and Zed).</p>}
+      {(groups || []).map((g: any, i: number) => (
+        <div key={i} className="found-group">
+          <div className="small"><b>{g.app}</b>{g.path ? <span className="muted"> · {g.path}</span> : null}</div>
+          {g.servers.map((s: any) => (
+            <label key={s.name} className="found-server">
+              <input type="checkbox" checked={!!picked[`${i}:${s.name}`]} onChange={(e) => setPicked({ ...picked, [`${i}:${s.name}`]: e.target.checked })} />
+              <div className="grow"><div><b>{s.name}</b>{!s.enabled && <Badge>switched off there</Badge>}</div>
+                <div className="small muted mono ellipsis">{serverLine(s)}</div>
+                {(Object.keys(s.env || {}).length > 0 || Object.keys(s.headers || {}).length > 0) && <div className="small muted">comes with values for {[...Object.keys(s.env || {}), ...Object.keys(s.headers || {})].join(", ")} (kept in Windows Credential Manager)</div>}
+                {s.note && <div className="small muted">{s.note}</div>}</div>
+            </label>
+          ))}
+        </div>
+      ))}
+    </Modal>
+  );
+}
+
+function ExportServers({ onClose }: any) {
+  const { toast } = useApp();
+  const [text, setText] = useState("");
+  useEffect(() => { api.get("/connectors-export").then((r) => setText(JSON.stringify(r, null, 2))).catch((e) => setText(e.message)); }, []);
+  return (
+    <Modal wide title="Your connectors as a configuration" onClose={onClose}
+      footer={<Button kind="primary" onClick={() => { navigator.clipboard.writeText(text); toast("Copied", "ok"); }}>Copy</Button>}>
+      <p className="muted small">The same JSON other apps read (Claude Desktop, Cursor, VS Code with “servers” instead of “mcpServers”). Keys and tokens are not included: they appear as {"${NAME}"} references to fill in where you use it.</p>
+      <pre className="log">{text}</pre>
+    </Modal>
+  );
+}
+
+function PromptUse({ c, p, onClose }: any) {
+  const { toast } = useApp();
+  const [args, setArgs] = useState<Record<string, string>>({});
+  const [text, setText] = useState("");
+  const get = async () => { try { setText((await api.post(`/connectors/${enc(c.id)}/prompt`, { name: p.name, arguments: args })).text); } catch (e: any) { toast(e.message, "error"); } };
+  return (
+    <Modal title={`${c.name}: ${p.title || p.name}`} onClose={onClose}
+      footer={<>{text && <Button onClick={() => { navigator.clipboard.writeText(text); toast("Copied: paste it into a chat", "ok"); }}>Copy</Button>}<Button kind="primary" onClick={get}>Fill it in</Button></>}>
+      {p.description && <p className="muted small">{p.description}</p>}
+      {p.arguments.map((a: any) => <Field key={a.name} label={`${a.name}${a.required ? "" : " (optional)"}`} help={a.description}><input className="input" value={args[a.name] || ""} onChange={(e) => setArgs({ ...args, [a.name]: e.target.value })} /></Field>)}
+      {text && <pre className="log">{text}</pre>}
     </Modal>
   );
 }
@@ -209,6 +322,9 @@ function Connectors() {
   const { toast } = useApp();
   const [data, setData] = useState<any>(null);
   const [preset, setPreset] = useState<any>(null);
+  const [edit, setEdit] = useState<any>(null);
+  const [dialog, setDialog] = useState("");
+  const [usePrompt, setUsePrompt] = useState<any>(null);
   const [tools, setTools] = useState<Record<string, any>>({});
   const load = () => api.get("/connectors").then(setData);
   useEffect(() => { load(); }, []);
@@ -224,16 +340,24 @@ function Connectors() {
     <div className="stack">
       <div className="card">
         <h3>Add a connector</h3>
-        <p className="muted small">Connectors are MCP servers: they give the agent tools for other apps and services. Choose them per chat (the plug menu) or per project.</p>
-        <div className="row gap-s wrap">{data.presets.map((p: any) => <Button key={p.key} icon={<Plug size={13} />} onClick={() => setPreset(p)}>{p.name}</Button>)}</div>
+        <p className="muted small">Connectors are MCP servers: they give the agent tools, documents and prompts from other apps and services. They are set up the same way as in Claude Desktop, Cursor or VS Code, so a server's own instructions work here: paste its configuration, or take over the servers those apps already have. Choose connectors per chat (the plug menu) or per project.</p>
+        <div className="row gap-s wrap">
+          <Button kind="primary" icon={<Plus size={13} />} onClick={() => setDialog("paste")}>Paste a configuration</Button>
+          <Button icon={<Download size={13} />} onClick={() => setDialog("found")}>Found on this computer</Button>
+          {data.presets.map((p: any) => <Button key={p.key} icon={<Plug size={13} />} onClick={() => setPreset(p)}>{p.name}</Button>)}
+          {data.connectors.some((c: any) => c.source === "user") && <Button kind="ghost" icon={<Upload size={13} />} onClick={() => setDialog("export")}>Export</Button>}
+        </div>
       </div>
       {data.connectors.map((c: any) => {
         const t = tools[c.id];
+        const info = (t && t !== "loading" && t.ok ? t.info : c.info) || {};
+        const oauth = c.auth === "oauth";
         return (
           <div key={c.id} className="card">
             <div className="row between">
-              <div><h3>{c.name}</h3><div className="muted small">{c.transport === "http" ? c.url : `${c.command} ${(c.args || []).join(" ")}`} · {c.source === "user" ? "yours" : `from plugin ${c.plugin}`}</div></div>
-              <div className="row gap-s">{!c.ready && <Badge kind="warn">needs key</Badge>}<Toggle checked={c.enabled} onChange={(v: boolean) => update(c, { enabled: v })} /></div>
+              <div className="grow" style={{ minWidth: 0 }}><h3>{c.name}</h3><div className="muted small ellipsis">{serverLine(c)} · {c.source === "user" ? "yours" : `from plugin ${c.plugin}`}</div>
+                {info.name && <div className="muted small">{info.title || info.name}{info.version ? ` ${info.version}` : ""}{info.protocol ? ` · MCP ${info.protocol}` : ""}{c.tool_count ? ` · ${c.tool_count} tool${c.tool_count === 1 ? "" : "s"}` : ""}{info.resources_count ? ` · ${info.resources_count} resource${info.resources_count === 1 ? "" : "s"}` : ""}{info.prompts_count ? ` · ${info.prompts_count} prompt${info.prompts_count === 1 ? "" : "s"}` : ""}</div>}</div>
+              <div className="row gap-s">{!c.ready && <Badge kind="warn">{oauth ? "sign in needed" : "needs key"}</Badge>}{oauth && c.signed_in && <Badge kind="ok">signed in</Badge>}<Toggle checked={c.enabled} onChange={(v: boolean) => update(c, { enabled: v })} /></div>
             </div>
             <div className="row gap-m wrap mt">
               <Field label="Ask before">
@@ -241,20 +365,30 @@ function Connectors() {
                   <option value="changes">Actions that change things</option><option value="always">Every action</option><option value="never">Never ask</option>
                 </select>
               </Field>
-              {c.source === "user" && c.auth === "bearer" && <Field label="Replace key"><input className="input" type="password" placeholder={c.has_token ? "saved ••••" : "paste key"} onBlur={(e) => e.target.value && update(c, { token: e.target.value })} /></Field>}
             </div>
-            <div className="row gap-s">
-              <Button small busy={t === "loading"} onClick={() => test(c)}>Test & list tools</Button>
+            <div className="row gap-s wrap">
+              <Button small busy={t === "loading"} onClick={() => test(c)}>{oauth && !c.signed_in ? "Sign in" : "Test & list tools"}</Button>
+              {oauth && c.signed_in && <Button small kind="ghost" onClick={async () => { await api.post(`/connectors/${enc(c.id)}/signout`); setTools((x) => ({ ...x, [c.id]: undefined })); load(); }}>Sign out</Button>}
+              {c.source === "user" && <Button small onClick={() => setEdit(c)}>Edit</Button>}
               {c.source === "user" && <ConfirmButton small icon={<Trash2 size={13} />} onConfirm={async () => { await api.del(`/connectors/${enc(c.id)}/delete`); load(); }}>Remove</ConfirmButton>}
               {c.source !== "user" && <button className="link" onClick={() => go("plugins")}>Settings are in its plugin</button>}
             </div>
-            {t && t !== "loading" && (t.ok ? (
-              <div className="tool-list">{t.tools.map((x: any) => <div key={x.name} className="small"><b>{x.name}</b> {x.readonly ? <Badge kind="ok">read-only</Badge> : <Badge kind="warn">changes</Badge>} <span className="muted">{x.description.slice(0, 140)}</span></div>)}</div>
-            ) : <div className="error-line">{t.error}</div>)}
+            {t === "loading" && oauth && !c.signed_in && <div className="note">Your browser is opening the service's sign-in page. Come back here when you have signed in.</div>}
+            {t && t !== "loading" && (t.ok ? (<>
+              <div className="tool-list">{t.tools.map((x: any) => <div key={x.name} className="small"><b>{x.title || x.name}</b> {x.readonly ? <Badge kind="ok">read-only</Badge> : x.destructive ? <Badge kind="bad">deletes or overwrites</Badge> : <Badge kind="warn">changes</Badge>} <span className="muted">{x.description.slice(0, 140)}</span></div>)}</div>
+              {t.resources?.length > 0 && <div className="tool-list"><div className="small"><b>Resources</b> <span className="muted">what the agent can read from it</span></div>
+                {t.resources.slice(0, 30).map((r: any) => <div key={r.uri} className="small"><span className="mono">{r.uri}</span> <span className="muted">{r.name}{r.description ? ` — ${r.description.slice(0, 100)}` : ""}</span></div>)}</div>}
+              {t.prompts?.length > 0 && <div className="tool-list"><div className="small"><b>Prompts</b> <span className="muted">ready-made requests the server offers</span></div>
+                {t.prompts.map((p: any) => <div key={p.name} className="small"><button className="link" onClick={() => setUsePrompt({ c, p })}>{p.title || p.name}</button> <span className="muted">{p.description.slice(0, 120)}</span></div>)}</div>}
+            </>) : <div className="error-line">{t.error}</div>)}
           </div>
         );
       })}
       {preset && <ConnectorForm preset={preset} onClose={() => setPreset(null)} onDone={load} />}
+      {edit && <ConnectorForm edit={edit} onClose={() => setEdit(null)} onDone={load} />}
+      {(dialog === "paste" || dialog === "found") && <ImportServers mode={dialog} onClose={() => setDialog("")} onDone={load} />}
+      {dialog === "export" && <ExportServers onClose={() => setDialog("")} />}
+      {usePrompt && <PromptUse c={usePrompt.c} p={usePrompt.p} onClose={() => setUsePrompt(null)} />}
     </div>
   );
 }

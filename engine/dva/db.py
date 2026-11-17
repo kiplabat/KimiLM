@@ -121,6 +121,13 @@ MIGRATIONS = [
     # set-up its planner made (what kind of run, the team, the limits, what it may do without asking)
     ("runs", "kind", "TEXT DEFAULT 'run'"),
     ("schedules", "setup_json", "TEXT DEFAULT '{}'"),
+    # 2.10.0: connectors as other apps describe MCP servers: type (stdio | http | sse), the names of custom
+    # headers (values are in the credential store, like env values now), a working folder, and what the server
+    # said about itself when it was last connected (name, version, protocol revision, capabilities)
+    ("connectors", "type", "TEXT DEFAULT ''"),
+    ("connectors", "headers_json", "TEXT DEFAULT '{}'"),
+    ("connectors", "cwd", "TEXT DEFAULT ''"),
+    ("connectors", "info_json", "TEXT DEFAULT '{}'"),
 ]
 
 
