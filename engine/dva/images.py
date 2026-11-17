@@ -34,7 +34,7 @@ from pathlib import Path
 import httpx
 
 from .db import new_id, now
-from .download import download, fetch_json
+from .download import DownloadStalled, download, fetch_json
 from .providers import cloud_id, month_key
 
 HF = "https://huggingface.co"
@@ -114,6 +114,26 @@ RATIOS = {"1:1": 1.0, "4:3": 4 / 3, "3:4": 3 / 4, "3:2": 1.5, "2:3": 2 / 3, "16:
 
 class ImageError(RuntimeError):
     pass
+
+
+class Flag:
+    """What the downloader asks to learn whether a download was cancelled (it calls is_set())."""
+    def __init__(self, state):
+        self.state = state
+
+    def is_set(self):
+        return bool(self.state.get("cancel"))
+
+
+async def fetch(url, dest, *, state, tries=8, **kw):
+    """Download a large file, continuing where it stopped when the connection stalls or drops."""
+    for attempt in range(tries):
+        try:
+            return await download(url, dest, cancel=Flag(state), **kw)
+        except (DownloadStalled, httpx.TransportError):
+            if attempt == tries - 1 or state.get("cancel"):
+                raise
+            await asyncio.sleep(3)
 
 
 def os_key():
@@ -445,9 +465,8 @@ class Images:
                     state.update(done=before + done, rate=rate)
                     publish()
                 if not (dest.exists() and f["size"] and dest.stat().st_size == f["size"]):
-                    await download(f"{HF}/{repo}/resolve/main/{quote(f['path'])}?download=true", dest,
-                                   headers=self._hf_headers(), expected_size=f["size"] or None, progress=progress,
-                                   cancel=lambda: state["cancel"])
+                    await fetch(f"{HF}/{repo}/resolve/main/{quote(f['path'])}?download=true", dest, state=state,
+                                headers=self._hf_headers(), expected_size=f["size"] or None, progress=progress)
                 before += f["size"]
                 files[slot] = str(dest)
             self.add_local(recipe["name"], files, recipe["defaults"], recipe=recipe["key"], licence=recipe["licence"],
