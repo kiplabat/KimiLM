@@ -203,7 +203,7 @@ class Evals:
         model = model or self.db.setting("default_model")
         run_id = new_id("eval_")
         self.db.insert("eval_runs", {"id": run_id, "created": now(), "version": VERSION, "model": model,
-                                     "status": "running", "results": [], "summary": {}})
+                                     "status": "running", "results": [], "summary": {}, "settings": self.settings()})
         self.current = {"id": run_id, "done": 0, "total": len(chosen), "task": chosen[0]["title"]}
         job = self.app.jobs.create("eval", "Evaluation", lambda row: self._run(run_id, model, chosen),
                                    model=model, payload={"eval": run_id})
@@ -281,6 +281,14 @@ class Evals:
             self.app.bus.publish("eval", run_id=run_id, done=len(results), total=len(tasks), finished=True)
             if not self.db.setting("eval_keep_files", False):
                 shutil.rmtree(root, ignore_errors=True)
+
+    # the settings that change how tasks are done: stored with each run, so two runs can be told apart
+    SETTINGS = ("agent_order", "team_mode", "step_rounds", "verify_results", "check_model", "lean_tools",
+                "escalate_models", "fit_context", "prompt_snapshots", "reading_budget_seconds",
+                "writing_budget_seconds", "learned_model_choice", "max_reply_tokens")
+
+    def settings(self):
+        return {k: self.db.setting(k) for k in self.SETTINGS}
 
     @staticmethod
     def summary(results, total):

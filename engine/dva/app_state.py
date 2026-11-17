@@ -48,6 +48,8 @@ DEFAULT_SETTINGS = {
     # model; check_model: "" (the planner's) | smallest | a model id; writing_budget_seconds: result length hint
     "resume_runs": "ask", "lean_tools": True, "escalate_models": True, "check_model": "",
     "writing_budget_seconds": 180,
+    # 2.8.0: learned_model_choice: a step whose model nobody fixed runs on the model that did such steps best here
+    "learned_model_choice": True, "runs_kept": 300,
 }
 CHAT_LIMIT_KEYS = ("max_reply_tokens", "max_steps", "time_limit_minutes", "temperature", "max_searches",
                    "max_tool_calls")
@@ -142,6 +144,50 @@ class App:
                 self.resume_run(row["chat_id"])
             except Exception as exc:
                 self.log(f"continuing run {row['id']}: {type(exc).__name__}: {exc}")
+
+    @staticmethod
+    def _run_summary(row, title=None):
+        state = row.get("state") or {}
+        tasks = state.get("tasks") or []
+        used = [t.get("used") or {} for t in tasks]
+        return {"id": row["id"], "chat_id": row["chat_id"], "title": title, "status": row["status"],
+                "created": row.get("created"), "updated": row.get("updated"), "resumes": row.get("resumes") or 0,
+                "request": (state.get("overall") or "")[:240], "total": len(tasks),
+                "done": sum(t.get("status") == "done" for t in tasks),
+                "failed": sum(t.get("status") == "failed" for t in tasks),
+                "incomplete": sum(bool(t.get("partial")) for t in tasks),
+                "rounds": sum(int(t.get("attempts") or 0) for t in tasks),
+                "tokens": sum(int(u.get("tokens") or 0) for u in used),
+                "read": sum(int(u.get("read") or 0) for u in used),
+                "cached": sum(int(u.get("cached") or 0) for u in used),
+                "written": sum(int(u.get("written") or 0) for u in used),
+                "seconds": sum(int(u.get("seconds") or 0) for u in used),
+                "models": sorted({t.get("model") for t in tasks if t.get("model")})}
+
+    def runs(self, limit=60):
+        """The history of planned runs, newest first."""
+        rows = self.db.all("SELECT r.*, c.title AS chat_title FROM runs r LEFT JOIN chats c ON c.id = r.chat_id "
+                           "ORDER BY r.created DESC LIMIT ?", (limit,))
+        return [self._run_summary(r, r.get("chat_title")) for r in rows]
+
+    def run_detail(self, run_id):
+        """One run with the timeline of every step."""
+        row = self.db.get("runs", run_id)
+        if not row:
+            return None
+        chat = self.db.get("chats", row["chat_id"]) or {}
+        state = row.get("state") or {}
+        steps = []
+        for t in state.get("tasks") or []:
+            model = self.models.get_any(t.get("model")) if t.get("model") else None
+            steps.append({k: t.get(k) for k in ("id", "name", "status", "attempts", "rounds", "depends_on", "harness",
+                                                "model", "partial", "note", "kit", "chat_id", "result_file", "forecast",
+                                                "used", "kind")}
+                         | {"goal": (t.get("goal") or "")[:500], "output": (t.get("output") or "")[:1500],
+                            "model_name": (model or {}).get("name") or t.get("model")})
+        return {**self._run_summary(row, chat.get("title")), "steps": steps, "log": state.get("log") or [],
+                "folder": state.get("dir"), "can_continue": bool(self.open_run(row["chat_id"]))
+                and (self.open_run(row["chat_id"]) or {}).get("id") == run_id}
 
     def open_run(self, chat_id):
         """The chat's latest run if it can be continued (stopped, or cut off by a crash or restart)."""

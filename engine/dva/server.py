@@ -288,6 +288,31 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         await A().runtime.unload((data or {}).get("model_id"))
         return {"ok": True}
 
+    @api.get("/api/runs")
+    async def runs_list(limit: int = 60):
+        """Planned runs, newest first, with what each one cost."""
+        return {"runs": A().runs(min(max(1, limit), 300))}
+
+    @api.get("/api/runs/{run_id}")
+    async def runs_get(run_id: str):
+        run = A().run_detail(run_id)
+        if not run:
+            raise KeyError("run")
+        return run
+
+    @api.get("/api/models/records")
+    async def models_records():
+        """How each kind of step has fared on each model on this computer (what model choice learns from)."""
+        a = A()
+        rows = a.db.all("SELECT * FROM step_stats ORDER BY harness, model_id")
+        return {"records": [{"harness": r["harness"], "model": r["model_id"],
+                             "model_name": (a.models.get_any(r["model_id"]) or {}).get("name") or r["model_id"],
+                             "judged": r.get("judged") or 0, "passed": r.get("passed") or 0,
+                             "rounds": round(float(r.get("rounds") or 0), 1), "runs": r.get("runs") or 0,
+                             "seconds": round(float(r.get("seconds") or 0)), "calls": round(float(r.get("calls") or 0), 1),
+                             "read_tps": round(float(r.get("read_tps") or 0), 1),
+                             "write_tps": round(float(r.get("write_tps") or 0), 1)} for r in rows]}
+
     @api.get("/api/evals")
     async def evals_list():
         """The built-in evaluation: its tasks, earlier runs, and the run in progress."""

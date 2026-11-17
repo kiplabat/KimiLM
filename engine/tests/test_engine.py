@@ -1354,6 +1354,7 @@ def test_the_evaluation_runs_tasks_and_keeps_the_numbers(engine):
     for r in run["results"]:
         assert isinstance(r["passed"], bool) and r["seconds"] >= 0 and r["chat_id"] and "read" in r, r
     assert run["summary"]["ran"] == 2 and run["summary"]["total"] == 2 and 0 <= run["summary"]["passed"] <= 2
+    assert run["settings"]["agent_order"] == "sequence" and "lean_tools" in run["settings"]      # what it ran with
     listed = {x["id"] for x in c.get("/api/chats").json()["chats"]} if isinstance(c.get("/api/chats").json(), dict) \
         else {x["id"] for x in c.get("/api/chats").json()}
     assert not ({r["chat_id"] for r in run["results"]} & listed)                           # not in the chat list
@@ -1404,3 +1405,51 @@ def test_the_evaluation_checks_judge_files_and_replies(tmp_path):
                                 {"passed": False}], 12) == {
         "passed": 1, "ran": 2, "total": 12, "seconds": 3, "read": 100, "cached": 300, "written": 20,
         "agent_tokens": 0, "cache_percent": 75}
+
+
+# ---------------------------------------------------------------- 2.8.0: history, learned model choice
+def test_runs_are_kept_with_their_timeline(engine):
+    c = engine["client"]
+    chat, status, msg = run_team(c, "As a team with a forgetful plan: find greetings, summarise them, publish.")
+    assert status == "done"
+    runs = c.get("/api/runs").json()["runs"]
+    mine = next(r for r in runs if r["chat_id"] == chat["id"])
+    assert mine["status"] == "done" and (mine["done"], mine["total"], mine["failed"]) == (3, 3, 0), mine
+    assert mine["tokens"] > 0 and mine["read"] + mine["cached"] > 0 and mine["rounds"] == 3 and mine["models"]
+    assert "forgetful plan" in mine["request"]
+    detail = c.get(f"/api/runs/{mine['id']}").json()
+    assert [s["id"] for s in detail["steps"]] == ["t1", "t2", "t3"] and detail["can_continue"] is False
+    for step in detail["steps"]:
+        assert step["status"] == "done" and step["used"]["calls"] >= 1 and step["model_name"] and step["kit"], step
+    assert any(line["text"].startswith("Planned 3 tasks") for line in detail["log"])
+    assert c.get("/api/runs/nope").status_code == 404
+    # every judged step is counted for its harness and model
+    records = c.get("/api/models/records").json()["records"]
+    agent = next(r for r in records if r["harness"] == "agent")
+    assert agent["judged"] >= 3 and agent["passed"] >= 3 and agent["model_name"]
+
+
+def test_model_choice_learns_from_measured_steps(tmp_path):
+    from dva.db import DB
+    from dva.forecast import Forecaster
+
+    class App:
+        db = DB(tmp_path / "t.db")
+    fc = Forecaster(App())
+
+    def history(model, passed, failed, seconds):
+        for i in range(passed + failed):
+            fc.judge("coder", model, i < passed)
+        fc.db.update("step_stats", fc.key("coder", model), {"seconds": seconds}, key="key")
+    history("small", 1, 5, 60)        # the usual model fails this kind of step
+    history("big", 5, 1, 200)
+    history("new", 1, 0, 10)          # one step is not enough to judge a model
+    picked, why = fc.choose("coder", "small", ["small", "big", "new"])
+    assert picked == "big" and "5 of 6" in why and "1 of 6" in why
+    assert fc.choose("coder", "big", ["small", "big", "new"]) == ("big", None)        # nothing better: stay
+    history("quick", 9, 1, 80)        # as reliable as "big", well under 70% of its time
+    picked, why = fc.choose("coder", "big", ["small", "big", "quick"])
+    assert picked == "quick" and "as reliably" in why
+    assert fc.choose("writer", "small", ["small", "big"]) == ("small", None)          # no record for this harness
+    rec = fc.record_of("coder", "quick")
+    assert rec["judged"] == 10 and rec["passed"] == 9 and abs(rec["rate"] - 0.9) < 1e-9

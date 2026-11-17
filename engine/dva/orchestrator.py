@@ -221,6 +221,7 @@ def lean_kit(goal, harness_groups=None):
 
 # the fields of a step that are saved so a run can continue after a stop, a crash or a restart
 SAVED = ("id", "name", "goal", "done_when", "depends_on", "role", "harness", "agent", "model", "limits", "status",
+         "auto_model", "chosen", "kit", "started_at",
          "attempts", "output", "files", "loop", "expects", "rounds", "feedback", "partial", "note", "result_file",
          "chat_id", "used", "forecast", "brief_tokens", "kind", "best", "error", "result_state", "full_kit")
 
@@ -281,7 +282,10 @@ class Orchestra:
                 self.db.update("runs", self.id, row)
             else:                             # a new run in this chat replaces older ones that were left open
                 self.db.run("UPDATE runs SET status='superseded' WHERE chat_id=? AND status IN "
-                                "('interrupted','stopped','running')", (self.turn.chat["id"],))
+                            "('interrupted','stopped','running')", (self.turn.chat["id"],))
+                keep = int(self.db.setting("runs_kept", 300))        # the history keeps the newest runs
+                self.db.run("DELETE FROM runs WHERE id NOT IN (SELECT id FROM runs ORDER BY created DESC LIMIT ?)",
+                            (keep,))
                 self.db.insert("runs", {"id": self.id, "created": now(), **row})
         except Exception as exc:              # saving must never stop a run
             self.app.log(f"saving run {self.id}: {type(exc).__name__}: {exc}")
@@ -460,8 +464,11 @@ class Orchestra:
             self.tasks[t["id"]] = t
             self.settled[t["id"]] = asyncio.Event()
         self._order()
-        self.turn.assign_models([t for t in self.tasks.values() if t["status"] == "waiting" and
-                                 (not t.get("model") or str(t["model"]).startswith("role:") or t["model"] == "auto")])
+        auto = [t for t in self.tasks.values() if t["status"] == "waiting" and
+                (not t.get("model") or str(t["model"]).startswith("role:") or t["model"] == "auto")]
+        for t in auto:
+            t["auto_model"] = True             # nobody fixed its model: it may be chosen from measured results
+        self.turn.assign_models(auto)
 
     def preset(self, items):
         """Steps given directly (team builder with tasks, the delegate tool): no planning call."""
@@ -760,6 +767,14 @@ class Orchestra:
         model = t.get("model") or self.turn.model_id
         if model and not self.app.models.get_any(model):
             model = self.turn.model_id
+        if t.get("auto_model") and not t.get("chat_id") and not t.get("chosen") and not is_cloud(model) \
+                and self.db.setting("learned_model_choice", True):
+            t["chosen"] = True                 # once per step: from what steps like this did on each model here
+            picked, why = self.app.forecaster.choose(t.get("harness") or "agent", model,
+                                                     [c["id"] for c in self.app.router.local()])
+            if why and picked != model:
+                self.logline(f"{t['id']} runs on {self.model_name(picked)}: {why}.")
+                model = picked
         t["model"] = model
         if fresh:                                   # a new agent with an empty context
             if t.get("chat_id"):
@@ -992,6 +1007,7 @@ class Orchestra:
             met, reason = await self.verify(t)
             if met:
                 t["kind"] = None
+                self.judge(t, True)
                 self.settle(t, "done", None if t["attempts"] == 1 else f"passed in round {t['attempts']}")
                 self.logline(f"Accepted {t['id']}" + (f" in round {t['attempts']}" if t["attempts"] > 1 else "") + ".")
                 return
@@ -1046,10 +1062,19 @@ class Orchestra:
             return
         self.logline(f"{t['id']} moves from {self.model_name(t['model'])} to {self.model_name(strong)}: "
                      "the same objection came twice.")
+        self.judge(t, False)                   # the first model did not manage this step
         t["model"] = strong
+
+    def judge(self, t, passed):
+        """Remember how this kind of step went on this model (model choice learns from it)."""
+        try:
+            self.app.forecaster.judge(t.get("harness") or "agent", t["model"], passed, t.get("attempts") or 1)
+        except Exception as exc:
+            self.app.log(f"recording the verdict on {t['id']}: {type(exc).__name__}: {exc}")
 
     def exhausted(self, t, why):
         """The rounds are used up: keep the best attempt if it is usable, else the step fails."""
+        self.judge(t, False)
         best = t.get("best") or {}
         if best and not best.get("hard") and best.get("output"):
             t["output"], t["files"] = best["output"], best["files"] or t.get("files") or []

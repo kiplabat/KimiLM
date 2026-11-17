@@ -7,9 +7,26 @@ import { Badge, Button, Field, FolderInput, PageHeader, Toggle } from "../compon
 // The built-in evaluation: twelve small tasks with answers that code checks. It turns "is this setup good?" into
 // numbers that can be compared between models, settings and versions.
 function EvaluationCard() {
-  const { toast } = useApp();
+  const { toast, boot } = useApp();
   const [data, setData] = useState<any>(null);
   const [open, setOpen] = useState<string | null>(null);
+  const [model, setModel] = useState("");
+  const [picked, setPicked] = useState<string[]>([]);       // up to two runs to compare
+  const pick = (id: string) => setPicked((p) => p.includes(id) ? p.filter((x) => x !== id) : [...p.slice(-1), id]);
+  const save = (name: string, text: string, type: string) => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([text], { type }));
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  };
+  const exportRuns = () => {
+    const q = (v: any) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+    const lines = ["run,when,version,model,task,passed,seconds,read,cached,written,agent_tokens,model_calls,tools,planned,error"];
+    for (const r of data.runs) for (const t of r.results || [])
+      lines.push([r.id, r.created, r.version, r.model, t.id, t.passed ? 1 : 0, t.seconds ?? "", t.read ?? "", t.cached ?? "", t.written ?? "", t.agent_tokens ?? "", t.calls ?? "", t.tools ?? "", t.planned ? 1 : 0, t.error || ""].map(q).join(","));
+    save("kimilm-evaluation.csv", lines.join("\n") + "\n", "text/csv");
+  };
   const load = () => api.get("/evals").then(setData).catch(() => {});
   useEffect(() => { load(); }, []);
   useEffect(() => {
@@ -19,7 +36,10 @@ function EvaluationCard() {
   }, [!!data?.current]);
   const dur = (sec: number) => sec < 90 ? `${Math.round(sec)} s` : sec < 5400 ? `${Math.round(sec / 60)} min` : `${(sec / 3600).toFixed(1)} h`;
   const k = (n: number) => n >= 10000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n || 0);
-  const run = async () => { try { await api.post("/evals/run", {}); load(); } catch (e: any) { toast(e.message, "error"); } };
+  const run = async () => { try { await api.post("/evals/run", model ? { model } : {}); load(); } catch (e: any) { toast(e.message, "error"); } };
+  const two = picked.map((id) => data?.runs?.find((r: any) => r.id === id)).filter(Boolean);
+  const [a, b] = two.length === 2 ? [...two].sort((x: any, y: any) => String(x.created).localeCompare(String(y.created))) : [null, null];
+  const changed = a && b ? Object.keys({ ...(a.settings || {}), ...(b.settings || {}) }).filter((key) => JSON.stringify(a.settings?.[key]) !== JSON.stringify(b.settings?.[key])) : [];
   return (
     <div className="card stack-s">
       <h3>Check this setup</h3>
@@ -28,14 +48,22 @@ function EvaluationCard() {
         {data?.current
           ? <><span className="small"><b>Running:</b> task {data.current.done + 1} of {data.current.total} · {data.current.task}</span>
               <Button small kind="ghost" onClick={async () => { await api.post("/evals/stop"); load(); }}>Stop</Button></>
-          : <Button small onClick={run}>Run the evaluation</Button>}
+          : <>
+              <select className="input" style={{ maxWidth: 280 }} value={model} onChange={(e) => setModel(e.target.value)} title="The model to test">
+                <option value="">Default model</option>
+                {(boot?.models || []).map((m: any) => <option key={m.id} value={m.id}>{m.name}</option>)}
+              </select>
+              <Button small onClick={run}>Run the evaluation</Button>
+              {data?.runs?.length > 0 && <Button small kind="ghost" onClick={exportRuns}>Export all results (CSV)</Button>}
+            </>}
       </div>
+      {data?.runs?.length > 1 && <div className="small muted">Tick two runs to compare them task by task.</div>}
       {data?.runs?.length > 0 && <div className="eval-runs">
         <div className="eval-row eval-head small muted"><span>When</span><span>Version</span><span>Model</span><span>Passed</span><span>Time</span><span>Read</span><span>From cache</span><span>Written</span></div>
         {data.runs.map((r: any) => (
           <div key={r.id}>
             <div className="eval-row small" onClick={() => setOpen(open === r.id ? null : r.id)} title="Show each task">
-              <span>{new Date(r.created).toLocaleString()}</span><span>{r.version}</span><span className="ellipsis">{r.model || "default"}</span>
+              <span><input type="checkbox" checked={picked.includes(r.id)} onClick={(e) => e.stopPropagation()} onChange={() => pick(r.id)} title="Compare" />{new Date(r.created).toLocaleString()}</span><span>{r.version}</span><span className="ellipsis">{r.model || "default"}</span>
               <span><b>{r.summary?.passed ?? 0} of {r.summary?.total ?? "?"}</b>{r.status !== "done" ? ` (${r.status})` : ""}</span>
               <span>{dur(r.summary?.seconds || 0)}</span><span>{k(r.summary?.read)}</span><span>{r.summary?.cache_percent ?? 0}%</span><span>{k(r.summary?.written)}</span>
             </div>
@@ -50,6 +78,19 @@ function EvaluationCard() {
             </div>}
           </div>
         ))}
+      </div>}
+      {a && b && <div className="eval-compare">
+        <div className="eval-cmp-row eval-head small muted"><span>Task</span><span>{a.version} · {a.model || "default"}</span><span>{b.version} · {b.model || "default"}</span><span>Change</span></div>
+        {(data.tasks || []).map((t: any) => {
+          const x = (a.results || []).find((r: any) => r.id === t.id), y = (b.results || []).find((r: any) => r.id === t.id);
+          if (!x && !y) return null;
+          const cell = (r: any) => r ? <span><span className={r.passed ? "ok" : "bad"}>{r.passed ? "passed" : "failed"}</span> <span className="muted">{dur(r.seconds || 0)}</span></span> : <span className="muted">not run</span>;
+          const delta = x && y ? (x.passed !== y.passed ? (y.passed ? "now passes" : "now fails") : x.seconds > 0 && Math.round(100 * (y.seconds - x.seconds) / x.seconds) !== 0 ? `${y.seconds >= x.seconds ? "+" : "−"}${Math.abs(Math.round(100 * (y.seconds - x.seconds) / x.seconds))}% time` : "same") : "";
+          return <div key={t.id} className="eval-cmp-row small"><span>{t.title}</span>{cell(x)}{cell(y)}<span className={delta === "now passes" ? "ok" : delta === "now fails" ? "bad" : "muted"}>{delta}</span></div>;
+        })}
+        <div className="eval-cmp-row small"><b>Total</b><span><b>{a.summary?.passed} of {a.summary?.total}</b> · {dur(a.summary?.seconds || 0)} · {a.summary?.cache_percent}% from cache</span>
+          <span><b>{b.summary?.passed} of {b.summary?.total}</b> · {dur(b.summary?.seconds || 0)} · {b.summary?.cache_percent}% from cache</span><span /></div>
+        <div className="small muted" style={{ padding: "8px 12px" }}>{changed.length ? <>Settings that differ: {changed.map((key) => `${key} ${JSON.stringify(a.settings?.[key])} → ${JSON.stringify(b.settings?.[key])}`).join("; ")}</> : "Both runs used the same settings."}</div>
       </div>}
     </div>
   );
@@ -148,6 +189,7 @@ export default function Settings() {
         <Toggle checked={s.unload_after_run ?? false} onChange={(v: boolean) => set({ unload_after_run: v })} label="Unload the planner's model as well when a run ends (scheduled runs always do)" />
         <Toggle checked={(s.resume_runs || "ask") === "auto"} onChange={(v: boolean) => set({ resume_runs: v ? "auto" : "ask" })} label="Continue runs that were cut off (app closed, restart, crash) by themselves when the app starts; otherwise the chat offers a Continue button" />
         <Toggle checked={s.lean_tools ?? true} onChange={(v: boolean) => set({ lean_tools: v })} label="Give each step only the tools its goal calls for (all of them on a fresh attempt)" />
+        <Toggle checked={s.learned_model_choice ?? true} onChange={(v: boolean) => set({ learned_model_choice: v })} label="Choose each step's model from how such steps went on this computer (Activity → Models' record); models you fix yourself are never changed" />
         <Toggle checked={s.escalate_models ?? true} onChange={(v: boolean) => set({ escalate_models: v })} label="Move a step to a stronger model when it fails the same way twice" />
         <Field label="Who checks results" help="A smaller model checks in a fraction of the time, but may judge less well. Run the evaluation below with each choice and compare.">
           <select className="input" value={s.check_model || ""} onChange={(e) => set({ check_model: e.target.value })}>

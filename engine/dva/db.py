@@ -111,6 +111,12 @@ MIGRATIONS = [
     ("chats", "agent_name", "TEXT"),
     ("projects", "notes", "TEXT DEFAULT ''"),               # living project notes (2.4.0)
     ("projects", "memory_mode", "TEXT DEFAULT 'shared'"),   # shared | isolated (2.4.0)
+    # how steps of a harness fared on a model (2.8.0): judged = steps with a verdict, passed = accepted complete,
+    # rounds = average rounds a step took
+    ("step_stats", "judged", "INTEGER DEFAULT 0"),
+    ("step_stats", "passed", "INTEGER DEFAULT 0"),
+    ("step_stats", "rounds", "REAL DEFAULT 0"),
+    ("eval_runs", "settings_json", "TEXT DEFAULT '{}'"),    # the settings an evaluation ran with (2.8.0)
 ]
 
 
