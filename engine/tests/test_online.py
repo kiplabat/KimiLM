@@ -14,7 +14,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from test_engine import ENGINE, TESTS, free_port, last_assistant, tiny_gguf, wait_job
+from test_engine import ENGINE, TESTS, free_port, last_assistant, tiny_gguf, wait_job, wait_picture
 
 
 @pytest.fixture(scope="module")
@@ -213,6 +213,78 @@ def test_local_only_privacy_mode(env):
     assert wait_job(c, job["job_id"], approve="allow")["status"] == "done"
     assert last_assistant(c, chat["id"])["meta"]["online"]
     c.put("/api/online/settings", json={"cloud_privacy": "ask"})
+
+
+def test_online_pictures_with_openai_and_google_and_not_with_claude(env):
+    c, tmp = env["c"], env["tmp"]
+    from PIL import Image
+    state = c.get("/api/images").json()
+    assert {p["id"]: p["ready"] for p in state["online"]} == {"openai": True, "google": True}
+    assert not state["engines"]["installed"] and not state["models"]
+    # Claude reads pictures and does not make them: said plainly, not offered as an image model
+    for call in (c.get("/api/images/online/anthropic/models"),
+                 c.post("/api/images/models", json={"kind": "online", "provider": "anthropic", "remote_id": "claude-test-opus"})):
+        assert call.status_code == 400 and "Claude reads pictures but does not make them" in call.json()["error"]
+    # the image models are read from each provider's own list (their names change often)
+    assert c.get("/api/images/online/openai/models").json() == {"models": ["gpt-image-test"], "from": "provider"}
+    assert c.get("/api/images/online/google/models").json() == {"models": ["gemini-test-flash-image"], "from": "provider"}
+    assert "gpt-image-test" not in {m["remote_id"] for m in c.get("/api/online").json()["models"]}     # not a chat model
+    gpt = c.post("/api/images/models", json={"kind": "online", "provider": "openai", "remote_id": "gpt-image-test"}).json()
+    gem = c.post("/api/images/models", json={"kind": "online", "provider": "google",
+                                             "remote_id": "models/gemini-test-flash-image"}).json()
+    assert gpt["ready"] and gpt["default"] and gem["remote_id"] == "gemini-test-flash-image" and gem["ready"]
+    before = c.get("/api/online/usage").json()["spent"]
+
+    made = wait_picture(c, c.post("/api/images/generate", json={"prompt": "a lighthouse at dusk", "count": 2,
+                                                                "width": 1248, "height": 832}).json()["id"])
+    assert made["state"] == "done" and len(made["images"]) == 2, made
+    with Image.open(made["images"][0]["path"]) as img:
+        assert img.size == (64, 48)
+    sent = [r for r in cloud_requests(env, "openai-images")][-1]
+    assert sent["body"] == {"model": "gpt-image-test", "prompt": "a lighthouse at dusk", "n": 2, "size": "1536x1024"}
+    assert sent["headers"]["authorization"] == "Bearer sk-test"
+    usage = c.get("/api/online/usage").json()
+    assert round(usage["spent"] - before, 4) == 0.08                           # counted against the monthly budget
+    assert any(p["purpose"] == "image" and p["calls"] == 1 for p in usage["by_purpose"])
+    assert made["images"][0]["params"]["cost"] == 0.08 and made["images"][0]["source"] == "online"
+    # changing a picture sends the picture itself (OpenAI: a form with the file; Google: inside the request)
+    source = made["images"][0]["path"]
+    wait_picture(c, c.post("/api/images/generate", json={"prompt": "add a boat", "image": source}).json()["id"])
+    sent = cloud_requests(env, "openai-images")[-1]
+    assert sent["edit"] and sent["body"]["images"] == [Path(source).name] and sent["body"]["bytes"][0] == Path(source).stat().st_size
+    assert sent["body"]["prompt"] == "add a boat" and sent["body"]["model"] == "gpt-image-test"
+    g = wait_picture(c, c.post("/api/images/generate", json={"prompt": "a harbour", "model": gem["id"], "width": 768,
+                                                             "height": 1360}).json()["id"])
+    assert g["state"] == "done" and g["images"][0]["model_name"] == "Google · gemini-test-flash-image", g
+    sent = cloud_requests(env, "gemini-images")[-1]
+    assert sent["model"] == "gemini-test-flash-image" and sent["headers"]["x-goog-api-key"] == "gm-test"
+    assert sent["body"]["generationConfig"] == {"responseModalities": ["IMAGE"], "imageConfig": {"aspectRatio": "9:16"}}
+    assert sent["body"]["contents"][0]["parts"] == [{"text": "a harbour"}]
+    wait_picture(c, c.post("/api/images/generate", json={"prompt": "add fog", "model": gem["id"], "image": source}).json()["id"])
+    part = cloud_requests(env, "gemini-images")[-1]["body"]["contents"][0]["parts"][1]["inlineData"]
+    assert part["mimeType"] == "image/png" and len(part["data"]) > 50
+    # a provider's refusal is passed on in its own words; an exhausted budget stops online pictures
+    no = wait_picture(c, c.post("/api/images/generate", json={"prompt": "a forbidden picture"}).json()["id"])
+    assert no["state"] == "failed" and "rejected by the safety system" in no["error"]
+    c.put("/api/online/settings", json={"cloud_budget_monthly": 0.000001})
+    broke = wait_picture(c, c.post("/api/images/generate", json={"prompt": "a lighthouse"}).json()["id"])
+    assert broke["state"] == "failed" and "budget" in broke["error"]
+    c.put("/api/online/settings", json={"cloud_budget_monthly": 10})
+
+    # an agent on a local model asks before a prompt goes to an online image model; declined, nothing is sent
+    count = len(cloud_requests(env, "openai-images"))
+    chat = chat_with(c, env["local"])
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "paint a picture of a red kite"}).json()
+    assert wait_job(c, job["job_id"], approve="deny")["status"] == "done"
+    step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
+    assert step["declined"] and "media" not in step and len(cloud_requests(env, "openai-images")) == count
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "paint a picture of a red kite"}).json()
+    assert wait_job(c, job["job_id"], approve="allow")["status"] == "done"
+    step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
+    assert step["ok"] and step["media"][0]["source"] == "online" and "about US$0.04" in step["result"]
+    assert cloud_requests(env, "openai-images")[-1]["body"]["prompt"] == "a red kite"
+    for m in (gpt, gem):
+        c.delete(f"/api/images/models/{m['id']}")
 
 
 # ------------------------------------------------------------------------------------------- adapters, offline

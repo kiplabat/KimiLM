@@ -213,6 +213,8 @@ KIT_WORDS = {
     "skills": r"skill",
     "automation": r"schedul|harness|every (day|week|hour|morning)|recurring|remind",
     "vision": r"image|photo|picture|screenshot|video|diagram|scan",
+    "images": r"image|picture|illustrat|logo|poster|draw|artwork|icon\b|banner|cover art|thumbnail|wallpaper|"
+              r"photo of|retouch|inpaint|change the background",
 }
 
 

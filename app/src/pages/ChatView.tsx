@@ -5,6 +5,7 @@ import {
   ShieldCheck, Sparkles, Trash2, Users, Workflow, X, XCircle,
 } from "lucide-react";
 import { api, desktop, fileUrl, fmtBytes, fmtTime } from "../api";
+import { PictureGrid } from "../components/Pictures";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, Markdown, Spinner, Toggle } from "../components/ui";
 import { Composer, ConnectorPicker, FolderPicker, HarnessPicker, LimitsPicker, ModelPicker, TeamPicker, ThinkingToggle, uploadAll } from "../components/Pickers";
@@ -23,6 +24,7 @@ function ToolCard({ step, approval, onDecide }: any) {
         {state === "declined" && <Badge>declined</Badge>}
         {state === "blocked" && <Badge kind="warn" title="The loop guard stopped a repeated or over-limit call">repeat stopped</Badge>}
       </div>
+      {step.media?.length > 0 && <div className="tool-media"><PictureGrid items={step.media} large={step.media.length === 1} /></div>}
       {approval && (
         <div className="approval">
           {approval.tool === "send_to_online_model" ? <>
@@ -577,7 +579,7 @@ export default function ChatView({ chatId }: { chatId: string }) {
         return { ...l, steps };
       }); break;
       case "tool_call": update((l) => ({ ...l, steps: [...l.steps.map((s: any) => s.type === "text" ? { ...s, closed: true } : s), { ...e.call, type: "tool", state: "running" }], status: e.call.label || "Working…" })); break;
-      case "tool_result": update((l) => ({ ...l, steps: l.steps.map((s: any) => s.id === e.call_id ? { ...s, state: "done", ok: e.ok, result: e.result, declined: e.declined, blocked: e.blocked } : s) })); break;
+      case "tool_result": update((l) => ({ ...l, steps: l.steps.map((s: any) => s.id === e.call_id ? { ...s, state: "done", ok: e.ok, result: e.result, declined: e.declined, blocked: e.blocked, media: e.media || undefined } : s) })); break;
       case "approval": update((l) => {
         const lastTool = [...l.steps].reverse().find((s: any) => s.type === "tool" && s.state === "running");
         return { ...l, approvals: [...l.approvals, { ...e, call_id: lastTool?.id }], status: "Waiting for your approval" };

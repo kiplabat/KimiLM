@@ -424,6 +424,8 @@ class Turn:
             groups.discard("python")
         if not self.vision:
             groups.discard("vision")
+        if not self.app.images.available():   # no image model is set up: the picture tools would only fail
+            groups.discard("images")
         if self.chat.get("parent_chat_id"):   # agents in a team do not start their own teams
             groups.discard("agents")
         return groups
@@ -1121,8 +1123,21 @@ class Turn:
                     self.private.add("files")        # the tool sends the picture itself: ask first
                     await self.before_model_call([])
                 self.app.jobs.progress(self.job["id"], f"{tool.label or tool.name}")
-                result = await tool.func(self.ctx, **(call["arguments"] or {}))
+                self.ctx.notes.pop("media", None)
+                # a picture made on this computer needs memory: this turn's text model is given back meanwhile
+                # (it is unloaded only if the image model does not fit beside it) and taken again afterwards
+                lend = tool.group == "images" and not is_cloud(self.model_id) and self.app.images.local_default()
+                if lend:
+                    await self.drop_model()
+                try:
+                    result = await tool.func(self.ctx, **(call["arguments"] or {}))
+                finally:
+                    if lend:
+                        await self.hold_model()
                 ok = True
+                made = self.ctx.notes.pop("media", None)
+                if made:                             # pictures the tool made: the chat shows them in the step
+                    step["media"] = made
                 if tool.group in ("files", "vision", "python"):
                     self.private.add("files")
                 if call["name"] in PRIVATE_MEMORY_TOOLS:
@@ -1141,7 +1156,7 @@ class Turn:
                           changed=bool(ok and tool and (tool.changes or call["name"] == "use_connector_tool")))
         step.update(ok=ok, result=result[:4000])
         self.emit("tool_result", call_id=call["id"], ok=ok, result=result[:4000], declined=step.get("declined", False),
-                  blocked=bool(blocked))
+                  blocked=bool(blocked), media=step.get("media"))
         limit = self.result_limit()
         if len(result) > limit:
             result = result[:limit] + f"\n…(trimmed; {len(result) - limit:,} more characters)"

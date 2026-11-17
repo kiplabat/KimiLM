@@ -9,6 +9,7 @@ from .embed import Embedder
 from .events import EventBus
 from .forecast import Forecaster
 from .harness import Harnesses
+from .images import Images
 from .jobs import Jobs
 from .knowledge import Knowledge
 from .llm import LLM
@@ -31,7 +32,7 @@ STATE = None
 DEFAULT_SETTINGS = {
     "default_harness": "agent", "default_compute": "auto", "default_ctx": 8192, "max_reply_tokens": 2048,
     "unload_after_minutes": 20, "memory_enabled": True, "learn_enabled": True, "learn_delay_seconds": 45,
-    "allow_python": True, "approval_timeout_minutes": 360, "max_native_tools": 36, "python_timeout_seconds": 180,
+    "allow_python": True, "approval_timeout_minutes": 360, "max_native_tools": 38, "python_timeout_seconds": 180,
     "max_loaded_models": 3, "browser_search": True, "max_parallel_agents": 4, "turn_time_limit_minutes": 30,
     "cloud_privacy": "ask", "cloud_budget_monthly": 10.0, "cloud_max_parallel": 4,
     "team_mode": "auto", "max_team_tasks": 8, "team_time_limit_minutes": 120,
@@ -53,6 +54,9 @@ DEFAULT_SETTINGS = {
     # 2.9.0: long-running tasks. Default limits of a new task (hours of work, steps, minutes one step may take);
     # mission_auto_resume: a task that was cut off by a restart or a crash continues by itself at start
     "mission_hours": 8, "mission_steps": 40, "mission_step_minutes": 45, "mission_auto_resume": True,
+    # 2.11.0: pictures. image_compute: auto | cpu | vulkan | cuda | metal (which build of the image engine works);
+    # image_timeout_minutes: one request on this computer is stopped after this long
+    "image_compute": "auto", "image_timeout_minutes": 60,
 }
 CHAT_LIMIT_KEYS = ("max_reply_tokens", "max_steps", "time_limit_minutes", "temperature", "max_searches",
                    "max_tool_calls")
@@ -89,6 +93,7 @@ class App:
         self.jobs = Jobs(self)
         self.scheduler = Scheduler(self)
         self.services = Services(self)
+        self.images = Images(self)
         self.approvals = {}
         self.pauses = {}          # chat id -> {"event", "reason"}: paused agent loops (orchestrator.pause_chat)
         self.orchestras = {}      # chat id -> running Orchestra (a team led from that chat)
@@ -106,6 +111,10 @@ class App:
         if self.db.setting("max_native_tools") == 28 and not self.db.setting("native_tools_2_9"):
             self.db.set_setting("max_native_tools", 36)
         self.db.set_setting("native_tools_2_9", True)
+        # 2.11.0 adds two picture tools (offered once an image model is set up): the default moves again.
+        if self.db.setting("max_native_tools") == 36 and not self.db.setting("native_tools_2_11"):
+            self.db.set_setting("max_native_tools", 38)
+        self.db.set_setting("native_tools_2_11", True)
 
     def _release_pending_after_restart(self):
         """Follow-ups queued while a reply was running are not sent if the app closed meanwhile: they show as

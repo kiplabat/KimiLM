@@ -60,6 +60,14 @@ CREATE TABLE IF NOT EXISTS usage (
   input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0, cost REAL DEFAULT 0, estimated INTEGER DEFAULT 0);
 CREATE INDEX IF NOT EXISTS usage_month ON usage(month);
 CREATE INDEX IF NOT EXISTS usage_chat ON usage(chat_id);
+CREATE TABLE IF NOT EXISTS image_models (
+  id TEXT PRIMARY KEY, kind TEXT, name TEXT, recipe TEXT DEFAULT '', provider TEXT DEFAULT '', remote_id TEXT DEFAULT '',
+  files_json TEXT DEFAULT '{}', settings_json TEXT DEFAULT '{}', size INTEGER DEFAULT 0, licence TEXT DEFAULT '',
+  added TEXT, last_used TEXT);
+CREATE TABLE IF NOT EXISTS media (
+  id TEXT PRIMARY KEY, kind TEXT, path TEXT, chat_id TEXT, prompt TEXT DEFAULT '', model TEXT, model_name TEXT,
+  source TEXT, params_json TEXT DEFAULT '{}', created TEXT);
+CREATE INDEX IF NOT EXISTS media_chat ON media(chat_id);
 CREATE TABLE IF NOT EXISTS kb_docs (
   id TEXT PRIMARY KEY, project_id TEXT, name TEXT, path TEXT, size INTEGER DEFAULT 0, status TEXT, error TEXT,
   chunks INTEGER DEFAULT 0, chars INTEGER DEFAULT 0, added TEXT, updated TEXT);
