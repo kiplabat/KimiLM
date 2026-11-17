@@ -10,6 +10,9 @@ Loop harnesses (mode):
             each starts when the results it needs are accepted, every result is checked and sent round again
             until it passes, then the planner writes the answer. "agent" and "planner" turns hand multi-step
             requests to it automatically (Settings → Teams), and the delegate tool uses it too.
+  mission   a long-running task (missions.py, 2.9.0): the planner keeps its understanding of the problem, gives
+            one step at a time to an agent, reads the handoff the agent leaves and decides the next step from
+            it, changing the plan when the findings call for it, until the task is done or a limit is reached.
 Pipeline harnesses: a Python program run as a task; its output streams into the chat.
 
 Every tool-using turn has a loop guard: repeated or near-identical calls are refused (the model is told why), tools
@@ -229,6 +232,10 @@ class Turn:
         self.unload_after = set()                 # models to unload when this turn ends
         self.auto_approve = bool(job.get("payload", {}).get("auto_approve")) or \
             self.db.setting(f"chat_auto_approve:{chat_id}", False)
+        # What this turn may do without asking (2.9.0): {"allow": [tool groups]} set when a scheduled or
+        # long-running task was set up. Anything outside it still asks (and notifies), so an unattended run
+        # never does more than was agreed.
+        self.policy = job.get("payload", {}).get("policy") or self.db.setting(f"chat_policy:{chat_id}", None)
         self.allowed_always = set(self.db.setting(f"chat_allow:{chat_id}", []) or [])
         self.ctx = None
         self.server = None
@@ -363,6 +370,8 @@ class Turn:
             return True
         if (self.auto_approve and not ignore_auto) or tool.name in self.allowed_always:
             return True
+        if self.policy and not ignore_auto and tool.group in (self.policy.get("allow") or []):
+            return True
         approval_id = new_id("ap_")
         fut = asyncio.get_running_loop().create_future()
         self.app.approvals[approval_id] = {"future": fut, "chat_id": self.chat["id"], "job_id": self.job["id"],
@@ -491,7 +500,7 @@ class Turn:
 
     def _delegate_tool(self):
         harness_ids = [h["id"] for h in self.app.harnesses.all() if h.get("type") == "loop"
-                       and h.get("mode") not in ("team",) and h.get("enabled", True)]
+                       and h.get("mode") not in ("team", "mission") and h.get("enabled", True)]
 
         async def delegate(ctx, tasks):
             """Runs through the orchestrator: steps run in order, each waits for the results it needs, and every
@@ -706,7 +715,7 @@ class Turn:
             return
         mode = self.harness.get("mode", "agent")
         team_mode = self.db.setting("team_mode", "auto")
-        likely = mode == "team" or bool((self.job.get("payload") or {}).get("resume_run")) or (mode in ("agent", "planner") and (
+        likely = mode in ("team", "mission") or bool((self.job.get("payload") or {}).get("resume_run")) or (mode in ("agent", "planner") and (
             team_mode == "always" or (team_mode == "auto" and looks_multistep(self.last_user_text()))))
         if not likely:
             return
@@ -757,7 +766,9 @@ class Turn:
                     raise TurnStopped("No model is installed yet. Open Models and download one (the recommended "
                                       "one is marked).")
                 self.prefit()
-                if self.harness.get("mode") == "team":
+                if self.harness.get("mode") == "mission":
+                    await self.run_mission()
+                elif self.harness.get("mode") == "team":
                     await self.run_orchestra()
                 else:
                     await self.hold_model()
@@ -1126,7 +1137,7 @@ class Turn:
         app starts): no new plan, accepted steps are kept, the rest runs. True when it did."""
         run_id = (self.job.get("payload") or {}).get("resume_run")
         row = self.db.get("runs", run_id) if run_id else None
-        if not row or not (row.get("state") or {}).get("tasks"):
+        if not row or not (row.get("state") or {}).get("tasks") or row.get("kind") == "mission":
             return False
         orch = Orchestra.restore(self, row, fit=self.run_fit)
         try:
@@ -1157,6 +1168,25 @@ class Turn:
             await orch.final(messages)
         finally:
             orch.close()
+
+    async def run_mission(self):
+        """A long-running task. A chat has at most one open task: a new message in the chat (an answer to the
+        planner's question, a new instruction, or Continue) carries on with it instead of starting again."""
+        from .missions import Mission, open_mission
+        await self.hold_model()
+        self.new_ctx()
+        messages = await self.base_messages([])
+        row = open_mission(self.app, self.chat["id"])
+        if row:
+            mission = Mission.restore(self, row, fit=self.run_fit)
+            mission.came_back((self.job.get("payload") or {}).get("resume_run") == row["id"])
+        else:
+            mission = Mission(self, setup=(self.job.get("payload") or {}).get("mission"), fit=self.run_fit)
+        try:
+            await mission.drive(messages)
+            await mission.final(messages)
+        finally:
+            mission.close()
 
     async def agent_loop(self, messages, tools, max_steps):
         use_json = self.harness.get("tool_mode") == "json"
@@ -1459,8 +1489,8 @@ class Turn:
                 a["model"] = mid
 
     def team_harnesses(self):
-        return [h for h in self.app.harnesses.all() if h.get("type") == "loop" and h.get("mode") != "team"
-                and h.get("enabled", True)]
+        return [h for h in self.app.harnesses.all() if h.get("type") == "loop"
+                and h.get("mode") not in ("team", "mission") and h.get("enabled", True)]
 
     # ------------------------------------------------------------------ pipelines
     async def pipeline_inputs(self, user_text):

@@ -190,6 +190,41 @@ function OrchestraTask({ t, live }: any) {
   );
 }
 
+// A long-running task's card starts with where the task stands: what was used against its limits, the planner's
+// understanding of the problem (rewritten after every step) and the phases it expects next.
+function MissionSummary({ m }: any) {
+  const [open, setOpen] = useState(false);
+  const lim = m.limits || {}, used = m.spent || {};
+  return (
+    <div className="mission-sum">
+      <div className="small muted">{used.steps || 0} of {lim.steps} steps · {fmtDuration(used.seconds || 0)} of {lim.hours} h · {fmtTokens(used.tokens || 0)} tokens{used.cost ? ` · US$${used.cost.toFixed(2)}` : ""}{m.changes ? ` · the plan changed ${m.changes === 1 ? "once" : `${m.changes} times`}` : ""}</div>
+      {m.understanding && <div className={`small${open ? "" : " clamp-2"}`} style={{ cursor: "pointer" }} onClick={() => setOpen(!open)} title="The planner's understanding of the task (click to show all of it)"><b>Understanding:</b> {m.understanding}</div>}
+      {m.outline?.length > 0 && <div className="small muted">Expected next: {m.outline.join(" → ")}</div>}
+    </div>
+  );
+}
+
+// A long-running task that is not running: paused at a limit, waiting for an answer, stopped or cut off.
+function MissionBanner({ run, onResume, onMore, onDismiss }: any) {
+  const p = run.pause || {};
+  const lim = run.limits || {};
+  const more = Math.max(5, Math.round((lim.steps || 20) / 2));
+  return (
+    <div className="run-banner">
+      <span><Workflow size={14} /> {p.kind === "question" ? <>The planner is waiting for your answer: <b>{p.text}</b> Reply below and the task continues.</>
+        : p.kind === "limit" ? <>This task is paused: {p.text}. Everything done so far is kept.</>
+        : p.text ? <>This task is paused: {p.text}</>
+        : <>This task stopped after {run.done} of {run.total} steps{run.status === "interrupted" ? " (the app was closed or restarted)" : ""}. Everything done so far is kept.</>}</span>
+      <span className="row gap-s">
+        {p.kind === "limit" ? <Button small icon={<Play size={13} />} onClick={() => onMore(more)}>Continue with {more} more steps</Button>
+          : p.kind !== "question" ? <Button small icon={<Play size={13} />} onClick={onResume}>Continue</Button> : null}
+        <Button small kind="ghost" onClick={() => go("tasks")}>All tasks</Button>
+        <Button small kind="ghost" onClick={onDismiss}>End task</Button>
+      </span>
+    </div>
+  );
+}
+
 function OrchestraCard({ step, live }: any) {
   const [showLog, setShowLog] = useState(false);
   const tasks: any[] = step?.tasks || [];
@@ -214,7 +249,7 @@ function OrchestraCard({ step, live }: any) {
   return (
     <div className="orch">
       <div className="orch-head">
-        <span className="row gap-s"><Workflow size={14} /> <b>{sequence ? "Plan" : "Team"}</b>
+        <span className="row gap-s"><Workflow size={14} /> <b>{step.mission ? "Long-running task" : sequence ? "Plan" : "Team"}</b>
           <span className="muted small">{done} of {tasks.length} done{failed ? ` · ${failed} failed` : ""}{skipped ? ` · ${skipped} not run` : ""}{running ? ` · ${running} working` : ""}{sequence ? " · one step at a time" : ""}
             {step.totals?.tokens ? ` · ${fmtTokens(step.totals.tokens)} tokens` : ""}</span></span>
         <span className="row gap-s">
@@ -222,6 +257,7 @@ function OrchestraCard({ step, live }: any) {
           {desktop && step.folder && <button className="icon-btn" title="Open the shared team folder" onClick={() => desktop.openPath(step.folder)}><FolderOpen size={13} /></button>}
         </span>
       </div>
+      {step.mission && <MissionSummary m={step.mission} />}
       {sequence ? (
         <div className="orch-seq">
           {tasks.map((t, i) => (
@@ -358,7 +394,7 @@ function progressLabel(p: any) {
   return `Step ${Math.min(settled + 1, n)} of ${n}`;
 }
 
-function ProgressPanel({ progress, openRun, onResume, onDismiss, onClose }: any) {
+function ProgressPanel({ progress, openRun, onResume, onMore, onDismiss, onClose }: any) {
   const open = (path: string) => desktop ? desktop.openPath(path) : window.open(fileUrl(path));
   const base = (path: string) => path.split(/[\\/]/).pop();
   const lastLog = progress.log?.length ? progress.log[progress.log.length - 1] : null;
@@ -370,9 +406,15 @@ function ProgressPanel({ progress, openRun, onResume, onDismiss, onClose }: any)
         <button className="icon-btn" title="Hide (the Progress button at the top of the chat brings it back)" onClick={onClose}><ChevronRight size={16} /></button></div>
       <div className="panel-list">
         {progress.running && <div className="progress-now"><Loader2 size={14} className="spin accent" /><span>{progress.status || "Working…"}</span></div>}
-        {openRun && <div className="progress-resume">
+        {openRun && !openRun.mission && <div className="progress-resume">
           <div className="small">This run stopped after {openRun.done} of {openRun.total} steps{openRun.next ? <>. Next: <b>{openRun.next}</b></> : null}.</div>
           <div className="row gap-s"><Button small icon={<Play size={13} />} onClick={onResume}>Continue run</Button><Button small kind="ghost" onClick={onDismiss}>Dismiss</Button></div>
+        </div>}
+        {openRun?.mission && <div className="progress-resume">
+          <div className="small">{openRun.pause?.kind === "question" ? <>The planner asks: <b>{openRun.pause.text}</b> Reply in the chat.</> : openRun.pause ? <>Paused: {openRun.pause.text}.</> : <>This task stopped after {openRun.done} of {openRun.total} steps.</>}</div>
+          {openRun.pause?.kind !== "question" && <div className="row gap-s">
+            <Button small icon={<Play size={13} />} onClick={() => openRun.pause?.kind === "limit" ? onMore(Math.max(5, Math.round((openRun.limits?.steps || 20) / 2))) : onResume()}>{openRun.pause?.kind === "limit" ? "Continue with more steps" : "Continue"}</Button>
+            <Button small kind="ghost" onClick={onDismiss}>End task</Button></div>}
         </div>}
         {progress.items.length === 0 && !progress.running && <div className="small muted pad-x progress-empty">
           Nothing is running. When KimiLM works on a message, its plan and each thing it does appear here.</div>}
@@ -580,6 +622,14 @@ export default function ChatView({ chatId }: { chatId: string }) {
   const running = !!live || !!chat.running_job;
   const resumeRun = async () => { try { await api.post(`/chats/${chatId}/run/resume`); load(); } catch (e: any) { toast(e.message, "error"); } };
   const dismissRun = async () => { try { await api.post(`/chats/${chatId}/run/dismiss`); load(); } catch (e: any) { toast(e.message, "error"); } };
+  // a long-running task that reached a limit: raise the limit (steps and hours), then continue
+  const moreRun = async (steps: number) => {
+    const run = chat.open_run, lim = run?.limits || {};
+    try {
+      await api.put(`/missions/${run.id}/limits`, { steps: (lim.steps || 0) + steps, hours: (lim.hours || 0) + Math.max(1, (lim.hours || 2) / 2) });
+      await api.post(`/chats/${chatId}/run/resume`); load();
+    } catch (e: any) { toast(e.message, "error"); }
+  };
   const lastAssistant = [...chat.messages].reverse().find((m: any) => m.role === "assistant");
   const progress = progressOf(live, lastAssistant);
   const pending = chat.messages.filter((m: any) => m.meta?.pending);
@@ -633,7 +683,8 @@ export default function ChatView({ chatId }: { chatId: string }) {
               : <AssistantMessage key={m.id} msg={m} isLast={m.id === lastAssistant?.id && !running}
                   onRetry={async () => { try { await api.post(`/chats/${chatId}/retry`); load(); } catch (e: any) { toast(e.message, "error"); } }} />)}
             {live && <LiveTurn live={live} onDecide={decide} />}
-            {!running && chat.open_run && <div className="run-banner">
+            {!running && chat.open_run?.mission && <MissionBanner run={chat.open_run} onResume={resumeRun} onMore={moreRun} onDismiss={dismissRun} />}
+            {!running && chat.open_run && !chat.open_run.mission && <div className="run-banner">
               <span><Workflow size={14} /> This run stopped after {chat.open_run.done} of {chat.open_run.total} steps{chat.open_run.status === "interrupted" ? " (the app was closed or restarted)" : ""}. The accepted steps are kept.</span>
               <span className="row gap-s"><Button small icon={<Play size={13} />} onClick={resumeRun}>Continue run</Button><Button small kind="ghost" onClick={dismissRun}>Dismiss</Button></span>
             </div>}
@@ -660,7 +711,7 @@ export default function ChatView({ chatId }: { chatId: string }) {
             </>} />
         </div>
       </div>
-      {showProgress && !showFiles && <ProgressPanel progress={progress} openRun={!running ? chat.open_run : null} onResume={resumeRun} onDismiss={dismissRun} onClose={() => setShowProgress(false)} />}
+      {showProgress && !showFiles && <ProgressPanel progress={progress} openRun={!running ? chat.open_run : null} onResume={resumeRun} onMore={moreRun} onDismiss={dismissRun} onClose={() => setShowProgress(false)} />}
       {showFiles && <FilesPanel chatId={chatId} onClose={() => setShowFiles(false)} />}
     </div>
   );

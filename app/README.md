@@ -16,6 +16,14 @@ meaning with the optional search model), project knowledge files, living project
 Plugins are optional; Datavera is one of them (it runs the command-line agent in the repository root, which keeps
 working on its own).
 
+From 2.9.0 there are **long-running tasks**: work that goes on until a problem is solved. A planner keeps its
+understanding of the problem, gives one step at a time to an agent, reads the handoff that agent leaves and decides
+the next step from it, changing the plan when the findings call for it. Tasks have limits (hours, steps), pause
+between two steps when one is reached or when the planner needs an answer, and continue after a restart. A planner
+can also write the set-up of a task or a scheduled task from one sentence (team, limits, what it may do without
+asking). Agents can work in a **real browser** (open, click, type, choose, download, screenshot), and the computer is
+kept awake while tasks run.
+
 KimiLM was called **Datavera Agent** up to 2.1.x. Version 2.2.0 renamed it; see "Upgrading from Datavera Agent".
 
 ```
@@ -33,7 +41,7 @@ engine/             Python engine (FastAPI on 127.0.0.1 + a per-launch token) â€
 Needs Python 3.12 and Node.js 20+.
 
 ```powershell
-cd D:\datavera\datavera-agent\engine
+cd D:\KimiLM\engine
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 cd ..\app
@@ -48,7 +56,7 @@ or install a runtime from **Models â†’ Hardware & GPU** inside the app.
 ## Build the Windows installer
 
 ```powershell
-cd D:\datavera\datavera-agent\app
+cd D:\KimiLM\app
 npm install
 npm run dist:win
 ```

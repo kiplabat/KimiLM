@@ -1,7 +1,7 @@
 // KimiLM — desktop shell.
 // Starts the local engine (Python) with a random token, opens the window on it, keeps running in the tray so
 // chats, long tasks and schedules continue when the window is closed, and can start with Windows.
-const { app, BrowserWindow, Tray, Menu, ipcMain, dialog, shell, Notification, nativeImage, session } = require("electron");
+const { app, BrowserWindow, Tray, Menu, ipcMain, dialog, shell, Notification, nativeImage, session, powerSaveBlocker } = require("electron");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -17,14 +17,15 @@ let win = null;
 let tray = null;
 let quitting = false;
 let restarts = 0;
+let awake = null;     // id of the power-save blocker while tasks are running (2.9.0)
 
 const userData = app.getPath("userData");
 const prefsPath = path.join(userData, "shell-prefs.json");
 const logsDir = path.join(userData, "logs");   // created after the first-start data move (migrate.cjs)
 
 function prefs() {
-  try { return { keepInTray: true, openAtLogin: false, startHidden: false, ...JSON.parse(fs.readFileSync(prefsPath, "utf8")) }; }
-  catch { return { keepInTray: true, openAtLogin: false, startHidden: false }; }
+  try { return { keepInTray: true, openAtLogin: false, startHidden: false, keepAwake: true, ...JSON.parse(fs.readFileSync(prefsPath, "utf8")) }; }
+  catch { return { keepInTray: true, openAtLogin: false, startHidden: false, keepAwake: true }; }
 }
 function savePrefs(p) { fs.writeFileSync(prefsPath, JSON.stringify({ ...prefs(), ...p }, null, 2)); }
 
@@ -166,6 +167,34 @@ function createTray() {
   tray.on("click", showWindow);
 }
 
+// While anything is running (a reply, a planned run, a scheduled or long-running task) Windows is asked not to
+// put the computer to sleep, so hours of work are not cut off halfway. The screen may still turn off, and closing
+// a laptop's lid still does what Windows is set to do. The tray's tooltip says how many tasks are running.
+function applyBusy(busy) {
+  const active = Number(busy && busy.active) || 0;
+  const want = active > 0 && prefs().keepAwake !== false;
+  try {
+    if (want && awake === null) { awake = powerSaveBlocker.start("prevent-app-suspension"); log("tasks are running: keeping the computer awake"); }
+    if (!want && awake !== null) { powerSaveBlocker.stop(awake); awake = null; log("no task is running: the computer may sleep again"); }
+    if (tray) tray.setToolTip(active ? `KimiLM — ${active} task${active === 1 ? "" : "s"} running${busy.waiting ? `, ${busy.waiting} waiting for you` : ""}` : "KimiLM");
+  } catch (err) { log(`keeping awake: ${err && err.message || err}`); }
+}
+
+function watchWork() {
+  setInterval(() => {
+    if (!engine || !enginePort || quitting) return;
+    const req = http.request({ host: "127.0.0.1", port: enginePort, path: "/api/busy", method: "GET",
+      headers: { Authorization: `Bearer ${token}` }, timeout: 4000 }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => { try { applyBusy(JSON.parse(data)); } catch {} });
+    });
+    req.on("error", () => {});
+    req.on("timeout", () => req.destroy());
+    req.end();
+  }, 15000);
+}
+
 function showFatal(err) {
   log(`fatal: ${err && err.stack || err}`);
   dialog.showErrorBox("KimiLM could not start", `${err.message || err}\n\nLogs: ${logsDir}`);
@@ -244,6 +273,7 @@ if (!app.requestSingleInstanceLock()) {
       });
     }
     createTray();
+    watchWork();
     const hidden = process.argv.includes("--hidden") || prefs().startHidden;
     createWindow(!hidden);
   });

@@ -117,6 +117,10 @@ MIGRATIONS = [
     ("step_stats", "passed", "INTEGER DEFAULT 0"),
     ("step_stats", "rounds", "REAL DEFAULT 0"),
     ("eval_runs", "settings_json", "TEXT DEFAULT '{}'"),    # the settings an evaluation ran with (2.8.0)
+    # 2.9.0: long-running tasks are saved like planned runs (kind = run | mission); a scheduled task keeps the
+    # set-up its planner made (what kind of run, the team, the limits, what it may do without asking)
+    ("runs", "kind", "TEXT DEFAULT 'run'"),
+    ("schedules", "setup_json", "TEXT DEFAULT '{}'"),
 ]
 
 

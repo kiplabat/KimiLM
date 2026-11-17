@@ -212,7 +212,7 @@ class Providers:
             return {"x-api-key": key or "", "anthropic-version": "2023-06-01"}
         h = {"Authorization": f"Bearer {key}"} if key else {}
         if pid == "openrouter":
-            h.update({"HTTP-Referer": "https://github.com/kiplabat/datavera-agent", "X-Title": "KimiLM"})
+            h.update({"HTTP-Referer": "https://github.com/kiplabat/KimiLM", "X-Title": "KimiLM"})
         return h
 
     @staticmethod

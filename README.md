@@ -1,9 +1,19 @@
-# Datavera local agent
+# KimiLM
 
-> **New (beta): the Datavera Agent desktop app.** A window instead of the command line: chats, projects, memory,
-> skills, plugins, scheduled tasks, and models you download and run on your own computer (CPU or GPU).
-> This dataset publisher is built in as the Datavera plugin. Developers: see [app/README.md](app/README.md) and
-> [engine/README.md](engine/README.md). The steps below are for the command-line version, which keeps working.
+**KimiLM** is a desktop app for AI agents that run on your own computer: chat, projects, memory, skills, plugins
+and connectors, planned runs, scheduled tasks and long-running tasks, with models you download and run locally
+(CPU or GPU) and, if you choose, online models with your own keys.
+
+- The app (Electron + React): [app/README.md](app/README.md) — how to run it in development and build the installer.
+- The engine (Python): [engine/README.md](engine/README.md) — how it works, release by release.
+
+KimiLM started as "Datavera Agent" and this repository was called `datavera-agent` until November 2026. The
+Datavera dataset publisher below is now one optional plugin of KimiLM; its command-line version lives in the
+repository root and keeps working on its own.
+
+---
+
+# Datavera local agent (command line)
 
 A helper that runs **on your own computer**. Each time you start it, it:
 
@@ -53,7 +63,7 @@ Full illustrated guide: **https://www.datavera.io/publish/agent**
 2. Copy this whole line, then **right-click** inside the PowerShell window to paste it, and press **Enter**:
 
    ```
-   powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/kiplabat/datavera-agent/main/install-windows.ps1 | iex"
+   powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/kiplabat/KimiLM/main/install-windows.ps1 | iex"
    ```
 
 3. Wait. It installs Python, Node.js and Ollama if you don't have them.
@@ -71,7 +81,7 @@ Full illustrated guide: **https://www.datavera.io/publish/agent**
 2. Paste this line and press **Enter**:
 
    ```
-   curl -fsSL https://raw.githubusercontent.com/kiplabat/datavera-agent/main/install-mac.sh | bash
+   curl -fsSL https://raw.githubusercontent.com/kiplabat/KimiLM/main/install-mac.sh | bash
    ```
 
 3. If it asks for your **Mac password** (the one you log in with), type it. Nothing appears while you type,

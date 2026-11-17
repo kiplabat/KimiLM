@@ -27,6 +27,11 @@ gets only the tool groups its goal calls for (lean_kit), the full set on a fresh
 failing moves to a stronger model if one is installed; the result check can run on a smaller model
 (`check_model`); and briefs ask for a result length that fits the computer's writing speed.
 
+2.9.0 adds what long-running tasks need (missions.py builds on this class): a run asks `advance` for more steps
+when its steps are all settled, `over_limit` decides when it has to stop, `extra_state` and `load_extra` save
+and restore what a subclass adds, and agents inherit the turn's unattended policy (what they may do without
+asking).
+
 Agents can read the board and ask the planner a question. Chats, projects and scheduled tasks use this
 automatically when a request looks multi-step; team harnesses, the team builder and `delegate` always use it."""
 import asyncio
@@ -201,6 +206,7 @@ def classify(error, timed_out=False):
 # What a step's goal has to mention for a tool group to be handed to its agent (files are always given).
 KIT_WORDS = {
     "web": r"web|online|internet|search|look up|url|https?:|site|page|latest|news|download|research|source|publish|api\b",
+    "browser": r"browser|click|button|log ?in|sign ?in|\bform\b|fill in|menu|navigate|web ?site|portal|web app",
     "python": r"python|code|script|run\b|test|comput|calculat|analy[sz]|csv|xlsx|excel|data|chart|plot|graph|command|"
               r"shell|git\b|install|build|convert|parse|json|sql|statistic|average|sum\b|count",
     "memory": r"remember|memory|earlier chat|previous chat|chat history|knowledge|project notes?",
@@ -228,6 +234,7 @@ SAVED = ("id", "name", "goal", "done_when", "depends_on", "role", "harness", "ag
 
 class Orchestra:
     """One run inside a chat turn. `turn` is the lead's Turn (its model plans and checks)."""
+    kind = "run"                              # saved in runs.kind; missions.Mission is "mission"
 
     def __init__(self, turn, roster=None, overall=None, fit=None):
         self.turn, self.app, self.db = turn, turn.app, turn.db
@@ -275,14 +282,14 @@ class Orchestra:
                      "chain": self.chain, "roster": self.roster, "dir": str(self.dir), "log": self.step["log"][-40:],
                      "agent_chats": self.agent_chats,
                      "need": dict(self.fit.need) if self.fit is not None else {},
-                     "tasks": [{k: t.get(k) for k in SAVED} for t in self.tasks.values()]}
+                     "tasks": [{k: t.get(k) for k in SAVED} for t in self.tasks.values()], **self.extra_state()}
             row = {"chat_id": self.turn.chat["id"], "status": status, "state": state, "resumes": self.resumes,
-                   "updated": now()}
+                   "kind": self.kind, "updated": now()}
             if self.db.get("runs", self.id):
                 self.db.update("runs", self.id, row)
             else:                             # a new run in this chat replaces older ones that were left open
                 self.db.run("UPDATE runs SET status='superseded' WHERE chat_id=? AND status IN "
-                            "('interrupted','stopped','running')", (self.turn.chat["id"],))
+                            "('interrupted','stopped','running','paused')", (self.turn.chat["id"],))
                 keep = int(self.db.setting("runs_kept", 300))        # the history keeps the newest runs
                 self.db.run("DELETE FROM runs WHERE id NOT IN (SELECT id FROM runs ORDER BY created DESC LIMIT ?)",
                             (keep,))
@@ -290,12 +297,20 @@ class Orchestra:
         except Exception as exc:              # saving must never stop a run
             self.app.log(f"saving run {self.id}: {type(exc).__name__}: {exc}")
 
+    def extra_state(self):
+        """What a subclass saves with the run (missions: understanding, handoffs, limits)."""
+        return {}
+
+    def load_extra(self, state):
+        """The other half of extra_state, called when a saved run is continued."""
+
     @classmethod
     def restore(cls, turn, row, fit=None):
         """Continue a saved run: accepted steps keep their results; a step that was working, being checked or
         waiting starts again (the interrupted attempt is not counted); failed steps stay failed."""
         state = row.get("state") or {}
         self = cls(turn, roster=state.get("roster"), overall=state.get("overall"), fit=fit)
+        self.load_extra(state)
         self.id = self.step["id"] = row["id"]
         self.final_hint = state.get("final_hint") or ""
         self.chain = bool(state.get("chain"))
@@ -820,7 +835,8 @@ class Orchestra:
                         or self.db.setting("turn_time_limit_minutes", 30) or 30)
         t["deadline"] = time.monotonic() + max((minutes + 10) * 60, (t.get("forecast") or {}).get("seconds", 0) * 4)
         job = self.app.start_turn(chat_id, message, kind="agent",
-                                  payload={"auto_approve": self.turn.auto_approve})
+                                  payload={"auto_approve": self.turn.auto_approve,
+                                           "policy": getattr(self.turn, "policy", None)})
         t["job_id"] = job["id"]
         self.handles[t["id"]] = self.app.spawn(self._watch(t, job["id"]))
         self.save()
@@ -1255,6 +1271,18 @@ class Orchestra:
             self.logline("Planner " + "; ".join(said) + ".")
         self.publish()
 
+    # ------------------------------------------------------------------ hooks for runs that keep going (missions)
+    async def advance(self, messages):
+        """Every step is settled. True when more steps were added and the run goes on; a planned run is simply
+        finished at this point."""
+        return False
+
+    def over_limit(self):
+        """A sentence saying why the run has to stop now, or None. A planned run has one limit: its time."""
+        if time.monotonic() - self.started > self.time_limit:
+            return "The run reached its time limit; the planner writes up what is done."
+        return None
+
     # ------------------------------------------------------------------ the scheduler
     async def drive(self, messages):
         """Run the plan until every step is settled. Returns the accepted steps."""
@@ -1275,8 +1303,9 @@ class Orchestra:
         stalled_once = False
         try:
             while not self.finished:
-                if time.monotonic() - self.started > self.time_limit:
-                    turn.note("The run reached its time limit; the planner writes up what is done.")
+                why = self.over_limit()
+                if why:
+                    turn.note(why)
                     break
                 batch = []
                 while not self.events.empty():
@@ -1300,6 +1329,8 @@ class Orchestra:
                 pending = [t for t in self.tasks.values() if t["status"] in ("waiting", "paused")]
                 if not running and self.events.empty():
                     if not pending:
+                        if await self.advance(messages):
+                            continue
                         break
                     if is_paused(app, turn.chat["id"]):
                         self._wake.clear()

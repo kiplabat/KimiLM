@@ -1,13 +1,13 @@
 #!/bin/bash
 # Datavera local agent - Mac installer (also updates an existing install).  NOT YET TESTED ON A REAL MAC.
 # Run it by pasting this ONE line into Terminal:
-#   curl -fsSL https://raw.githubusercontent.com/kiplabat/datavera-agent/main/install-mac.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/kiplabat/KimiLM/main/install-mac.sh | bash
 # Installs Homebrew, Python 3.12, Node.js, Ollama and Google Chrome if missing, downloads the agent into
 # ~/DataveraAgent, downloads the AI model, connects your Datavera account and puts a "Datavera Agent"
 # icon on your Desktop. Your key, settings and history are kept when you run it again.
 set -euo pipefail
 
-REPO="https://github.com/kiplabat/datavera-agent/archive/refs/heads/main.tar.gz"
+REPO="https://github.com/kiplabat/KimiLM/archive/refs/heads/main.tar.gz"
 MODEL="qwen3.5:4b"
 DEST="${DATAVERA_AGENT_DIR:-$HOME/DataveraAgent}"
 TOTAL=8
@@ -59,7 +59,7 @@ ok "Ollama is running"
 step 5 "Downloading the Datavera agent"
 TMP="$(mktemp -d)"
 curl -fsSL "$REPO" | tar -xz -C "$TMP"
-SRC="$(find "$TMP" -maxdepth 1 -type d -name 'datavera-agent*' | head -1)"
+SRC="$(find "$TMP" -maxdepth 1 -type d \( -name 'KimiLM*' -o -name 'datavera-agent*' \) | head -1)"
 mkdir -p "$DEST"
 BACKUP="$DEST/backup_$(date +%Y%m%d_%H%M%S)"
 (cd "$SRC" && find . -type f) | while read -r rel; do
