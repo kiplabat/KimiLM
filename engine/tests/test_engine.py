@@ -2243,7 +2243,7 @@ def wait_sound(c, job, timeout=60):
 
 def sound_jobs(tmp, kind=None):
     log = tmp / "sound-jobs.log"
-    rows = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+    rows = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
     return [r for r in rows if not kind or r["kind"] == kind]
 
 
@@ -2341,7 +2341,8 @@ def test_speech_voices_and_transcription_on_this_computer(engine):
     heard = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "transcribe", "audio": pod["result"]["path"], "language": "sw"}).json())
     res = heard["result"]
     assert heard["state"] == "done" and res["text"].startswith("These are the words of episode-1") and "Language: sw." in res["text"], heard
-    assert Path(res["file"]).read_text().strip() == res["text"] and "00:00:01,500 --> 00:00:02,400" in Path(res["subtitles"]).read_text()
+    assert Path(res["file"]).read_text(encoding="utf-8").strip() == res["text"]
+    assert "00:00:01,500 --> 00:00:02,400" in Path(res["subtitles"]).read_text(encoding="utf-8")
     assert sound_jobs(tmp, "transcribe")[-1]["model"] == {"family": "whisper", "dir": str(tmp / "sound-models" / "whisper"), "language": "sw"}
     missing = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "transcribe", "audio": str(tmp / "nope.wav")}).json())
     assert missing["state"] == "failed" and "no file" in missing["error"]
@@ -2679,7 +2680,7 @@ def test_a_podcast_is_made_from_a_document_in_one_request(engine):
     assert lines[4]["text"].startswith("Part 3 of 3. The document says: Next steps are training for technicians")
     # a hesitation is spelled so that the voice can say it, a stage direction is gone, pauses are kept as pauses
     assert lines[1]["text"] == "Um… that is interesting, and it costs $45… really."
-    script = Path(p["script"]).read_text()
+    script = Path(p["script"]).read_text(encoding="utf-8")       # the app writes UTF-8; Windows would guess otherwise
     assert script.startswith("# The Stand-in Report") and "**Sam:** Um… that is interesting" in script and "Made from: Solar-pumps-report-" in script
     spoken = sound_jobs(tmp, "speak")[-1]["segments"]
     assert [(s["text"], s["pause"]) for s in spoken[:5]] == [
