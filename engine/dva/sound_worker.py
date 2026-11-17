@@ -14,7 +14,9 @@ Jobs
 Families: kokoro, kitten, vits (Piper voices), pocket (a voice from a recording); whisper."""
 import json
 import os
+import re
 import sys
+import tempfile
 import time
 import wave
 from pathlib import Path
@@ -23,6 +25,15 @@ from pathlib import Path
 def say(**data):
     sys.stdout.write(json.dumps(data, ensure_ascii=False) + "\n")
     sys.stdout.flush()
+
+
+def espeak():
+    """True when the installed library still pronounces unknown words through espeak-ng (its 1.x versions)."""
+    try:
+        from importlib import metadata
+        return metadata.version("sherpa-onnx").startswith("1.")
+    except Exception:
+        return False
 
 
 def threads():
@@ -77,13 +88,131 @@ def write_wav(path, samples, rate):
         f.writeframes(data.tobytes())
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# Words the dictionary does not know. Kokoro pronounces from a dictionary (about 180,000 English words); without
+# the espeak-ng component (left out of the library's 2.x versions) a word that is not in it is skipped in silence,
+# and many ordinary forms are missing ("households", "described", "makes"), as are names ("KimiLM", "amapiano").
+# For every such word of a request a pronunciation is worked out and given to the model as a second dictionary:
+#   1. from a word that is known: plural and verb endings (-s, -ed, -ing, -ly, -er, -ness, -ment…), possessives;
+#   2. as two known words written together ("down" + "loads");
+#   3. short all-capital or vowel-less words as letters ("CPU", "MCP");
+#   4. otherwise letter by letter with plain vowels (a e i o u as in Spanish or Swahili), which reads names and
+#      foreign words recognisably instead of dropping them.
+VOICELESS, SIBILANT = set("p t k f θ".split()), set("s z ʃ ʒ ʧ ʤ".split())
+LETTERS = {"sh": "ʃ", "ch": "ʧ", "th": "θ", "ph": "f", "ng": "ŋ", "ny": "n j", "kh": "k", "gh": "g", "ts": "t s", "zh": "ʒ",
+           "oo": "u", "ee": "i", "ai": "I", "ay": "A", "ei": "A", "ou": "u", "au": "W", "oi": "Y", "oy": "Y", "ck": "k", "qu": "k w",
+           "a": "ɑ", "e": "ɛ", "i": "i", "o": "O", "u": "u", "y": "j", "b": "b", "c": "k", "d": "d", "f": "f", "g": "ɡ", "h": "h",
+           "j": "ʤ", "k": "k", "l": "l", "m": "m", "n": "n", "p": "p", "q": "k", "r": "ɹ", "s": "s", "t": "t", "v": "v", "w": "w",
+           "x": "k s", "z": "z"}
+
+
+def s_ending(ph):
+    last = ph.split()[-1]
+    return ph + (" ᵻ z" if last in SIBILANT else " s" if last in VOICELESS else " z")
+
+
+def ed_ending(ph):
+    last = ph.split()[-1]
+    return ph + (" ᵻ d" if last in ("t", "d") else " t" if last in VOICELESS | {"s", "ʃ", "ʧ"} else " d")
+
+
+def pronounce(word, lex, tokens, spelled=False):
+    """Phonemes for a word the dictionary lacks, or None. `lex` is the dictionary, `tokens` the model's symbols."""
+    w = word.lower().strip("'")
+    if w in lex:
+        return lex[w]
+    bits = re.findall(r"[A-Z][a-z]+|[A-Z]+(?![a-z])|[a-z]+", word)        # KimiLM → Kimi + LM, OpenAI → Open + AI
+    if not spelled and len(bits) > 1 and "".join(bits) == word:
+        said = [pronounce(b, lex, tokens) for b in bits]
+        if all(said):
+            return " ".join(said)
+    for end, cut in (("'s", 2), ("s'", 1), ("’s", 2)):
+        if w.endswith(end) and w[:-cut] in lex:
+            return s_ending(lex[w[:-cut]]) if not w[:-cut].endswith("s") or end != "s'" else lex[w[:-cut]]
+    tries = []
+    if w.endswith("ies"):
+        tries.append((w[:-3] + "y", s_ending))
+    if w.endswith("es"):
+        tries += [(w[:-2], s_ending), (w[:-1], s_ending)]
+    if w.endswith("s") and not w.endswith("ss"):
+        tries.append((w[:-1], s_ending))
+    if w.endswith("ied"):
+        tries.append((w[:-3] + "y", ed_ending))
+    if w.endswith("ed"):
+        tries += [(w[:-1], ed_ending), (w[:-2], ed_ending)] + ([(w[:-3], ed_ending)] if len(w) > 4 and w[-3] == w[-4] else [])
+    if w.endswith("ing"):
+        tries += [(w[:-3], lambda p: p + " ɪ ŋ"), (w[:-3] + "e", lambda p: p + " ɪ ŋ")] + (
+            [(w[:-4], lambda p: p + " ɪ ŋ")] if len(w) > 5 and w[-4] == w[-5] else [])
+    for end, sound in (("ly", "l i"), ("er", "ə ɹ"), ("ers", "ə ɹ z"), ("est", "ə s t"), ("ness", "n ə s"), ("ment", "m ə n t"),
+                       ("ments", "m ə n t s"), ("less", "l ə s"), ("ful", "f ə l"), ("able", "ə b ə l"), ("ation", "A ʃ ə n")):
+        if w.endswith(end):
+            tries += [(w[:-len(end)], lambda p, s=sound: p + " " + s), (w[:-len(end)] + "e", lambda p, s=sound: p + " " + s)]
+    for base, rule in tries:
+        if len(base) > 1 and base in lex:
+            return rule(lex[base])
+    if not spelled:                                    # two known words written together, the longest first part first
+        for i in range(len(w) - 3, 2, -1):
+            if w[:i] in lex:
+                rest = pronounce(w[i:], lex, tokens, spelled=True) if len(w) - i >= 3 else None
+                if rest:
+                    return lex[w[:i]] + " " + rest
+    if spelled:
+        return None
+    if (word.isupper() and len(w) <= 5) or not re.search(r"[aeiouy]", w):
+        if all(c in lex for c in w):
+            return " ".join(lex[c] for c in w)         # said as letters
+    out, i, stressed = [], 0, False
+    while i < len(w):                                  # letter by letter, plain vowels
+        two = w[i:i + 2]
+        sound = LETTERS.get(two) if len(two) == 2 and two in LETTERS and len(two) == 2 else None
+        if sound and two not in ("ny", "ng") or (sound and i + 2 <= len(w)):
+            i += 2
+        else:
+            sound = LETTERS.get(w[i])
+            i += 1
+        if not sound:
+            continue
+        if not stressed and sound.split()[0] in ("ɑ", "ɛ", "i", "O", "u", "I", "A", "W", "Y"):
+            out.append("ˈ")
+            stressed = True
+        out.append(sound)
+    ph = " ".join(out)
+    return ph if ph and all(t in tokens for t in ph.split()) else None
+
+
+def extra_lexicon(folder, texts):
+    """A second dictionary with the words of `texts` that the model's own one lacks. Returns its path, or None."""
+    files = sorted(Path(folder).glob("lexicon-us-en*.txt")) or sorted(Path(folder).glob("lexicon*en*.txt"))
+    if not files:
+        return None
+    wanted = {w for t in texts for w in re.findall(r"[A-Za-z][A-Za-z'’]*", t)}
+    lex = {}
+    with open(files[0], encoding="utf-8") as f:
+        for line in f:
+            word, _, ph = line.rstrip("\n").partition(" ")
+            lex.setdefault(word.lower(), ph)
+    tokens = {line.rsplit(" ", 1)[0] for line in open(Path(folder) / "tokens.txt", encoding="utf-8") if line.strip()}
+    lines = []
+    for word in sorted(wanted):
+        if word.lower() in lex or word.lower().replace("’", "'") in lex:
+            continue
+        ph = pronounce(word.replace("’", "'"), lex, tokens)
+        if ph:
+            lines.append(f"{word.lower()} {ph}")
+    if not lines:
+        return None
+    out = Path(tempfile.gettempdir()) / f"kimilm-words-{os.getpid()}.txt"
+    out.write_text("\n".join(sorted(set(lines))) + "\n", encoding="utf-8")
+    return str(out)
+
+
 def load_tts(model):
     import sherpa_onnx as so
     family, d = model["family"], model["dir"]
     data_dir = str(Path(d) / "espeak-ng-data") if (Path(d) / "espeak-ng-data").is_dir() else ""
     parts = {}
     if family == "kokoro":
-        lexicons = ",".join(str(p) for p in sorted(Path(d).glob("lexicon*.txt")))
+        lexicons = ",".join([str(p) for p in sorted(Path(d).glob("lexicon*.txt"))] + ([model["extra"]] if model.get("extra") else []))
         parts["kokoro"] = so.OfflineTtsKokoroModelConfig(
             model=one(d, "model.onnx", "model*.onnx"), voices=one(d, "voices.bin"), tokens=one(d, "tokens.txt"),
             lexicon=lexicons, data_dir=data_dir, dict_dir=str(Path(d) / "dict") if (Path(d) / "dict").is_dir() else "")
@@ -110,7 +239,7 @@ def load_tts(model):
 def speak(job):
     import numpy as np
     import sherpa_onnx as so
-    loaded, refs, pieces, marks = {}, {}, [], []
+    loaded, refs, pieces, marks, extras = {}, {}, [], [], []
     rate, at = int(job.get("rate") or 0), 0.0
     segments = [s for s in job["segments"] if str(s.get("text") or "").strip()]
     if not segments:
@@ -120,7 +249,11 @@ def speak(job):
         key = seg["model"]
         if key not in loaded:
             say(progress=i / len(segments), text="Loading the voice…")
-            loaded[key] = load_tts(job["models"][key])
+            model = dict(job["models"][key])
+            if model["family"] == "kokoro" and not espeak():      # words its dictionary lacks would be silent
+                model["extra"] = extra_lexicon(model["dir"], [s["text"] for s in segments if s["model"] == key])
+                extras.append(model["extra"])
+            loaded[key] = load_tts(model)
         tts = loaded[key]
         family = job["models"][key]["family"]
         speed = float(seg.get("speed") or 1.0)
@@ -148,6 +281,9 @@ def speak(job):
                       "speaker": seg.get("speaker") or ""})
         pieces += [samples, np.zeros(int(rate * pause), dtype="float32")]
         at += len(samples) / rate + pause
+    for path in extras:
+        if path:
+            Path(path).unlink(missing_ok=True)
     out = np.concatenate(pieces)
     write_wav(job["out"], out, rate)
     say(done=True, out=job["out"], seconds=round(len(out) / rate, 2), rate=rate, segments=marks)

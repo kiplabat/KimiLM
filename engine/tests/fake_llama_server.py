@@ -116,12 +116,14 @@ def decide(body):
                                ("read resource ", "read_connector_resource", "uri"),
                                ("paint a picture of ", "generate_image", "prompt"),
                                ("say aloud: ", "speak", "text"), ("write down what is said in ", "transcribe_audio", "path"),
-                               ("compose music: ", "generate_music", "prompt")):
+                               ("compose music: ", "generate_music", "prompt"), ("podcast of ", "make_podcast", "source")):
         if trigger in text and tool in tools and not after_tool:
             args = {key: text.split(trigger, 1)[1].strip()}
             if tool == "update_project_notes":
                 args["section"] = "Decisions"
             return {"tool": (tool, args)}
+    if "podcast from the attached" in text and "make_podcast" in tools and not after_tool:
+        return {"tool": ("make_podcast", {"minutes": 3})}
     if "repaint " in text and "edit_image" in tools and not after_tool:      # "repaint <path> so that <what>"
         path, _, what = text.split("repaint ", 1)[1].partition(" so that ")
         return {"tool": ("edit_image", {"image": path.strip(), "prompt": what.strip()})}
@@ -293,6 +295,21 @@ def structured(schema, body):
     """Planner answers for the orchestrator; everything else gets a minimal valid object."""
     props = schema.get("properties", {})
     users = " ".join(text_of(m.get("content")) for m in body["messages"] if m["role"] == "user").lower()
+    raw = " ".join(text_of(m.get("content")) for m in body["messages"] if m["role"] == "user")
+    if "points" in props and "PART:" in raw:          # podcast (2.13.0): notes of one part of a document
+        part = raw.split("PART:", 1)[1].split("JSON only")[0].strip()
+        return {"points": [s.strip() + "." for s in part.replace("\n", " ").split(".")[:2] if s.strip()]}
+    if "segments" in props and "summary" in props:    # podcast: the outline
+        n = int(re.search(r"as (\d+) segments", raw).group(1))
+        return {"title": "The Stand-in Report", "summary": "What the document says, in short.",
+                "segments": [{"title": t, "points": [f"point about {t.lower()}"]} for t in ["Solar pumps", "Costs and savings", "Next steps"][:max(2, min(3, n))]]}
+    if "lines" in props and "EXCERPTS FROM THE DOCUMENT" in raw:      # podcast: one part of the script
+        part = re.search(r"Write part (\d+) of (\d+)", raw)
+        excerpt = " ".join(raw.split("EXCERPTS FROM THE DOCUMENT:", 1)[1].split()[:7])
+        both = "B" in props["lines"]["items"]["properties"]["speaker"]["enum"]
+        lines = [{"speaker": "A", "text": f"Part {part.group(1)} of {part.group(2)}. The document says: {excerpt}."},
+                 {"speaker": "B" if both else "A", "text": "Uhm... that is **interesting** (laughs), and it costs $45 [pause] really."}]
+        return {"lines": lines}
     if "decision" in props and "steps" in props:      # a long-running task's next move (2.9.0)
         return mission_move(body, users)
     if "team" in props and "limits" in props:         # the set-up of a task, with values to be repaired

@@ -8,6 +8,11 @@ On this computer   Speech and transcription run in a separate process per reques
                    GPL-licensed), so with them local speech covers what Kokoro's own dictionaries cover: English
                    and Chinese. Models that need it (Piper voices, Kitten, Kokoro's other languages) are offered
                    only when a 1.x version of the library is installed (`espeak()`).
+Music here         ACE-Step 1.5 through acestep.cpp (2.13.0): two programs, `ace-lm` (plans the piece: structure, words,
+                   audio codes) and `ace-synth` (renders the sound), run one after the other for a request and then
+                   gone. Its authors publish no ready-made programs, so they are built from the pinned source by a
+                   workflow in KimiLM's own repository and downloaded from that repository's releases; a folder
+                   with programs you already have works too. The models come from Hugging Face.
 Online             OpenAI (speech, transcription) and Google (speech with one or two speakers, transcription,
                    music with Lyria), with the keys saved for those providers, counted against the monthly budget
                    with estimated prices. Anthropic's Claude neither speaks nor listens through its interface.
@@ -34,8 +39,8 @@ from pathlib import Path
 import httpx
 
 from .db import new_id, now
-from .download import download
-from .images import fetch
+from .download import download, fetch_json
+from .images import HF, fetch, pick_file
 from .providers import cloud_id, month_key
 
 RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
@@ -88,6 +93,30 @@ CATALOG = [
                               ("small", 610, "More accurate, slower."),
                               ("turbo", 538, "The most accurate here; needs patience without a graphics card."))],
 ]
+# Music on this computer: every model is four files from one repository (chosen from its listing when downloaded).
+ACE_REPO = "Serveurperso/ACE-Step-1.5-GGUF"
+
+
+def ace(key, name, mb, ram, about, lm, dit, recommended=False):
+    part = lambda slot, match, prefer: {"slot": slot, "sources": [{"repo": ACE_REPO, "match": match}], "prefer": prefer}  # noqa: E731
+    return {"key": key, "role": "music", "family": "ace", "name": name, "mb": mb, "min_ram_gb": ram, "about": about,
+            "recommended": recommended, "licence": "MIT", "page": f"https://huggingface.co/{ACE_REPO}", "voices": [],
+            "hf": [part("lm", rf"^acestep-5Hz-lm-{lm}-.*\.gguf$", ["Q8_0", "Q6_K", "Q5_K_M"]),
+                   part("dit", r"^acestep-v15-turbo-(Q|BF)[^-]*\.gguf$", dit),
+                   part("encoder", r"^Qwen3-Embedding-0\.6B-.*\.gguf$", ["Q8_0"]),
+                   part("vae", r"^vae-.*\.gguf$", ["BF16"])]}
+
+
+CATALOG += [
+    ace("ace-step-light", "ACE-Step 1.5 (light)", 3300, 8, "Music from a description, with or without singing, on this "
+        "computer. The lightest set: expect several minutes for 30 seconds of music on a processor alone.",
+        "0\\.6B", ["Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"], recommended=True),
+    ace("ace-step", "ACE-Step 1.5 (better)", 5700, 16, "The same model with a larger planner and finer weights: "
+        "better structure and words, slower, and it wants 16 GB of memory or a graphics card.",
+        "1\\.7B", ["Q8_0", "Q6_K"]),
+]
+ACE_LM, ACE_SYNTH = ("ace-lm.exe", "ace-synth.exe") if os.name == "nt" else ("ace-lm", "ace-synth")
+ACE_ASSET = {"nt": "acestep-windows-x64.zip"}.get(os.name, "acestep-linux-x64.tar.gz")
 VAD_URL = f"{RELEASES}/asr-models/silero_vad.onnx"
 ONLINE = {
     "openai": {"name": "OpenAI",
@@ -273,8 +302,14 @@ class Sound:
     def models(self):
         rows = self.db.all("SELECT * FROM sound_models ORDER BY added")
         for r in rows:
+            r["default"] = self.db.setting(f"sound_{r['role']}", "") == r["id"]
             if r["kind"] == "local":
                 entry = next((c for c in CATALOG if c["key"] == r["id"]), {})
+                if r["family"] == "ace":
+                    r["ready"] = Path(r["path"]).is_dir() and bool(self.music_engine())
+                    r["why"] = "" if r["ready"] else ("its files are missing" if not Path(r["path"]).is_dir() else
+                                                      "the music engine is not installed")
+                    continue
                 r["ready"] = bool(self.library()) and Path(r["path"]).is_dir() and self.usable(entry)
                 r["why"] = "" if r["ready"] else ("the speech library is not installed" if not self.library() else
                                                   "its files are missing" if not Path(r["path"]).is_dir() else
@@ -282,7 +317,6 @@ class Sound:
             else:
                 r["ready"] = self.app.providers.ready(r["provider"])
                 r["why"] = "" if r["ready"] else "its provider has no key"
-            r["default"] = self.db.setting(f"sound_{r['role']}", "") == r["id"]
         return rows
 
     def get(self, model_id):
@@ -328,11 +362,25 @@ class Sound:
         if not entry:
             raise ValueError("Choose which model the folder holds")
         folder = Path(str(path or ""))
-        if not folder.is_dir() or not any(folder.glob("*.onnx")):
-            raise ValueError(f"{folder} is not a folder with a model's .onnx files in it")
+        kind = "*.gguf" if entry["family"] == "ace" else "*.onnx"
+        if not folder.is_dir() or not any(folder.glob(kind)):
+            raise ValueError(f"{folder} is not a folder with a model's {kind[1:]} files in it")
         size = sum(p.stat().st_size for p in folder.rglob("*") if p.is_file())
+        settings = self._ace_settings(folder) if entry["family"] == "ace" else {}
         return self._insert({"id": entry["key"], "kind": "local", "role": entry["role"], "family": entry["family"],
-                             "name": entry["name"], "path": str(folder), "size": size, "licence": entry["licence"]})
+                             "name": entry["name"], "path": str(folder), "size": size, "licence": entry["licence"],
+                             "settings": settings})
+
+    @staticmethod
+    def _ace_settings(folder):
+        """Which file is the planner and which the renderer (the programs are told by name)."""
+        names = sorted(p.name for p in Path(folder).glob("*.gguf"))
+        lm = next((n for n in names if "-lm-" in n), "")
+        dit = next((n for n in names if n.startswith("acestep-v15")), "")
+        if not lm or not dit or not any(n.startswith("vae") for n in names) or not any("Embedding" in n for n in names):
+            raise ValueError("A music model needs four files: the planner (…-lm-…), the renderer (acestep-v15-…), "
+                             "the text encoder (Qwen3-Embedding-…) and the VAE (vae-…)")
+        return {"lm": lm, "dit": dit, "steps": 8, "shift": 3.0}
 
     def update(self, model_id, data):
         row = self.db.get("sound_models", model_id)
@@ -356,8 +404,14 @@ class Sound:
 
     def catalog(self):
         have = {m["id"] for m in self.models() if m["kind"] == "local"}
+        try:
+            import psutil
+            ram_gb = psutil.virtual_memory().total / 2**30
+        except Exception:
+            ram_gb = 0
         return [{k: c[k] for k in ("key", "role", "name", "mb", "licence", "page", "about")}
                 | {"installed": c["key"] in have, "usable": self.usable(c), "recommended": bool(c.get("recommended")),
+                   "fits": not c.get("min_ram_gb") or not ram_gb or ram_gb >= c["min_ram_gb"] * 0.93,
                    "voices": len(c["voices"]), "download": self.downloads.get(c["key"])} for c in CATALOG]
 
     def start_download(self, key):
@@ -381,8 +435,11 @@ class Sound:
     async def _download(self, entry, state):
         publish = lambda: self.app.bus.publish("sound_download", **{k: v for k, v in state.items() if k != "cancel"})  # noqa: E731
         folder = self.folder()
-        archive = folder / Path(entry["url"]).name
         try:
+            if entry.get("hf"):
+                return await self._download_parts(entry, state, publish)
+            archive = folder / Path(entry["url"]).name
+
             def progress(done, total, rate):
                 state.update(state="downloading", done=done, total=total or state["total"])
                 publish()
@@ -401,8 +458,44 @@ class Sound:
         except Exception as exc:
             state.update(state="cancelled" if state["cancel"] else "failed", error=str(exc)[:300])
             self.app.log(f"sound model {entry['key']}: {type(exc).__name__}: {exc}")
-        publish()
-        self.app.bus.publish("sound_changed")
+        finally:
+            publish()
+            self.app.bus.publish("sound_changed")
+
+    async def _download_parts(self, entry, state, publish):
+        """A model made of several files of a Hugging Face repository (music): the files are chosen from the
+        repository's listing, because publishers add and rename quantisations."""
+        from urllib.parse import quote
+        token = self.app.secrets.get("hf_token")
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        listing = {}
+        for repo in {s["repo"] for p in entry["hf"] for s in p["sources"]}:
+            tree = await fetch_json(f"{HF}/api/models/{repo}/tree/main?recursive=true", headers)
+            listing[repo] = [{"path": f["path"], "size": (f.get("lfs") or {}).get("size") or f.get("size") or 0}
+                             for f in tree if f.get("type") == "file"]
+        chosen = []
+        for part in entry["hf"]:
+            repo, f = pick_file(listing, part)
+            if not f:
+                raise SoundError(f"The {part['slot']} file was not found in {part['sources'][0]['repo']}. The publisher "
+                                 "may have renamed it.")
+            chosen.append((repo, f))
+        state["total"] = sum(f["size"] for _, f in chosen)
+        target, before = self.folder() / entry["key"], 0
+        for repo, f in chosen:
+            dest = target / Path(f["path"]).name
+
+            def progress(done, total, rate, before=before):
+                state.update(state="downloading", done=before + done)
+                publish()
+            if not (dest.exists() and f["size"] and dest.stat().st_size == f["size"]):
+                await fetch(f"{HF}/{repo}/resolve/main/{quote(f['path'])}?download=true", dest, state=state, headers=headers,
+                            expected_size=f["size"] or None, progress=progress)
+            before += f["size"]
+        self._insert({"id": entry["key"], "kind": "local", "role": entry["role"], "family": entry["family"],
+                      "name": entry["name"], "path": str(target), "size": state["total"], "licence": entry["licence"],
+                      "settings": self._ace_settings(target)})
+        state.update(state="done", done=state["total"])
 
     @staticmethod
     def _unpack(archive, target):
@@ -740,6 +833,8 @@ class Sound:
                         job["models"][m["id"]] = {"family": m["family"], "dir": m["path"]}
                         seg = {"model": m["id"], "text": spell_english(ln["text"]) if v["language"].startswith("English") else ln["text"],
                                "speaker": ln.get("speaker") or "", "speed": float(ln.get("speed") or speed or 1.0)}
+                        if ln.get("pause") is not None:        # the silence after this line (a script's own rhythm)
+                            seg["pause"] = float(ln["pause"])
                         if v["kind"] == "recording":
                             row = self.db.get("voices", v["id"].removeprefix("voice:"))
                             seg.update(ref_audio=row["ref_audio"], ref_text=row.get("ref_text") or "")
@@ -857,17 +952,205 @@ class Sound:
         self.db.update("sound_models", row["id"], {"last_used": now()})
         return result
 
+    # ------------------------------------------------------------------ the music engine (acestep.cpp)
+    def music_engine(self):
+        """The folder with ace-lm and ace-synth: DVA_ACE_DIR, a folder the user chose, or the installed one."""
+        for source, folder in (("your own (DVA_ACE_DIR)", os.environ.get("DVA_ACE_DIR")),
+                               ("a folder you chose", self.db.setting("music_engine_dir", "")),
+                               ("installed", str(self.app.paths.data / "runtimes" / "acestep"))):
+            if folder and (Path(folder) / ACE_LM).exists() and (Path(folder) / ACE_SYNTH).exists():
+                return {"dir": str(folder), "source": source}
+        return None
+
+    def set_music_engine(self, folder):
+        folder = str(folder or "").strip()
+        if folder and not ((Path(folder) / ACE_LM).exists() and (Path(folder) / ACE_SYNTH).exists()):
+            raise ValueError(f"{folder} does not contain {ACE_LM} and {ACE_SYNTH}")
+        self.db.set_setting("music_engine_dir", folder)
+        self.app.bus.publish("sound_changed")
+
+    def engine_source(self):
+        v = json.loads(Path(__file__).with_name("versions.json").read_text(encoding="utf-8"))
+        repo = os.environ.get("DVA_MUSIC_ENGINE_REPO") or v["music_engine_repo"]
+        return {"repo": repo, "tag": v["music_engine_tag"], "commit": v["acestep_commit"], "built_from": v["acestep_repo"],
+                "url": f"https://github.com/{repo}/releases/download/{v['music_engine_tag']}/{ACE_ASSET}",
+                "workflow": f"https://github.com/{repo}/actions/workflows/music-engine.yml"}
+
+    async def install_music_engine(self):
+        """Download the programs that KimiLM's own repository built from the pinned acestep.cpp source."""
+        if getattr(self, "engine_installing", None):
+            return
+        src = self.engine_source()
+        state = self.engine_installing = {"state": "downloading", "done": 0, "total": 0, "cancel": False}
+        publish = lambda **kw: self.app.bus.publish("music_engine", **kw)        # noqa: E731
+        target = self.app.paths.data / "runtimes" / "acestep"
+        archive = target.with_name(ACE_ASSET)
+        try:
+            def progress(done, total, rate):
+                state.update(done=done, total=total)
+                publish(action="progress", done=done, total=total)
+            try:
+                await fetch(src["url"], archive, state=state, progress=progress)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404:
+                    raise SoundError("The music engine has not been built yet. It is built once by the workflow "
+                                     f"“Build music engine” in {src['repo']} on GitHub (Actions → Build music engine → "
+                                     "Run workflow, about 15 minutes); then press Install again. Or choose a folder "
+                                     "that already holds the programs.") from exc
+                raise
+            tmp = target.with_name("acestep.tmp")
+            shutil.rmtree(tmp, ignore_errors=True)
+            tmp.mkdir(parents=True)
+            if archive.suffix == ".zip":
+                from .runtime import Runtime
+                await asyncio.to_thread(Runtime._extract, archive, tmp)
+            else:
+                with tarfile.open(archive, "r:*") as tar:
+                    tar.extractall(tmp, filter="data")
+            archive.unlink(missing_ok=True)
+            exe = next(iter(tmp.rglob(ACE_SYNTH)), None)
+            if not exe or not (exe.parent / ACE_LM).exists():
+                raise SoundError("The download did not contain the music programs (ace-lm, ace-synth)")
+            shutil.rmtree(target, ignore_errors=True)
+            shutil.move(str(exe.parent), str(target))
+            shutil.rmtree(tmp, ignore_errors=True)
+            if os.name != "nt":
+                for name in (ACE_LM, ACE_SYNTH):
+                    (target / name).chmod(0o755)
+            self.db.set_setting("music_engine_tag", src["tag"])
+            publish(action="installed")
+        except Exception as exc:
+            self.app.log(f"music engine: {type(exc).__name__}: {exc}")
+            publish(action="failed", error=str(exc)[:500])
+        finally:
+            self.engine_installing = None
+            self.app.bus.publish("sound_changed")
+
+    def remove_music_engine(self):
+        shutil.rmtree(self.app.paths.data / "runtimes" / "acestep", ignore_errors=True)
+        self.app.bus.publish("sound_changed")
+
+    def local_music(self):
+        """True when music without a named model is made on this computer."""
+        row = self.default("music")
+        return bool(row and row["kind"] == "local")
+
+    async def _program(self, cmd, cwd, status, label, minutes):
+        """Run one of the music programs to its end; returns its last lines. Stops it when the job is stopped."""
+        env = {**os.environ}
+        env.pop("DVA_TOKEN", None)
+        if os.name != "nt":
+            env["LD_LIBRARY_PATH"] = f"{cwd}{os.pathsep}{env.get('LD_LIBRARY_PATH', '')}"
+        proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(cwd), env=env, stdout=asyncio.subprocess.PIPE,
+                                                    stderr=asyncio.subprocess.STDOUT,
+                                                    creationflags=0x08000000 if os.name == "nt" else 0)
+        tail, began = [], time.monotonic()
+
+        async def pump():
+            buffer = b""
+            while True:
+                chunk = await proc.stdout.read(512)
+                if not chunk:
+                    break
+                buffer += chunk
+                *lines, buffer = re.split(rb"[\r\n]", buffer)
+                for raw in lines:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if line:
+                        tail.append(line)
+                        del tail[:-40]
+                        m = re.match(r"\[([\w-]+)\]\s*(Step \d+)?", line)
+                        if m:
+                            status(f"{label} ({int(time.monotonic() - began)} s{', ' + m.group(2).lower() if m.group(2) else ''})")
+        try:
+            await asyncio.wait_for(pump(), minutes * 60)
+            code = await proc.wait()
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise SoundError(f"The music took longer than the limit of {minutes:g} minutes and was stopped. Ask for a "
+                             "shorter piece, or raise the limit in Sound → Voices & models.")
+        except asyncio.CancelledError:
+            proc.kill()
+            raise
+        return code, tail
+
+    async def _music_local(self, row, prompt, seconds, instrumental, lyrics, language, seed, status):
+        engine = self.music_engine()
+        if not engine:
+            raise SoundError("The music engine is not installed (Sound → Voices & models → Music on this computer).")
+        s = row.get("settings") or {}
+        work = self.app.paths.data / "tmp" / new_id("mus_")
+        work.mkdir(parents=True)
+        request = {"caption": prompt, "lyrics": lyrics.strip() or ("[Instrumental]" if instrumental else ""),
+                   "duration": float(max(10, min(600, int(seconds or 30)))), "seed": int(seed) if seed not in (None, "") else -1,
+                   "inference_steps": int(s.get("steps") or 8), "shift": float(s.get("shift") or 3.0),
+                   "lm_model": s.get("lm") or "", "synth_model": s.get("dit") or "", "output_format": "mp3"}
+        if language:
+            request["vocal_language"] = language
+        (work / "request.json").write_text(json.dumps(request), encoding="utf-8")
+        folder = Path(row["path"])
+        need = int(sum(p.stat().st_size for p in folder.glob("*.gguf")) * 1.1) + 2**30
+        minutes = float(self.db.setting("music_timeout_minutes", 90))
+        try:
+            status("Making room in memory for the music model…")
+            try:
+                await self.app.images._free_memory(need)
+            except Exception:
+                pass
+            exe = Path(engine["dir"])
+            code, tail = await self._program([str(exe / ACE_LM), "--models", str(folder), "--request", str(work / "request.json")],
+                                             exe, status, "Planning the piece", minutes)
+            planned = work / "request0.json"
+            if code != 0 or not planned.exists():
+                raise SoundError(self._music_error(tail, code, "planning"))
+            code, tail = await self._program([str(exe / ACE_SYNTH), "--models", str(folder), "--request", str(planned)],
+                                             exe, status, "Rendering the sound", minutes)
+            made = next(iter(sorted(work.glob("request0*.mp3")) + sorted(work.glob("request0*.wav"))), None)
+            if code != 0 or not made:
+                raise SoundError(self._music_error(tail, code, "rendering"))
+            try:
+                plan = json.loads(planned.read_text(encoding="utf-8"))
+            except ValueError:
+                plan = {}
+            keep = work.with_suffix(made.suffix)
+            shutil.move(str(made), str(keep))
+            words = plan.get("lyrics") or ""
+            facts = {k: plan[k] for k in ("bpm", "keyscale", "timesignature", "vocal_language") if plan.get(k)}
+            return keep, ("" if words.strip() == "[Instrumental]" else words), facts
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def _music_error(self, tail, code, phase):
+        self.app.log(f"music engine ({phase}) exit {code}: " + " | ".join(tail[-10:]))
+        text = " ".join(tail[-15:]).lower()
+        if "alloc" in text or "out of memory" in text or code in (-9, 137):
+            return "This computer ran out of memory for the music model. Close other apps, or ask for a shorter piece."
+        last = next((line for line in reversed(tail) if "fatal" in line.lower() or "error" in line.lower()), "")
+        return (f"The music engine stopped while {phase} (code {code})" + (f": {last[:300]}" if last else ".")
+                + " Its last lines are in the app's log.")
+
     # ------------------------------------------------------------------ music
     async def music(self, prompt, *, out_dir, model=None, seconds=None, instrumental=False, lyrics="", chat_id=None,
-                    job_id=None, on_status=None):
+                    job_id=None, on_status=None, language="", seed=None):
         status = on_status or (lambda text: None)
         prompt = (prompt or "").strip()
         if not prompt:
             raise SoundError("Describe the music: the style, the instruments, the mood, the tempo")
         row = self.get(model) if model else self.default("music")
         if not row or row["role"] != "music" or not row["ready"]:
-            raise SoundError("No music model is set up. Music is made online for now (Google's Lyria): open Sound → "
-                             "Models, add the Google key and a music model.")
+            raise SoundError("No music model is set up. Open Sound → Voices & models: install the music engine and "
+                             "download ACE-Step for this computer, or add an online music model (Google's Lyria).")
+        if row["kind"] == "local":
+            started = time.monotonic()
+            async with self.lock:
+                made, words, facts = await self._music_local(row, prompt, seconds, instrumental, lyrics, language, seed, status)
+            dest = Path(out_dir) / f"{slug(prompt)[:40]}-{time.strftime('%Y%m%d-%H%M%S')}{made.suffix}"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(made), str(dest))
+            self.db.update("sound_models", row["id"], {"last_used": now()})
+            params = {"mode": "music", "seconds": seconds_of(dest), "words": words[:2000], **facts,
+                      "took": round(time.monotonic() - started, 1)}
+            return self._record(dest, prompt, row["name"], params, chat_id, "local")
         conf = self._online_ok(row)
         ask = prompt
         if seconds:
@@ -896,9 +1179,11 @@ class Sound:
         return self._record(dest, prompt, row["name"], params, chat_id, "online")
 
     # ------------------------------------------------------------------ mixing
-    async def mix(self, tracks, *, out_dir, name="mix", fmt="mp3", length="first", fade=2.0, chat_id=None):
-        """Lay recordings over each other: [{"path", "volume" (1 = as it is), "start" (seconds)}]. `length` is
-        "first" (as long as the first track, e.g. the voice, plus the fade) or "longest"."""
+    async def mix(self, tracks, *, out_dir, name="mix", fmt="mp3", length="first", fade=2.0, chat_id=None, keep=True):
+        """Lay recordings over each other: [{"path", "volume" (1 = as it is), "start" (seconds), "from" / "to" (the
+        part of the recording to use), "fade_in", "fade_out", "mute"}]. `length` is "first" (as long as the first
+        track, e.g. the voice, plus the fade) or "longest". `keep=False` makes a preview that is not put in the library."""
+        tracks = [t for t in tracks or [] if not t.get("mute")]
         if not tracks:
             raise SoundError("Give the recordings to mix")
 
@@ -906,7 +1191,17 @@ class Sound:
             import numpy as np
             rate, loaded = 44100, []
             for t in tracks:
-                samples = read_pcm(t["path"], rate, 2) * float(t.get("volume", 1.0) or 1.0)
+                samples = read_pcm(t["path"], rate, 2)
+                a, b = int(float(t.get("from") or 0) * rate), int(float(t.get("to") or 0) * rate)
+                samples = samples[max(0, a):b if b > a else None] * float(1.0 if t.get("volume") is None else t["volume"])
+                for key, ramp in (("fade_in", (0.0, 1.0)), ("fade_out", (1.0, 0.0))):       # a track's own fades
+                    n = min(len(samples), int(float(t.get(key) or 0) * rate))
+                    if n:
+                        curve = np.linspace(*ramp, n, dtype="float32")[:, None]
+                        if key == "fade_in":
+                            samples[:n] *= curve
+                        else:
+                            samples[-n:] *= curve
                 loaded.append((int(float(t.get("start") or 0) * rate), samples))
             ends = [start + len(s) for start, s in loaded]
             total = min(max(ends), ends[0] + int(fade * rate)) if length == "first" else max(ends)
@@ -923,19 +1218,39 @@ class Sound:
             dest = Path(out_dir) / f"{slug(name)[:40]}-{time.strftime('%Y%m%d-%H%M%S')}.{fmt if fmt in ('wav', 'mp3', 'm4a') else 'mp3'}"
             return write_audio(dest, out, rate), round(total / rate, 2)
         dest, seconds = await asyncio.to_thread(work)
-        return self._record(dest, name, "mix", {"mode": "mix", "seconds": seconds,
-                                                "tracks": [Path(t["path"]).name for t in tracks]}, chat_id, "local")
+        params = {"mode": "mix", "seconds": seconds, "tracks": [Path(t["path"]).name for t in tracks]}
+        if not keep:
+            return {"id": "", "kind": "audio", "path": str(dest), "name": dest.name, "prompt": name, "model_name": "mix",
+                    "source": "local", "params": params}
+        return self._record(dest, name, "mix", params, chat_id, "local")
+
+    @staticmethod
+    def peaks(path, n=240):
+        """The loudness of a recording in `n` steps (for drawing it), and its length."""
+        import numpy as np
+        samples = np.abs(read_pcm(path, 8000, 1).reshape(-1))
+        if not len(samples):
+            return {"seconds": 0.0, "peaks": []}
+        edges = np.linspace(0, len(samples), min(n, len(samples)) + 1).astype(int)
+        peaks = [round(float(samples[a:b].max()) if b > a else 0.0, 3) for a, b in zip(edges[:-1], edges[1:])]
+        return {"seconds": round(len(samples) / 8000, 2), "peaks": peaks}
 
     # ------------------------------------------------------------------ the Sound window
     def status(self):
         can = self.can()
+        engine = self.music_engine()
         return {"library": self.library(), "espeak": self.espeak(), "can": can, "models": self.models(),
+                "music_engine": {"installed": bool(engine), **(engine or {}), **self.engine_source(),
+                                 "installing": getattr(self, "engine_installing", None) and
+                                 {k: v for k, v in self.engine_installing.items() if k != "cancel"},
+                                 "timeout_minutes": self.db.setting("music_timeout_minutes", 90)},
                 "catalog": self.catalog(), "voices": self.voices(),
                 "defaults": {role: (self.default(role) or {}).get("id") for role in ROLES},
                 "default_voice": (self.voice() if can["tts"] and any(v["ready"] for v in self.voices()) else {}).get("id"),
                 "online": [{"id": p, "name": s["name"], "ready": self.app.providers.ready(p),
                             "roles": [r for r in ("tts", "stt", "music") if r in s]} for p, s in ONLINE.items()],
                 "jobs": list(self.jobs.values())[-8:],
+                "text_model": bool(self.app.router.pick("worker")[0]),
                 "claude": "Claude does not speak, listen or make music through its interface. A chat that runs on "
                           "Claude can still use the sound tools: they work with the models chosen here.",
                 "note": "" if self.espeak() else
@@ -953,8 +1268,11 @@ class Sound:
 
     def start_job(self, kind, data):
         """A request from the Sound window: runs in the background, reports through event `sound_job`."""
-        job = {"id": new_id("snd_"), "kind": kind, "state": "running", "text": "Starting…", "result": None, "error": None,
-               "title": str(data.get("text") or data.get("prompt") or Path(str(data.get("audio") or "")).name)[:120], "started": now()}
+        # "what" repeats the kind: an event's own field `kind` is the event's name, so `kind` is lost on the way
+        job = {"id": new_id("snd_"), "kind": kind, "what": kind, "state": "running", "text": "Starting…", "result": None, "error": None,
+               "title": (("Podcast: " + ", ".join(Path(str(s)).name for s in data.get("sources") or ["a text"])) if kind == "podcast"
+                         else str(data.get("text") or data.get("prompt") or Path(str(data.get("audio") or "")).name))[:120],
+               "started": now()}
         self.jobs[job["id"]] = job
         for old in list(self.jobs)[:-16]:
             if self.jobs[old]["state"] != "running":
@@ -980,10 +1298,25 @@ class Sound:
                 elif kind == "music":
                     job["result"] = await self.music(data.get("prompt"), out_dir=out, model=data.get("model"),
                                                      seconds=data.get("seconds"), instrumental=bool(data.get("instrumental")),
-                                                     lyrics=data.get("lyrics") or "", on_status=status)
+                                                     lyrics=data.get("lyrics") or "", language=data.get("language") or "",
+                                                     seed=data.get("seed"), on_status=status)
+                elif kind == "podcast":
+                    from . import podcast
+                    job["result"] = await podcast.make(self.app, sources=data.get("sources") or [], text=data.get("text") or "",
+                                                       minutes=data.get("minutes") or 5, style=data.get("style") or "conversation",
+                                                       hosts=data.get("hosts"), voices=data.get("voices"),
+                                                       focus=data.get("focus") or "", model=data.get("model"),
+                                                       music=bool(data.get("music")), out_dir=out, on_status=status)
                 elif kind == "mix":
-                    job["result"] = await self.mix(data.get("tracks") or [], out_dir=out, name=data.get("name") or "mix",
-                                                   fmt=data.get("format") or "mp3", length=data.get("length") or "first")
+                    preview = bool(data.get("preview"))                      # heard once, not kept in the library
+                    if preview:
+                        for old in (self.app.paths.data / "sound" / "previews").glob("*"):
+                            old.unlink(missing_ok=True)
+                    job["result"] = await self.mix(data.get("tracks") or [], name=data.get("name") or "mix",
+                                                   out_dir=out / "previews" if preview else out,
+                                                   fmt="wav" if preview else data.get("format") or "mp3",
+                                                   length=data.get("length") or "first", keep=not preview,
+                                                   fade=float(2.0 if data.get("fade") is None else data["fade"]))
                 else:
                     raise SoundError(f"Unknown kind of sound job: {kind}")
                 job.update(state="done", text="Done")
