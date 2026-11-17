@@ -39,6 +39,16 @@ saved for those providers and count against the monthly online budget. Claude re
 them: a chat on Claude asks for pictures through the same tools. Pictures appear in the chat where they were
 made, can be downloaded, and are kept in a library with their prompt, model and seed.
 
+From 2.12.0 KimiLM **speaks, listens and makes music** (the Sound window, and the tools `speak`, `list_voices`,
+`transcribe_audio`, `generate_music` and `mix_audio` for agents). On this computer: Kokoro (28 English voices and
+Chinese), Pocket TTS (a voice made from a 10 to 30 second recording: your own after you confirm it, another
+person's only with a recording of their consent) and Whisper (transcription in 99 languages, with times and
+subtitle files), downloaded in the app and run on the processor by the sherpa-onnx library. A script with one line
+per speaker (`Host: …`, `Guest: …`) becomes one recording, with a voice for each speaker: a podcast. Online:
+OpenAI and Google voices and transcription, and Google's Lyria for music, with the keys already saved, counted
+against the monthly budget. Replies can be read aloud and messages can be dictated. After pulling this version,
+install the new dependency once: `cd engine` and `.\.venv\Scripts\python.exe -m pip install -r requirements.txt`.
+
 KimiLM was called **Datavera Agent** up to 2.1.x. Version 2.2.0 renamed it; see "Upgrading from Datavera Agent".
 
 ```

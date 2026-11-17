@@ -408,3 +408,14 @@ label.menu-item { flex-direction: row; }
 .image-source img { width: 56px; height: 56px; object-fit: cover; border-radius: 8px; }
 .recipe { display: flex; align-items: center; gap: 12px; padding: 10px 4px; border-top: 1px solid var(--line); }
 .recipe .grow { display: flex; flex-direction: column; gap: 3px; }
+
+/* sound (2.12.0) */
+.audio-clip { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
+.audio-clip audio { height: 34px; width: 260px; flex-shrink: 0; }
+.audio-meta { flex: 1; min-width: 0; font-size: 13px; }
+.tool-media .audio-clip { padding: 4px 0 0; }
+.icon-btn.recording { color: var(--danger); animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .45; } }
+.transcript { white-space: pre-wrap; max-height: 320px; overflow-y: auto; background: var(--surface-2); padding: 10px 12px; border-radius: 10px; font-size: 13.5px; line-height: 1.5; }
+.cast-name { width: 120px; flex-shrink: 0; font-weight: 600; }
+

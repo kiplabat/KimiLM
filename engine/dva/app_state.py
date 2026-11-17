@@ -26,13 +26,14 @@ from .scheduler import Scheduler
 from .secrets import Secrets
 from .services import Services
 from .skills import Skills
+from .sound import Sound
 
 STATE = None
 
 DEFAULT_SETTINGS = {
     "default_harness": "agent", "default_compute": "auto", "default_ctx": 8192, "max_reply_tokens": 2048,
     "unload_after_minutes": 20, "memory_enabled": True, "learn_enabled": True, "learn_delay_seconds": 45,
-    "allow_python": True, "approval_timeout_minutes": 360, "max_native_tools": 38, "python_timeout_seconds": 180,
+    "allow_python": True, "approval_timeout_minutes": 360, "max_native_tools": 44, "python_timeout_seconds": 180,
     "max_loaded_models": 3, "browser_search": True, "max_parallel_agents": 4, "turn_time_limit_minutes": 30,
     "cloud_privacy": "ask", "cloud_budget_monthly": 10.0, "cloud_max_parallel": 4,
     "team_mode": "auto", "max_team_tasks": 8, "team_time_limit_minutes": 120,
@@ -94,6 +95,7 @@ class App:
         self.scheduler = Scheduler(self)
         self.services = Services(self)
         self.images = Images(self)
+        self.sound = Sound(self)
         self.approvals = {}
         self.pauses = {}          # chat id -> {"event", "reason"}: paused agent loops (orchestrator.pause_chat)
         self.orchestras = {}      # chat id -> running Orchestra (a team led from that chat)
@@ -115,6 +117,10 @@ class App:
         if self.db.setting("max_native_tools") == 36 and not self.db.setting("native_tools_2_11"):
             self.db.set_setting("max_native_tools", 38)
         self.db.set_setting("native_tools_2_11", True)
+        # 2.12.0 adds up to five sound tools (offered once sound models are set up).
+        if self.db.setting("max_native_tools") == 38 and not self.db.setting("native_tools_2_12"):
+            self.db.set_setting("max_native_tools", 44)
+        self.db.set_setting("native_tools_2_12", True)
 
     def _release_pending_after_restart(self):
         """Follow-ups queued while a reply was running are not sent if the app closed meanwhile: they show as

@@ -75,7 +75,44 @@ async def openai_models(request: Request):
     if request.headers.get("authorization") != "Bearer sk-test":
         return JSONResponse({"error": {"message": "Incorrect API key"}}, 401)
     return {"data": [{"id": "gpt-test-pro"}, {"id": "gpt-test-mini"}, {"id": "text-embedding-3-small"},
-                     {"id": "gpt-image-test"}]}
+                     {"id": "gpt-image-test"}, {"id": "gpt-test-tts"}, {"id": "gpt-test-transcribe"}]}
+
+
+def tone(seconds=1.0, pitch=440, rate=24000):
+    import io
+    import math
+    import struct
+    import wave
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(rate)
+        f.writeframes(b"".join(struct.pack("<h", int(9000 * math.sin(2 * math.pi * pitch * i / rate)))
+                               for i in range(int(rate * seconds))))
+    return buf.getvalue()
+
+
+@app.post("/openai/v1/audio/speech")
+async def openai_speech(request: Request):
+    from fastapi.responses import Response
+    body = await request.json()
+    REQUESTS.append({"provider": "openai-sound", "what": "speech", "body": body, "headers": dict(request.headers)})
+    if request.headers.get("authorization") != "Bearer sk-test":
+        return JSONResponse({"error": {"message": "Incorrect API key"}}, 401)
+    if "forbidden words" in body.get("input", ""):
+        return JSONResponse({"error": {"message": "This text cannot be spoken."}}, 400)
+    return Response(tone(1.5), media_type="audio/wav")
+
+
+@app.post("/openai/v1/audio/transcriptions")
+async def openai_transcriptions(request: Request):
+    form = await request.form()
+    data = await form["file"].read()
+    REQUESTS.append({"provider": "openai-sound", "what": "transcription", "headers": dict(request.headers),
+                     "body": {"model": form.get("model"), "language": form.get("language"), "file": form["file"].filename,
+                              "bytes": len(data), "mp3": data[:3] == b"ID3" or data[:1] == b"\xff"}})
+    return {"text": "The words OpenAI heard."}
 
 
 def png(colour=(200, 30, 30), size=(64, 48)):
@@ -230,7 +267,21 @@ async def gemini_models(request: Request):
     if request.headers.get("authorization") != "Bearer gm-test":
         return JSONResponse([{"error": {"message": "API key not valid"}}], 400)
     return {"object": "list", "data": [{"id": "models/gemini-test-pro"}, {"id": "models/gemini-test-flash"},
-                                       {"id": "models/text-embedding-004"}, {"id": "models/gemini-test-flash-image"}]}
+                                       {"id": "models/text-embedding-004"}, {"id": "models/gemini-test-flash-image"},
+                                       {"id": "models/gemini-test-flash-tts"}, {"id": "models/lyria-test"}]}
+
+
+@app.post("/gemini/interactions")
+async def gemini_interactions(request: Request):
+    import base64
+    body = await request.json()
+    REQUESTS.append({"provider": "gemini-sound", "body": body, "headers": dict(request.headers)})
+    if request.headers.get("x-goog-api-key") != "gm-test":
+        return JSONResponse({"error": {"message": "API key not valid"}}, 400)
+    content = [{"type": "audio", "data": base64.b64encode(tone(2.0, 330)).decode()}]
+    if body["model"].startswith("lyria"):
+        content.insert(0, {"type": "text", "text": "[Intro] soft piano [Verse] strings join"})
+    return {"steps": [{"type": "model_output", "content": content}]}
 
 
 @app.post("/gemini/models/{name}:generateContent")
@@ -239,6 +290,10 @@ async def gemini_generate(name: str, request: Request):
     REQUESTS.append({"provider": "gemini-images", "model": name, "body": body, "headers": dict(request.headers)})
     if request.headers.get("x-goog-api-key") != "gm-test":
         return JSONResponse({"error": {"message": "API key not valid"}}, 400)
+    parts = body["contents"][0]["parts"]
+    if any((p.get("inlineData") or {}).get("mimeType", "").startswith("audio/") for p in parts):
+        REQUESTS[-1]["provider"] = "gemini-sound"
+        return {"candidates": [{"content": {"parts": [{"text": "The words Google heard."}]}}]}
     return {"candidates": [{"content": {"parts": [{"text": "Here is the picture."},
                                                   {"inlineData": {"mimeType": "image/png", "data": png((30, 200, 30))}}]}}],
             "usageMetadata": {"promptTokenCount": 12, "candidatesTokenCount": 1300}}

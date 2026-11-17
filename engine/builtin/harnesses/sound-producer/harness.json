@@ -1,0 +1,19 @@
+{
+  "name": "Sound producer",
+  "description": "Makes voiceovers, narrations and podcasts: writes the script, records it with the voices you have (also your own), adds music under it, and writes down recordings. Needs sound models (Sound).",
+  "type": "loop",
+  "mode": "agent",
+  "tools": [
+    "files",
+    "web",
+    "sound",
+    "memory"
+  ],
+  "connectors": false,
+  "max_steps": 12,
+  "max_reply_tokens": 4096,
+  "temperature": 0.6,
+  "memory": true,
+  "learn": true,
+  "icon": "pen"
+}

@@ -14,7 +14,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from test_engine import ENGINE, TESTS, free_port, last_assistant, tiny_gguf, wait_job, wait_picture
+from test_engine import ENGINE, TESTS, free_port, last_assistant, tiny_gguf, wait_job, wait_picture, wait_sound
 
 
 @pytest.fixture(scope="module")
@@ -31,6 +31,7 @@ def env():
         wrapper.chmod(0o755)
     port, token = free_port(), "test-token"
     env = {**os.environ, "DVA_TOKEN": token, "DVA_LLAMA_SERVER": str(wrapper), "DVA_SECRETS": "file",
+           "DVA_SOUND_WORKER": str(TESTS / "fake_sound_worker.py"), "DVA_SOUND_LIBRARY": "2.0.1",
            "PYTHONPATH": str(ENGINE), "OLLAMA_MODELS": str(tmp / "ollama"), "HF_HOME": str(tmp / "hf"),
            "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}
     log = tmp / "engine-output.log"
@@ -285,6 +286,94 @@ def test_online_pictures_with_openai_and_google_and_not_with_claude(env):
     assert cloud_requests(env, "openai-images")[-1]["body"]["prompt"] == "a red kite"
     for m in (gpt, gem):
         c.delete(f"/api/images/models/{m['id']}")
+
+
+def test_online_voices_transcription_and_music_with_openai_and_google(env):
+    c = env["c"]
+    state = c.get("/api/sound").json()
+    assert {p["id"]: p["roles"] for p in state["online"]} == {"openai": ["tts", "stt"], "google": ["tts", "stt", "music"]}
+    assert not any(state["can"].values())
+    # Claude neither speaks nor listens: said plainly
+    for call in (c.get("/api/sound/online/anthropic/tts/models"),
+                 c.post("/api/sound/models", json={"provider": "anthropic", "role": "tts", "remote_id": "claude-test-opus"})):
+        assert call.status_code == 400 and "Claude does not speak, listen or make music" in call.json()["error"]
+    assert c.post("/api/sound/models", json={"provider": "openai", "role": "music", "remote_id": "x"}).status_code == 400
+    # each provider's own list says which of its models speak, listen and make music
+    assert c.get("/api/sound/online/openai/tts/models").json() == {"models": ["gpt-test-tts"], "from": "provider"}
+    assert c.get("/api/sound/online/openai/stt/models").json()["models"] == ["gpt-test-transcribe"]
+    assert c.get("/api/sound/online/google/tts/models").json()["models"] == ["gemini-test-flash-tts"]
+    assert c.get("/api/sound/online/google/music/models").json()["models"] == ["lyria-test"]
+    assert c.get("/api/sound/online/google/stt/models").json()["models"] == ["gemini-test-flash"]
+    chat_models = {m["remote_id"] for m in c.get("/api/online").json()["models"]}
+    assert not chat_models & {"gpt-test-tts", "gpt-test-transcribe", "gemini-test-flash-tts", "lyria-test"}
+    add = lambda p, role, rid: c.post("/api/sound/models", json={"provider": p, "role": role, "remote_id": rid}).json()   # noqa: E731
+    o_tts, o_stt = add("openai", "tts", "gpt-test-tts"), add("openai", "stt", "gpt-test-transcribe")
+    g_tts, g_music, g_stt = add("google", "tts", "gemini-test-flash-tts"), add("google", "music", "lyria-test"), add("google", "stt", "gemini-test-flash")
+    assert o_tts["ready"] and g_music["role"] == "music" and g_music["settings"] == {"per_item": 0.1}
+    voices = {v["id"] for v in c.get("/api/sound").json()["voices"]}
+    assert "openai-gpt-test-tts:alloy" in voices and "google-gemini-test-flash-tts:Kore" in voices and len(voices) == 11 + 30
+    before = c.get("/api/online/usage").json()["spent"]
+
+    said = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "speak", "text": "Good morning, Nairobi.", "voice": "Alloy"}).json())
+    assert said["state"] == "done" and said["result"]["source"] == "online" and said["result"]["params"]["seconds"] == 1.5, said
+    sent = [r for r in cloud_requests(env, "openai-sound") if r["what"] == "speech"][-1]
+    assert sent["body"] == {"model": "gpt-test-tts", "input": "Good morning, Nairobi.", "voice": "alloy", "response_format": "wav"}
+    assert said["result"]["params"]["cost"] > 0 and c.get("/api/online/usage").json()["spent"] > before
+    # a dialogue of two Google voices is one request; a third voice is asked for separately and joined here
+    script = "Joe: How is it going?\nJane: Not too bad.\nJoe: Good."
+    duo = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "speak", "text": script, "voices": {"Joe": "Puck", "Jane": "Kore"}}).json())
+    assert duo["state"] == "done" and duo["result"]["params"]["voices"] == {"Joe": "Puck", "Jane": "Kore"}, duo
+    body = cloud_requests(env, "gemini-sound")[-1]["body"]
+    assert body["model"] == "gemini-test-flash-tts" and body["response_format"] == {"type": "audio"}
+    assert body["generation_config"]["speech_config"] == {"mode": "conversational", "speakers": [
+        {"speaker": "Joe", "voice": "Puck"}, {"speaker": "Jane", "voice": "Kore"}]}
+    assert [(p["text"], p["annotations"][0]["speaker"]) for p in body["input"][0]["content"]] == [
+        ("How is it going?", "Joe"), ("Not too bad.", "Jane"), ("Good.", "Joe")]
+    count = len(cloud_requests(env, "gemini-sound"))
+    trio = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "speak", "text": script + "\nAmy: And me.",
+                                                         "voices": {"Joe": "Puck", "Jane": "Kore", "Amy": "Alloy"}}).json())
+    assert trio["state"] == "done" and trio["result"]["params"]["seconds"] > 3.5, trio
+    assert len(cloud_requests(env, "gemini-sound")) == count + 1 and cloud_requests(env, "openai-sound")[-1]["body"]["input"] == "And me."
+    single = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "speak", "text": "One voice.", "voice": "Kore"}).json())
+    assert single["state"] == "done" and cloud_requests(env, "gemini-sound")[-1]["body"]["generation_config"]["speech_config"] == [{"voice": "Kore"}]
+    # transcription: the recording is sent small (mp3, 16 kHz); the default is the first one added
+    heard = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "transcribe", "audio": said["result"]["path"], "language": "en"}).json())
+    assert heard["state"] == "done" and heard["result"]["text"] == "The words OpenAI heard." and heard["result"]["source"] == "online", heard
+    sent = [r for r in cloud_requests(env, "openai-sound") if r["what"] == "transcription"][-1]["body"]
+    assert sent["model"] == "gpt-test-transcribe" and sent["language"] == "en" and sent["mp3"] and 0 < sent["bytes"] < 40000
+    heard = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "transcribe", "audio": said["result"]["path"], "model": g_stt["id"]}).json())
+    assert heard["result"]["text"] == "The words Google heard."
+    parts = cloud_requests(env, "gemini-sound")[-1]["body"]["contents"][0]["parts"]
+    assert "word for word" in parts[0]["text"] and parts[1]["inlineData"]["mimeType"] == "audio/mpeg"
+    # music: Google's Lyria; the length and "no singing" are said in the prompt, as its documentation asks
+    song = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "music", "prompt": "A calm piano piece", "seconds": 30,
+                                                         "instrumental": True}).json())
+    assert song["state"] == "done" and song["result"]["params"]["mode"] == "music" and song["result"]["name"].endswith(".wav"), song
+    assert song["result"]["params"]["words"].startswith("[Intro]") and song["result"]["params"]["cost"] == 0.1
+    assert cloud_requests(env, "gemini-sound")[-1]["body"] == {
+        "model": "lyria-test", "input": "A calm piano piece\nLength: about 30 seconds.\nInstrumental only, no vocals."}
+    usage = {p["purpose"] for p in c.get("/api/online/usage").json()["by_purpose"]}
+    assert {"speech", "transcription", "music"} <= usage
+    no = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "speak", "text": "some forbidden words", "voice": "Alloy"}).json())
+    assert no["state"] == "failed" and "cannot be spoken" in no["error"]
+    c.put("/api/online/settings", json={"cloud_budget_monthly": 0.000001})
+    broke = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "music", "prompt": "a jingle"}).json())
+    assert broke["state"] == "failed" and "budget" in broke["error"]
+    c.put("/api/online/settings", json={"cloud_budget_monthly": 10})
+
+    # an agent on a local model asks before text goes to an online voice, and before music is made online
+    count = len(cloud_requests(env, "openai-sound"))
+    chat = chat_with(c, env["local"])
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "say aloud: Hello from the agent"}).json()
+    assert wait_job(c, job["job_id"], approve="deny")["status"] == "done"
+    step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
+    assert step["declined"] and len(cloud_requests(env, "openai-sound")) == count
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "compose music: a short jingle"}).json()
+    assert wait_job(c, job["job_id"], approve="allow")["status"] == "done"
+    step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
+    assert step["name"] == "generate_music" and step["ok"] and step["media"][0]["kind"] == "audio", step
+    for m in (o_tts, o_stt, g_tts, g_music, g_stt):
+        c.delete(f"/api/sound/models/{m['id']}")
 
 
 # ------------------------------------------------------------------------------------------- adapters, offline

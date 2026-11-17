@@ -1,6 +1,6 @@
 {
   "name": "Agent",
-  "description": "Works step by step with tools: your folders, the web, a real browser, Python, images (looking at them and making them), skills, connectors, schedules and helper agents.",
+  "description": "Works step by step with tools: your folders, the web, a real browser, Python, images (looking at them and making them), sound (speaking, transcribing, music), skills, connectors, schedules and helper agents.",
   "type": "loop",
   "mode": "agent",
   "tools": [
@@ -13,6 +13,7 @@
     "automation",
     "vision",
     "images",
+    "sound",
     "agents"
   ],
   "connectors": true,

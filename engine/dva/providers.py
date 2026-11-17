@@ -49,7 +49,7 @@ PROVIDERS = {
             "key_url": "https://console.x.ai", "price_prefix": "x-ai/"},
 }
 CUSTOM_PREFIX = "custom-"          # custom OpenAI-compatible endpoints: "custom-<slug>"
-NOT_CHAT = re.compile(r"(embed|whisper|tts|dall-?e|davinci|babbage|moderation|transcribe|realtime|audio|image|imagen|"
+NOT_CHAT = re.compile(r"(embed|whisper|tts|lyria|dall-?e|davinci|babbage|moderation|transcribe|realtime|audio|image|imagen|"
                       r"veo|aqa|search-preview|computer-use|codex-mini|sora|omni-moderation|rerank|guard|"
                       r"text-embedding|learnlm|gemma-?3n?-?e)", re.I)
 ROLES = ("strategist", "worker", "both", "off")

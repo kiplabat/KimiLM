@@ -1,7 +1,7 @@
 # KimiLM
 
 **KimiLM** is a desktop app for AI agents that run on your own computer: chat, projects, memory, skills, plugins
-and connectors, planned runs, scheduled tasks, long-running tasks and pictures, with models you download and run locally
+and connectors, planned runs, scheduled tasks, long-running tasks, pictures and sound, with models you download and run locally
 (CPU or GPU) and, if you choose, online models with your own keys.
 
 - The app (Electron + React): [app/README.md](app/README.md) — how to run it in development and build the installer.
