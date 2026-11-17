@@ -453,7 +453,12 @@ class Turn:
                 mode = self.app.connectors.approval_mode(conf)
                 for t in listed:
                     connector_tools.append(self._connector_tool(cid, conf, t, mode))
+            with_resources = [cid for cid in connector_ids if self.app.connectors.has(cid, "resources")]
+            if with_resources:
+                connector_tools += self._resource_tools(with_resources)
         limit = int(self.harness.get("max_native_tools") or self.db.setting("max_native_tools", 28))
+        if is_cloud(self.model_id):       # the limit protects small local models; online ones take long tool lists
+            limit = max(limit, 128)
         if len(tools) + len(connector_tools) > limit and connector_tools:
             tools += self._connector_meta_tools(connector_ids, connector_tools)
             self.connector_index = connector_tools
@@ -464,14 +469,47 @@ class Turn:
 
     def _connector_tool(self, cid, conf, t, mode):
         async def call(ctx, **args):
-            ok, text = await self.app.connectors.call(cid, t["name"], args)
+            # pictures and files a tool hands back are saved in the chat's folder (so a vision model can look)
+            ok, text = await self.app.connectors.call(cid, t["name"], args, save_dir=ctx.workspace)
             if not ok:
                 raise ToolError(text)
             return text
         changes = mode == "always" or (mode == "changes" and not t["readonly"])
+        shown = t.get("title") or t["name"]
+        warn = " (it deletes or overwrites)" if t.get("destructive") else ""
         return Tool(tool_key(cid, t["name"]), f"[{conf['name']}] {t['description']}", t["parameters"], call,
-                    "connector", changes=changes, label=f"{conf['name']}: {t['name']}", source=f"connector:{cid}",
-                    summary=lambda a, n=t["name"], c=conf["name"]: f"{c} → {n} {json.dumps(a, ensure_ascii=False)[:300]}")
+                    "connector", changes=changes, label=f"{conf['name']}: {shown}", source=f"connector:{cid}",
+                    summary=lambda a, n=shown, c=conf["name"]: f"{c} → {n}{warn} {json.dumps(a, ensure_ascii=False)[:300]}")
+
+    def _resource_tools(self, connector_ids):
+        """Connected servers that offer resources (documents, records, files to read) get two tools, however
+        many servers there are. Reading does not change anything, so it does not ask."""
+        names = {cid: (self.app.connectors.get(cid, reveal=False) or {}).get("name") or cid for cid in connector_ids}
+
+        def pick(connector):
+            hit = next((cid for cid, name in names.items() if connector in (cid, name)), None) if connector else None
+            if hit or len(names) == 1:
+                return hit or next(iter(names))
+            raise ToolError("Say which connector: " + ", ".join(names.values()))
+
+        async def listing(ctx, connector=""):
+            out = []
+            for cid in ([pick(connector)] if connector else list(names)):
+                rows = await self.app.connectors.resources(cid)
+                out.append(f"## {names[cid]}\n" + ("\n".join(
+                    f"- {r['uri']}{' (fill in the blanks)' if r.get('template') else ''} — {r['name']}"
+                    + (f": {r['description'][:160]}" if r["description"] else "") for r in rows[:80]) or "(nothing)"))
+            return "\n\n".join(out)
+
+        async def read(ctx, uri, connector=""):
+            return await self.app.connectors.read_resource(pick(connector), uri, save_dir=ctx.workspace)
+        S = lambda props, req: {"type": "object", "properties": props, "required": req}  # noqa: E731
+        return [Tool("list_connector_resources", "List what connected services offer to read (documents, records, "
+                     "files), each with its address (uri).", S({"connector": {"type": "string"}}, []), listing,
+                     "connector", label="List connector resources", summary=lambda a: "List what connectors offer to read"),
+                Tool("read_connector_resource", "Read one resource of a connected service by its address (uri).",
+                     S({"uri": {"type": "string"}, "connector": {"type": "string"}}, ["uri"]), read, "connector",
+                     label="Read connector resource", summary=lambda a: f"Read {a.get('uri')}")]
 
     def _connector_meta_tools(self, connector_ids, connector_tools):
         """Too many connector tools for a small model's prompt: offer a lookup + call pair instead."""

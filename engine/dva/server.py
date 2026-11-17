@@ -1098,6 +1098,60 @@ def create_app(data_dir=None, resources_dir=None, token=None):
     async def connector_create(request: Request):
         return A().connectors.create(await body(request))
 
+    # MCP servers as other apps describe them (2.10.0): look at what is on this computer, take a configuration
+    # over (pasted text, or servers picked from an app's file), and hand KimiLM's own on
+    @api.get("/api/connectors-found")
+    async def connectors_found():
+        from .mcp_config import find_configs, masked
+        found = await asyncio.to_thread(find_configs)
+        return {"found": [{**f, "servers": [masked(s) for s in f["servers"]]} for f in found]}
+
+    @api.post("/api/connectors-preview")
+    async def connectors_preview(request: Request):
+        """What a pasted configuration contains, before anything is added."""
+        from .mcp_config import masked, parse
+        return {"servers": [masked(s) for s in parse((await body(request)).get("text") or "")]}
+
+    @api.post("/api/connectors-import")
+    async def connectors_import(request: Request):
+        """{text} = a pasted configuration; {path, app, names} = servers of an app found on this computer (the
+        file is read again here, so its secrets never pass through the window)."""
+        from .mcp_config import find_configs, parse
+        data = await body(request)
+        if data.get("path"):
+            found = await asyncio.to_thread(find_configs)
+            group = next((f for f in found if f["path"] == data["path"] and f["app"] == data.get("app")), None)
+            if not group:
+                raise ValueError("That configuration file is not there any more")
+            entries = group["servers"]
+        else:
+            entries = parse(data.get("text") or "")
+        names = data.get("names")
+        if names:
+            entries = [e for e in entries if e["name"] in names]
+        if not entries:
+            raise ValueError("Nothing to add")
+        return A().connectors.import_servers(entries)
+
+    @api.get("/api/connectors-export")
+    async def connectors_export(ids: str = ""):
+        return A().connectors.export_config([i for i in ids.split(",") if i] or None)
+
+    @api.post("/api/connectors/{cid:path}/signout")
+    async def connector_signout(cid: str):
+        await A().connectors.sign_out(cid)
+        return {"ok": True}
+
+    @api.post("/api/connectors/{cid:path}/prompt")
+    async def connector_prompt(cid: str, request: Request):
+        """A prompt the server offers, filled in with the given arguments: text to send in a chat."""
+        data = await body(request)
+        return {"text": await A().connectors.prompt(cid, data.get("name") or "", data.get("arguments") or {})}
+
+    @api.get("/api/connectors/{cid:path}/resource")
+    async def connector_resource(cid: str, uri: str):
+        return {"text": await A().connectors.read_resource(cid, uri)}
+
     @api.put("/api/connectors/{cid:path}/config")
     async def connector_update(cid: str, request: Request):
         return await A().connectors.update(cid, await body(request))

@@ -24,6 +24,12 @@ can also write the set-up of a task or a scheduled task from one sentence (team,
 asking). Agents can work in a **real browser** (open, click, type, choose, download, screenshot), and the computer is
 kept awake while tasks run.
 
+From 2.10.0 **connectors are set up the way other apps do it**: paste the `mcpServers` configuration that Claude
+Desktop, Cursor or VS Code use, or take over the servers those apps already have on this computer; remote servers
+can sign in with the browser (OAuth) or use keys and headers; MCP bundles (`.mcpb`) install as plugins; and besides
+tools, a server's resources and prompts are available. The protocol itself is handled by the bundled client
+library, which speaks the 2026-07-28 revision and the earlier ones.
+
 KimiLM was called **Datavera Agent** up to 2.1.x. Version 2.2.0 renamed it; see "Upgrading from Datavera Agent".
 
 ```

@@ -1769,3 +1769,225 @@ def test_a_cut_off_long_task_continues_by_itself_but_not_forever(tmp_path, monke
         await app.runtime.shutdown()
     asyncio.run(scenario())
 
+
+# ---------------------------------------------------------------- 2.10.0: MCP servers set up like in other apps
+def test_mcp_configurations_of_other_apps_are_understood(tmp_path, monkeypatch):
+    from dva import mcp_config as mc
+    claude = mc.parse('{"mcpServers": {"files": {"command": "npx", "args": ["-y", "@x/files", "C:/data"], '
+                      '"env": {"API_KEY": "abc"}}, "off": {"command": "uvx", "args": ["thing"], "disabled": true}}}')
+    assert [(e["name"], e["transport"], e["enabled"]) for e in claude] == [("files", "stdio", True), ("off", "stdio", False)]
+    assert claude[0]["args"] == ["-y", "@x/files", "C:/data"] and claude[0]["env"] == {"API_KEY": "abc"}
+    vscode = mc.parse("""{
+      // VS Code writes comments, and calls the map "servers"
+      "servers": {
+        "docs": {"type": "http", "url": "https://example.com/mcp", "headers": {"X-Team": "a//b", "Authorization": "Bearer ${env:DOCS_TOKEN}"}},
+        "old":  {"type": "sse", "url": "https://example.com/events",},   /* trailing commas too */
+      },
+    }""")
+    assert vscode[0]["type"] == "http" and vscode[0]["headers"]["X-Team"] == "a//b"      # "//" inside a string stays
+    assert vscode[0]["auth"] == "none" and "Authorization" in vscode[0]["headers"]       # a reference, not a value
+    assert vscode[1]["type"] == "sse"
+    cursor = mc.parse('{"mcpServers": {"api": {"url": "https://api.example.com/sse", "headers": {"Authorization": "Bearer sk-1"}}}}')[0]
+    assert (cursor["type"], cursor["auth"], cursor["token"], cursor["headers"]) == ("sse", "bearer", "sk-1", {})
+    zed = mc.parse('{"context_servers": {"db": {"command": {"path": "db-mcp", "args": ["--ro"], "env": {"DSN": "x"}}}}}')[0]
+    assert (zed["command"], zed["args"], zed["env"]) == ("db-mcp", ["--ro"], {"DSN": "x"})
+    bridged = mc.parse('{"mcpServers": {"notion": {"command": "npx", "args": ["-y", "mcp-remote", "https://mcp.example.com/mcp"]}}}')[0]
+    assert (bridged["transport"], bridged["url"], bridged["auth"]) == ("http", "https://mcp.example.com/mcp", "oauth")
+    assert "mcp-remote" in bridged["note"]
+    assert mc.parse('{"command": "python", "args": ["server.py"]}')[0]["name"] == "server"       # one bare entry
+    assert mc.parse('{"a": {"command": "x"}, "b": {"url": "https://b.example/mcp"}}')[1]["transport"] == "http"
+    for bad in ('{"name": "nothing here"}', '[1, 2]', '{"mcpServers": {"x": {"note": "no command"}}}'):
+        with pytest.raises(ValueError):
+            mc.parse(bad)
+    monkeypatch.setenv("DOCS_TOKEN", "tok")
+    missing = set()
+    assert mc.expand_vars("Bearer ${env:DOCS_TOKEN} ${REGION:-eu} ${NOT_SET}", missing=missing) == "Bearer tok eu "
+    assert missing == {"NOT_SET"} and mc.expand_vars("${K}", {"K": "from-values"}) == "from-values"
+    out = mc.export([{"name": "My Files", "transport": "stdio", "command": "{python}", "args": ["s.py"],
+                      "env": {"API_KEY": "abc", "REGION": "eu"}},
+                     {"name": "Docs", "transport": "http", "type": "http", "url": "https://d.example/mcp",
+                      "auth": "bearer", "headers": {"X-Team": "blue"}}])["mcpServers"]
+    assert out["my-files"] == {"command": "python", "args": ["s.py"], "env": {"API_KEY": "${API_KEY}", "REGION": "eu"}}
+    assert out["docs"]["headers"] == {"X-Team": "blue", "Authorization": "Bearer ${DOCS_TOKEN}"}     # no secret leaves
+    # what other apps on this computer have set up
+    home = tmp_path / "home"
+    (home / ".cursor").mkdir(parents=True)
+    (home / ".cursor" / "mcp.json").write_text('{"mcpServers": {"search": {"command": "npx", "args": ["s"], "env": {"KEY": "v"}}}}')
+    (home / ".claude.json").write_text(json.dumps({"mcpServers": {"gh": {"type": "http", "url": "https://gh.example/mcp"}},
+                                                    "projects": {"/work/site": {"mcpServers": {"db": {"command": "db"}}}}}))
+    roaming = tmp_path / "roaming"
+    (roaming / "Claude").mkdir(parents=True)
+    (roaming / "Claude" / "claude_desktop_config.json").write_text("{not json")          # a broken file is skipped
+    found = mc.find_configs(home, {"APPDATA": str(roaming)})
+    assert [(f["app"], [s["name"] for s in f["servers"]]) for f in found] == \
+        [("Claude Code", ["gh"]), ("Claude Code · site", ["db"]), ("Cursor", ["search"])]
+    assert mc.masked(found[2]["servers"][0])["env"] == {"KEY": "••••"}
+
+
+def test_connectors_are_taken_over_tested_and_used(engine):
+    c = engine["client"]
+    c.put("/api/settings", json={"max_native_tools": 60})        # this server's eight tools stay native
+    config = json.dumps({"mcpServers": {"Notes": {"command": "{python}", "args": [str(TESTS / "fake_mcp_server.py"), "--full"],
+                                                  "env": {"API_KEY": "s3cret-value"}}}})
+    seen = c.post("/api/connectors-preview", json={"text": config}).json()["servers"]
+    assert seen[0]["name"] == "Notes" and seen[0]["env"] == {"API_KEY": "••••"}
+    assert c.post("/api/connectors-preview", json={"text": "not a config"}).status_code == 400
+    got = c.post("/api/connectors-import", json={"text": config}).json()
+    cid = got["added"][0]["id"]
+    assert c.post("/api/connectors-import", json={"text": config}).json() == \
+        {"added": [], "skipped": [{"name": "Notes", "why": "already a connector here"}]}
+    row = next(x for x in c.get("/api/connectors").json()["connectors"] if x["id"] == cid)
+    assert row["env"] == {"API_KEY": ""} and row["type"] == "stdio" and "s3cret-value" not in json.dumps(row)
+    assert "s3cret-value" not in (engine["tmp"] / "data" / "kimilm.sqlite3").read_bytes().decode("latin-1")
+    t = c.post(f"/api/connectors/{cid}/test").json()
+    assert t["ok"] and t["info"]["name"] == "test" and t["info"]["version"] == "9.9.9", t
+    assert t["info"]["protocol"] == "2026-07-28" and set(t["info"]["capabilities"]) == {"tools", "resources", "prompts"}
+    tools = {x["name"]: x for x in t["tools"]}
+    assert tools["wipe"]["title"] == "Wipe everything" and tools["wipe"]["destructive"] and not tools["wipe"]["readonly"]
+    assert tools["snapshot"]["readonly"] and not tools["set_value"]["readonly"]
+    assert [r["uri"] for r in t["resources"]] == ["notes://today", "notes://{day}"] and t["resources"][1]["template"]
+    assert t["prompts"][0]["name"] == "summarise" and t["prompts"][0]["arguments"][0]["required"]
+    assert c.post(f"/api/connectors/{cid}/prompt", json={"name": "summarise", "arguments": {"topic": "tea"}}).json()["text"] \
+        == "Summarise what is known about tea in three sentences."
+    assert c.get(f"/api/connectors/{cid}/resource", params={"uri": "notes://friday"}).json()["text"] == "Nothing happened on friday."
+    shown = next(x for x in c.get("/api/connectors").json()["connectors"] if x["id"] == cid)
+    assert shown["info"]["protocol"] == "2026-07-28"                                   # kept for the window
+    assert c.get("/api/connectors-export", params={"ids": cid}).json()["mcpServers"]["notes"]["env"] == {"API_KEY": "${API_KEY}"}
+    # an agent reads a resource of the server (two tools for all servers with resources), without being asked
+    chat = c.post("/api/chats", json={"harness": "agent", "connectors": [cid]}).json()
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "read resource notes://today"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    step = [s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool"][0]
+    assert step["name"] == "read_connector_resource" and step["ok"] and "Today the value was" in step["result"]
+    # the value saved in the credential store reaches the server; changing other fields keeps it
+    c.put(f"/api/connectors/{cid}/config", json={"env": {"API_KEY": "", "REGION": "eu"}, "description": "notes"})
+    row = next(x for x in c.get("/api/connectors").json()["connectors"] if x["id"] == cid)
+    assert row["env"] == {"API_KEY": "", "REGION": ""}
+    assert c.delete(f"/api/connectors/{cid}/delete").json()["ok"]
+    c.put("/api/settings", json={"max_native_tools": 36})
+
+
+def test_remote_connectors_send_headers_speak_both_transports_and_sign_in(tmp_path, monkeypatch):
+    """Streamable HTTP with a key and a custom header, the older SSE transport, and OAuth: the browser is opened
+    only when a person asked for it, and a later run uses the saved sign-in."""
+    import asyncio
+    import threading
+    import webbrowser
+    monkeypatch.setenv("DVA_SECRETS", "file")
+    ports = [free_port() for _ in range(3)]
+    server = str(TESTS / "fake_mcp_server.py")
+    procs = [subprocess.Popen([sys.executable, server, *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+             for args in (["--full", "--http", str(ports[0])], ["--full", "--sse", str(ports[1])],
+                          ["--full", "--http", str(ports[2]), "--oauth"])]
+    for port in ports:
+        for _ in range(150):
+            with socket.socket() as sock:
+                sock.settimeout(0.3)
+                if sock.connect_ex(("127.0.0.1", port)) == 0:
+                    break
+            time.sleep(0.1)
+    opened = []
+
+    def person_signs_in(url, *a, **k):        # stands in for the browser: the test authorization server says yes
+        opened.append(url)
+        threading.Thread(target=lambda: httpx.get(url, follow_redirects=True, timeout=20, trust_env=False), daemon=True).start()
+        return True
+    monkeypatch.setattr(webbrowser, "open", person_signs_in)
+
+    async def scenario():
+        from dva.app_state import App
+        app = App(str(tmp_path / "data"))
+        cn = app.connectors
+        try:
+            monkeypatch.setenv("TEAM_NAME", "blue")
+            http = cn.create({"name": "Remote", "url": f"http://127.0.0.1:{ports[0]}/mcp", "token": "tok-1",
+                              "headers": {"X-Api-Key": "abc123", "X-Team": "${TEAM_NAME}"}})
+            assert http["transport"] == "http" and http["type"] == "http" and http["auth"] == "bearer"
+            assert (await cn.test(http["id"]))["info"]["protocol"] == "2026-07-28"
+            for name, value in (("X-Api-Key", "abc123"), ("X-Team", "blue"), ("Authorization", "Bearer tok-1")):
+                assert (await cn.call(http["id"], "show_header", {"name": name}))[1] == json.dumps({"result": value})
+            ok, text = await cn.call(http["id"], "snapshot", {}, save_dir=tmp_path / "ws")
+            saved = list((tmp_path / "ws" / "connector-files").glob("image-*.png"))
+            assert ok and len(saved) == 1 and str(saved[0]) in text                 # a picture becomes a file
+            sse = cn.create({"name": "Older", "type": "sse", "url": f"http://127.0.0.1:{ports[1]}/sse"})
+            assert len((await cn.test(sse["id"]))["tools"]) == 6
+            signed = cn.create({"name": "Signed", "url": f"http://127.0.0.1:{ports[2]}/mcp", "auth": "oauth"})
+            assert not cn.get(signed["id"])["ready"]
+            with pytest.raises(ConnectionError, match="sign in first"):
+                await cn.list_tools(signed["id"])                                   # nobody is there: no browser
+            assert opened == []
+            assert len((await cn.test(signed["id"]))["tools"]) == 6 and len(opened) == 1   # the person pressed Sign in
+            assert cn.get(signed["id"])["ready"] and cn.get(signed["id"])["signed_in"]
+            await cn.reset(signed["id"])
+            assert len(await cn.list_tools(signed["id"], refresh=True)) == 6 and len(opened) == 1   # saved sign-in
+            await cn.sign_out(signed["id"])
+            assert not cn.get(signed["id"])["signed_in"] and not list((app.paths.data / "mcp-auth").iterdir())
+            missing = cn.create({"name": "Needs a value", "url": f"http://127.0.0.1:{ports[0]}/mcp",
+                                 "headers": {"X-Key": "${KIMILM_NOT_SET_ANYWHERE}"}})
+            with pytest.raises(ConnectionError, match="KIMILM_NOT_SET_ANYWHERE"):
+                await cn.test(missing["id"])
+        finally:
+            await cn.shutdown()
+            await app.runtime.shutdown()
+    try:
+        asyncio.run(scenario())
+    finally:
+        for proc in procs:
+            proc.terminate()
+
+
+def test_an_mcp_bundle_installs_as_a_plugin(engine):
+    """A .mcpb file (manifest.json + the server's files) becomes a plugin: its user_config are the plugin's
+    settings (sensitive ones in the credential store) and its server a connector."""
+    c = engine["client"]
+    manifest = {"manifest_version": "0.3", "name": "Note Keeper", "display_name": "Note keeper", "version": "1.2.0",
+                "description": "Keeps notes.", "author": {"name": "Tester"},
+                "server": {"type": "python", "entry_point": "server/main.py",
+                           "mcp_config": {"command": "no-such-program", "args": ["${__dirname}/server/main.py"],
+                                          "env": {"API_KEY": "${user_config.api_key}", "WHERE": "${__dirname}"},
+                                          "platform_overrides": {p: {"command": sys.executable} for p in ("win32", "darwin", "linux")}}},
+                "user_config": {"api_key": {"type": "string", "title": "API key", "sensitive": True, "required": True},
+                                "folder": {"type": "directory", "title": "Notes folder", "default": "${HOME}/notes"}}}
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("manifest.json", json.dumps(manifest))
+        z.writestr("server/main.py", (TESTS / "fake_mcp_server.py").read_text())
+    p = c.post("/api/plugins-upload", files={"file": ("note-keeper.mcpb", buf.getvalue())}).json()
+    assert p["id"] == "note-keeper" and p["name"] == "Note keeper" and p["version"] == "1.2.0", p
+    assert [(f["key"], f["type"]) for f in p["settings"]] == [("api_key", "secret"), ("folder", "folder")]
+    assert not p["configured"]
+    conn = next(x for x in c.get("/api/connectors").json()["connectors"] if x["id"] == "note-keeper:note-keeper")
+    assert conn["name"] == "Note keeper" and not conn["ready"] and conn["source"] == "plugin:note-keeper"
+    c.put("/api/plugins/note-keeper/settings", json={"api_key": "bundle-secret"})
+    t = c.post("/api/connectors/note-keeper:note-keeper/test").json()
+    assert t["ok"] and len(t["tools"]) == 2, t
+    chat = c.post("/api/chats", json={"harness": "agent", "connectors": ["note-keeper:note-keeper"]}).json()
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "whoami please"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    assert "tester" in [s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool"][0]["result"]
+    bad = io.BytesIO()
+    with zipfile.ZipFile(bad, "w") as z:
+        z.writestr("readme.txt", "nothing")
+    assert c.post("/api/plugins-upload", files={"file": ("x.zip", bad.getvalue())}).status_code == 400
+
+
+def test_a_bundle_gets_its_folder_and_settings_and_missing_programs_are_named(tmp_path, monkeypatch):
+    from dva import mcp_config as mc
+    from dva.mcp import resolve_command
+    plugin = mc.bundle_to_plugin({"name": "x-tool", "version": "1", "server": {"type": "node", "entry_point": "server/index.js"}})
+    assert plugin["mcpServers"]["x-tool"] == {"command": "node", "args": ["${__dirname}/server/index.js"], "env": {}, "description": ""}
+    assert mc.fill_bundle_vars("${__dirname}/a ${user_config.key} ${user_config.none} ${OTHER}", "/b", {"key": "v"}) == "/b/a v  ${OTHER}"
+    with pytest.raises(ValueError, match="made for"):
+        mc.bundle_to_plugin({"name": "mac-only", "server": {"mcp_config": {"command": "x"}},
+                             "compatibility": {"platforms": ["plan9"]}})
+    monkeypatch.setenv("PATH", str(tmp_path))                     # nothing is installed here
+    monkeypatch.delenv("DVA_NODE", raising=False)
+    with pytest.raises(ValueError, match=r"npx.*not installed.*Node\.js"):
+        resolve_command("npx")
+    with pytest.raises(ValueError, match="uv "):
+        resolve_command("uvx")
+    assert resolve_command("python")[0] == sys.executable          # the app's own Python
+    monkeypatch.setenv("DVA_NODE", "/app/KimiLM.exe")
+    monkeypatch.setenv("DVA_NODE_IS_ELECTRON", "1")
+    assert resolve_command("node") == ("/app/KimiLM.exe", {"ELECTRON_RUN_AS_NODE": "1"})   # the app's own Node
+

@@ -112,7 +112,8 @@ def decide(body):
         return {"text": (msgs[0]["content"][:8000] + " || " + text[:6000]).replace("\n", " ")}
     for trigger, tool, key in (("search earlier chats for ", "search_chats", "query"),
                                ("search knowledge for ", "search_knowledge", "query"),
-                               ("note decision: ", "update_project_notes", "text")):
+                               ("note decision: ", "update_project_notes", "text"),
+                               ("read resource ", "read_connector_resource", "uri")):
         if trigger in text and tool in tools and not after_tool:
             args = {key: text.split(trigger, 1)[1].strip()}
             if tool == "update_project_notes":
