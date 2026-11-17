@@ -58,6 +58,8 @@ DEFAULT_SETTINGS = {
     # 2.11.0: pictures. image_compute: auto | cpu | vulkan | cuda | metal (which build of the image engine works);
     # image_timeout_minutes: one request on this computer is stopped after this long
     "image_compute": "auto", "image_timeout_minutes": 60,
+    # 2.13.0: music on this computer. music_engine_dir: a folder with ace-lm and ace-synth, if the user has one
+    "music_engine_dir": "", "music_timeout_minutes": 90,
 }
 CHAT_LIMIT_KEYS = ("max_reply_tokens", "max_steps", "time_limit_minutes", "temperature", "max_searches",
                    "max_tool_calls")

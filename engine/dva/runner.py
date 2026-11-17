@@ -1131,7 +1131,9 @@ class Turn:
                 self.ctx.notes.pop("media", None)
                 # a picture made on this computer needs memory: this turn's text model is given back meanwhile
                 # (it is unloaded only if the image model does not fit beside it) and taken again afterwards
-                lend = tool.group == "images" and not is_cloud(self.model_id) and self.app.images.local_default()
+                lend = not is_cloud(self.model_id) and (
+                    (tool.group == "images" and self.app.images.local_default())
+                    or (tool.name == "generate_music" and self.app.sound.local_music()))
                 if lend:
                     await self.drop_model()
                 try:

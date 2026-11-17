@@ -49,6 +49,14 @@ OpenAI and Google voices and transcription, and Google's Lyria for music, with t
 against the monthly budget. Replies can be read aloud and messages can be dictated. After pulling this version,
 install the new dependency once: `cd engine` and `.\.venv\Scripts\python.exe -m pip install -r requirements.txt`.
 
+From 2.13.0 a **podcast is made from a document in one request**: in Sound → Podcast choose a PDF, Word file,
+slides or text (or attach it in a chat and ask for a podcast), and KimiLM reads it, takes notes part by part,
+plans the episode, writes each part as a conversation with the matching pieces of the document in front of the
+model, and records it with two voices; the script is saved beside the recording. **Music is made on this
+computer** with ACE-Step 1.5 through acestep.cpp: the programs are built from the pinned source by the workflow
+`.github/workflows/music-engine.yml` in this repository (run it once: Actions → Build music engine → Run workflow)
+and installed from this repository's release; the model (about 3.3 GB) is downloaded in the app.
+
 KimiLM was called **Datavera Agent** up to 2.1.x. Version 2.2.0 renamed it; see "Upgrading from Datavera Agent".
 
 ```

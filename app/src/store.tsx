@@ -84,6 +84,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (e.kind === "image_download" && e.state === "done") toast(`Downloaded ${e.name}: it can make pictures now`, "ok");
     if (e.kind === "image_download" && e.state === "failed") toast(`${e.name} could not be downloaded: ${e.error}`, "error");
     if (e.kind === "sound_download" && e.state === "done") toast(`Downloaded ${e.name}`, "ok");
+    if (e.kind === "music_engine" && e.action === "installed") toast("The music engine is installed", "ok");
+    if (e.kind === "sound_job" && e.state === "done" && e.result?.params?.mode === "podcast") toast(`Your podcast “${e.result.params.title}” is ready`, "ok");
     if (e.kind === "sound_download" && e.state === "failed") toast(`${e.name} could not be downloaded: ${e.error}`, "error");
   });
 

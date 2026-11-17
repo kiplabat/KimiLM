@@ -83,6 +83,37 @@ async def transcribe_audio(ctx, path, language=None):
     return f"Transcript of {p.name} ({result['seconds']:g} seconds, {result['model']}):\n{text[:6000]}{more}{files}"
 
 
+DOCUMENTS = (".pdf", ".docx", ".odt", ".pptx", ".txt", ".md", ".html", ".htm", ".rtf", ".csv")
+
+
+async def make_podcast(ctx, source=None, text=None, minutes=5, style="conversation", focus=None, music=False):
+    from .. import podcast
+    sound = ctx.app.sound
+    given = [source] if isinstance(source, str) else list(source or [])
+    paths = [ctx.resolve(p) for p in given if p]
+    if not paths and not (text or "").strip():        # "make a podcast of this": the document attached to the chat
+        uploads = sorted((p for p in (ctx.workspace / "uploads").glob("*") if p.suffix.lower() in DOCUMENTS),
+                         key=lambda p: p.stat().st_mtime) if (ctx.workspace / "uploads").is_dir() else []
+        if not uploads:
+            raise ToolError("Give `source` (the document's path) or `text`. No document is attached to this chat.")
+        paths = uploads[-1:]
+    try:
+        await _allow(ctx, sound.get(sound.voice()["model"]), "the script")
+        if music:
+            await _allow(ctx, sound.default("music"), "a description of the music")
+        record = await podcast.make(ctx.app, sources=paths, text=text or "", minutes=minutes or 5, style=style or "conversation",
+                                    focus=focus or "", model=ctx.model_id, music=bool(music), out_dir=ctx.primary / "sound",
+                                    chat_id=ctx.chat["id"], job_id=ctx.job_id, on_status=_status(ctx))
+    except SoundError as exc:
+        raise ToolError(str(exc)) from exc
+    _show(ctx, record)
+    p = record["params"]
+    cast = ", ".join(f"{who}: {v}" for who, v in p["voices"].items())
+    return (f"The podcast “{p['title']}” is recorded: {p['seconds'] / 60:.1f} minutes, {p['parts']} parts, {p['words']} words "
+            f"({cast}).\n- Recording: {record['path']}\n- Script: {p['script']}\nIt is about: {p['summary']}\n"
+            "The user can play it in the chat. Tell them it is ready in one or two sentences; do not repeat the script.")
+
+
 async def generate_music(ctx, prompt, seconds=None, instrumental=True, lyrics=None):
     sound = ctx.app.sound
     try:
@@ -93,8 +124,10 @@ async def generate_music(ctx, prompt, seconds=None, instrumental=True, lyrics=No
         raise ToolError(str(exc)) from exc
     _show(ctx, record)
     p = record["params"]
-    return (f"Made {p['seconds']:g} seconds of music with {record['model_name']} (about US${p['cost']:g}):\n- {record['path']}"
-            + (f"\nWhat it says about the piece: {p['words'][:400]}" if p.get("words") else ""))
+    where = f"about US${p['cost']:g}" if p.get("cost") else "on this computer"
+    facts = ", ".join(str(x) for x in (p.get("bpm") and f"{p['bpm']} beats a minute", p.get("keyscale")) if x)
+    return (f"Made {p['seconds']:g} seconds of music with {record['model_name']} ({where}{', ' + facts if facts else ''}):\n"
+            f"- {record['path']}" + (f"\nIts words: {p['words'][:400]}" if p.get("words") else ""))
 
 
 async def mix_audio(ctx, tracks, name="mix", length="first"):
@@ -105,7 +138,8 @@ async def mix_audio(ctx, tracks, name="mix", length="first"):
         p = ctx.resolve((t or {}).get("path"))
         if not p.is_file():
             raise ToolError(f"No file at {p}")
-        clean.append({"path": str(p), "volume": float(t.get("volume", 1.0) or 1.0), "start": float(t.get("start") or 0)})
+        clean.append({"path": str(p), "volume": float(t.get("volume", 1.0) or 1.0), "start": float(t.get("start") or 0),
+                      **{k: float(t[k]) for k in ("from", "to", "fade_in", "fade_out") if t.get(k) is not None}})
     try:
         record = await ctx.app.sound.mix(clean, out_dir=ctx.primary / "sound", name=name, length=length, chat_id=ctx.chat["id"])
     except SoundError as exc:
@@ -126,6 +160,18 @@ TOOLS = [
             "name": {"type": "string", "description": "A short name for the file."},
             "speed": {"type": "number", "minimum": 0.5, "maximum": 2}}, ["text"]),
          speak, "sound", label="Speak", summary=lambda a: str(a.get("text", ""))[:160]),
+    Tool("make_podcast",
+         "Make a podcast episode from a document (PDF, Word, slides, text): KimiLM reads it, writes a conversation "
+         "between two hosts about it and records it. Use this whenever the user asks for a podcast, an audio "
+         "summary or a discussion of a document or a long text; do not write the script yourself.",
+         S({"source": {"type": "string", "description": "Path of the document. Leave out to use the document attached to this chat."},
+            "text": {"type": "string", "description": "The material itself, when there is no file."},
+            "minutes": {"type": "number", "minimum": 1, "maximum": 30, "description": "Length of the episode. Default 5."},
+            "style": {"type": "string", "enum": ["conversation", "interview", "narration"]},
+            "focus": {"type": "string", "description": "What the listener cares about most, if the user said so."},
+            "music": {"type": "boolean", "description": "Open with a short piece of music (needs a music model)."}}, []),
+         make_podcast, "sound", label="Make podcast",
+         summary=lambda a: f"Podcast of {Path(str(a.get('source') or 'the attached document')).name}"),
     Tool("list_voices", "The voices that can speak now, with their language.", S({}, []), list_voices, "sound",
          label="List voices", summary=lambda a: "Voices"),
     Tool("transcribe_audio", "Turn a recording (or the sound of a video) into text, with times. Works for meetings, "
@@ -142,8 +188,11 @@ TOOLS = [
          "sets the length unless length is \"longest\".",
          S({"tracks": {"type": "array", "items": S({"path": {"type": "string"},
                                                     "volume": {"type": "number", "description": "1 = as it is; 0.2 for music under a voice."},
-                                                    "start": {"type": "number", "description": "Seconds after the beginning."}}, ["path"])},
+                                                    "start": {"type": "number", "description": "Seconds after the beginning."},
+                                                    "from": {"type": "number", "description": "Use the recording from this second."},
+                                                    "to": {"type": "number", "description": "…up to this second."},
+                                                    "fade_in": {"type": "number"}, "fade_out": {"type": "number"}}, ["path"])},
             "name": {"type": "string"}, "length": {"type": "string", "enum": ["first", "longest"]}}, ["tracks"]),
          mix_audio, "sound", label="Mix sound", summary=lambda a: f"Mix {len(a.get('tracks') or [])} recordings"),
 ]
-NEEDS = {"speak": "tts", "list_voices": "tts", "transcribe_audio": "stt", "generate_music": "music"}
+NEEDS = {"speak": "tts", "list_voices": "tts", "make_podcast": "tts", "transcribe_audio": "stt", "generate_music": "music"}

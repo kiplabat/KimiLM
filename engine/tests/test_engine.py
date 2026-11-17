@@ -55,6 +55,13 @@ def engine():
     else:
         painter.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{TESTS / "fake_sd_cli.py"}" "$@"\n')
         painter.chmod(0o755)
+    ace = tmp / "ace-programs"                       # stand in for acestep.cpp's two programs (2.13.0)
+    ace.mkdir()
+    for tool in ("lm", "synth"):
+        if os.name != "nt":                          # on Windows a script cannot stand in for an .exe: test skipped there
+            prog = ace / f"ace-{tool}"
+            prog.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{TESTS / "fake_ace.py"}" {tool} "$@"\n')
+            prog.chmod(0o755)
     port = free_port()
     token = "test-token"
     env = {**os.environ, "DVA_TEST_CPU": "6x12", "DVA_TOKEN": token, "DVA_LLAMA_SERVER": str(wrapper), "DVA_SECRETS": "file",
@@ -72,7 +79,7 @@ def engine():
     print("engine log:", log)
     client = httpx.Client(base_url=f"http://127.0.0.1:{port}", headers={"Authorization": f"Bearer {token}"},
                           timeout=60, trust_env=False)
-    yield {"client": client, "tmp": tmp, "port": port, "token": token}
+    yield {"client": client, "tmp": tmp, "port": port, "token": token, "ace": ace}
     try:
         client.post("/api/shutdown")
     except httpx.HTTPError:
@@ -2401,8 +2408,11 @@ def test_sound_helpers_numbers_scripts_files_and_the_catalogue(tmp_path):
         write_audio(tmp_path / "tone.xyz", stereo, 44100)
     # the catalogue: where each model comes from, its licence, and voices that match the models' own lists
     for m in CATALOG:
-        assert m["url"].startswith(RELEASES) and m["url"].endswith(".tar.bz2") and m["licence"] and m["page"].startswith("https://")
-        assert m["role"] in ("tts", "stt", "clone") and [v["sid"] for v in m["voices"]] == list(range(len(m["voices"])))
+        assert m["licence"] and m["page"].startswith("https://") and [v["sid"] for v in m["voices"]] == list(range(len(m["voices"])))
+        if m["role"] == "music":                       # four files from one Hugging Face repository
+            assert [p["slot"] for p in m["hf"]] == ["lm", "dit", "encoder", "vae"] and m["family"] == "ace"
+        else:
+            assert m["url"].startswith(RELEASES) and m["url"].endswith(".tar.bz2") and m["role"] in ("tts", "stt", "clone")
     kokoro = next(m for m in CATALOG if m["key"] == "kokoro-v1")["voices"]
     assert (kokoro[3]["speaker"], kokoro[26]["speaker"], kokoro[53]["speaker"]) == ("af_heart", "bm_george", "em_santa")
     assert sum(not v.get("needs_espeak") for v in kokoro) == 36 and kokoro[28]["language"] == "Spanish"
@@ -2452,12 +2462,24 @@ def test_models_for_pictures_and_sound_really_download_and_can_be_cancelled(tmp_
     (tmp_path / "voice-model" / "tokens.txt").write_text("a 1\n")
     with tarfile.open(bundle, "w:bz2") as tar:
         tar.add(tmp_path / "voice-model", arcname="voice-model")
+    engine_bundle = tmp_path / "engine.tar.gz"         # what the build workflow publishes: the programs in one folder
+    (tmp_path / "built").mkdir()
+    for name in ("ace-lm", "ace-synth", "libggml.so"):
+        (tmp_path / "built" / name).write_text("#!/bin/sh\n")
+    with tarfile.open(engine_bundle, "w:gz") as tar:
+        for f in (tmp_path / "built").iterdir():
+            tar.add(f, arcname=f.name)
     asked = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             asked.append(self.path)
-            data = bundle.read_bytes() if self.path.endswith(".tar.bz2") else (b"\2" * 300_000 if "big" in self.path else b"\3" * 4000)
+            if "not-built" in self.path:
+                self.send_response(404)
+                self.end_headers()
+                return
+            data = bundle.read_bytes() if self.path.endswith(".tar.bz2") else engine_bundle.read_bytes() if "acestep-linux" in self.path \
+                else (b"\2" * 300_000 if "big" in self.path else b"\3" * 4000)
             self.send_response(200)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
@@ -2477,7 +2499,8 @@ def test_models_for_pictures_and_sound_really_download_and_can_be_cancelled(tmp_
     app = types.SimpleNamespace(db=DB(tmp_path / "t.sqlite3"), paths=paths, log=lambda m: events.append(("log", m)),
                                 bus=types.SimpleNamespace(publish=lambda kind, **k: events.append((kind, k))),
                                 secrets=types.SimpleNamespace(get=lambda k: None),
-                                providers=types.SimpleNamespace(ready=lambda p: False), runtime=None)
+                                providers=types.SimpleNamespace(ready=lambda p: False), runtime=None,
+                                router=types.SimpleNamespace(pick=lambda role: (None, "")))
 
     async def listing(url, headers=None):
         repo = url.split("/api/models/")[1].split("/tree/")[0]
@@ -2524,8 +2547,245 @@ def test_models_for_pictures_and_sound_really_download_and_can_be_cancelled(tmp_
         await so._download({**entry, "key": "other-voice"}, s2)
         assert s2["state"] == "cancelled" and not so.get("other-voice")
         json.dumps(so.catalog())
+        # a music model: four files chosen from the repository's listing (2.13.0)
+        async def ace_listing(url, headers=None):
+            return [{"type": "file", "path": n, "size": 4000} for n in (
+                "acestep-5Hz-lm-0.6B-BF16.gguf", "acestep-5Hz-lm-0.6B-Q8_0.gguf", "acestep-5Hz-lm-4B-Q8_0.gguf",
+                "acestep-v15-turbo-Q4_K_M.gguf", "acestep-v15-turbo-Q8_0.gguf", "acestep-v15-turbo-continuous-Q4_K_M.gguf",
+                "Qwen3-Embedding-0.6B-Q8_0.gguf", "vae-BF16.gguf", "README.md")]
+        monkeypatch.setattr(sound, "fetch_json", ace_listing)
+        monkeypatch.setattr(sound, "HF", base)
+        light = next(m for m in sound.CATALOG if m["key"] == "ace-step-light")
+        ms = {"key": light["key"], "name": light["name"], "state": "starting", "done": 0, "total": 1, "error": None, "cancel": False}
+        await so._download(light, ms)
+        assert ms["state"] == "done" and ms["done"] == 16000, ms
+        got = so.get("ace-step-light")
+        assert sorted(p.name for p in Path(got["path"]).iterdir()) == [
+            "Qwen3-Embedding-0.6B-Q8_0.gguf", "acestep-5Hz-lm-0.6B-Q8_0.gguf", "acestep-v15-turbo-Q4_K_M.gguf", "vae-BF16.gguf"]
+        assert got["settings"]["lm"] == "acestep-5Hz-lm-0.6B-Q8_0.gguf" and got["settings"]["dit"] == "acestep-v15-turbo-Q4_K_M.gguf"
+        assert not got["ready"] and got["why"] == "the music engine is not installed"
+        # the music programs: from KimiLM's own release; said plainly when that release was not built yet
+        monkeypatch.setattr(sound, "ACE_ASSET", "acestep-linux-x64.tar.gz")
+        monkeypatch.setattr(sound, "ACE_LM", "ace-lm")
+        monkeypatch.setattr(sound, "ACE_SYNTH", "ace-synth")
+        where = {"repo": "kiplabat/KimiLM", "tag": "music-engine-test", "commit": "c", "built_from": "x", "workflow": "w"}
+        monkeypatch.setattr(sound.Sound, "engine_source", lambda self: {**where, "url": f"{base}/not-built/acestep-linux-x64.tar.gz"})
+        await so.install_music_engine()
+        failed = [k for kind, k in events if kind == "music_engine" and k.get("action") == "failed"]
+        assert failed and "has not been built yet" in failed[-1]["error"] and "Run workflow" in failed[-1]["error"] and not so.music_engine()
+        monkeypatch.setattr(sound.Sound, "engine_source", lambda self: {**where, "url": f"{base}/acestep-linux-x64.tar.gz"})
+        await so.install_music_engine()
+        assert so.music_engine() == {"dir": str(tmp_path / "data" / "runtimes" / "acestep"), "source": "installed"}
+        assert sorted(p.name for p in (tmp_path / "data" / "runtimes" / "acestep").iterdir()) == ["ace-lm", "ace-synth", "libggml.so"]
+        assert so.get("ace-step-light")["ready"] and so.can()["music"] and so.local_music()
+        json.dumps(so.status())
     try:
         asyncio.run(run())
     finally:
         server.shutdown()
     assert not [e for e in events if e[0] == "log" and "is_set" in e[1]]
+
+
+# ------------------------------------------------------------------------- music here, podcasts (2.13.0)
+def music_folder(tmp, name="ace", leave_out=()):
+    folder = tmp / "sound-models" / name
+    folder.mkdir(parents=True, exist_ok=True)
+    for f in ("acestep-5Hz-lm-0.6B-Q8_0.gguf", "acestep-v15-turbo-Q4_K_M.gguf", "Qwen3-Embedding-0.6B-Q8_0.gguf", "vae-BF16.gguf"):
+        if f not in leave_out:
+            (folder / f).write_bytes(b"GGUF" + b"\0" * 1000)
+    return str(folder)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a script cannot stand in for ace-lm.exe on Windows")
+def test_music_is_made_on_this_computer_without_any_online_service(engine):
+    c, tmp = engine["client"], engine["tmp"]
+    start = c.get("/api/sound").json()
+    eng = start["music_engine"]
+    assert not eng["installed"] and not start["can"]["music"] and eng["commit"].startswith("ed53caf")
+    assert eng["url"].startswith("https://github.com/kiplabat/KimiLM/releases/download/music-engine-ed53caf/acestep-")
+    light = next(m for m in start["catalog"] if m["key"] == "ace-step-light")
+    assert light["role"] == "music" and light["recommended"] and light["licence"] == "MIT" and light["mb"] == 3300
+    # a model folder needs its four files; without the engine it is there but cannot be used yet
+    r = c.post("/api/sound/models", json={"key": "ace-step-light", "path": music_folder(tmp, "broken", leave_out=("vae-BF16.gguf",))})
+    assert r.status_code == 400 and "needs four files" in r.json()["error"]
+    model = c.post("/api/sound/models", json={"key": "ace-step-light", "path": music_folder(tmp)}).json()
+    assert model["role"] == "music" and not model["ready"] and model["why"] == "the music engine is not installed"
+    assert model["settings"] == {"lm": "acestep-5Hz-lm-0.6B-Q8_0.gguf", "dit": "acestep-v15-turbo-Q4_K_M.gguf", "steps": 8, "shift": 3.0}
+    none = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "music", "prompt": "a tune"}).json())
+    assert none["state"] == "failed" and "install the music engine" in none["error"]
+    assert c.post("/api/sound/music-engine", json={"folder": str(tmp)}).status_code == 400
+    state = c.post("/api/sound/music-engine", json={"folder": str(engine["ace"])}).json()
+    assert "music_engine" in state, state
+    assert state["music_engine"]["installed"] and state["music_engine"]["source"] == "a folder you chose" and state["can"]["music"], state
+    # a piece without singing: planned, then rendered, kept with what the planner chose
+    made = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "music", "prompt": "Amapiano groove with log drums and soft keys",
+                                                         "seconds": 12, "instrumental": True, "seed": 7}).json())
+    assert made["state"] == "done", made
+    rec = made["result"]
+    assert rec["source"] == "local" and rec["model_name"] == "ACE-Step 1.5 (light)" and rec["name"].startswith("amapiano-groove")
+    assert rec["name"].endswith(".mp3") and Path(rec["path"]).parent == tmp / "data" / "sound" and abs(rec["params"]["seconds"] - 12) < 0.5
+    assert rec["params"]["bpm"] == 96 and rec["params"]["keyscale"] == "A minor" and rec["params"]["words"] == "" and "cost" not in rec["params"]
+    assert not list((tmp / "data" / "tmp").glob("mus_*"))                      # nothing is left behind
+    song = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "music", "prompt": "A hopeful folk song", "seconds": 3,
+                                                         "instrumental": False, "language": "sw"}).json())
+    assert song["state"] == "done" and "[Chorus]" in song["result"]["params"]["words"] and song["result"]["params"]["vocal_language"] == "sw"
+    assert abs(song["result"]["params"]["seconds"] - 10) < 0.5                 # the model's shortest piece is 10 seconds
+    for prompt, said in (("please explode", "while planning"), ("a silent piece", "while rendering")):
+        bad = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "music", "prompt": prompt}).json())
+        assert bad["state"] == "failed" and said in bad["error"], bad
+    # an agent makes music without being asked for permission: nothing leaves the computer
+    chat = c.post("/api/chats", json={"harness": "agent"}).json()
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "compose music: a calm piano piece"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
+    assert step["name"] == "generate_music" and step["ok"] and step["media"][0]["kind"] == "audio" and "US$" not in step["result"], step
+    # the engine can be taken away again; the model stays, waiting for it
+    state = c.delete("/api/sound/music-engine").json()
+    assert not state["music_engine"]["installed"] and not state["can"]["music"]
+    c.post("/api/sound/music-engine", json={"folder": str(engine["ace"])})
+
+
+def minimal_docx(path, paragraphs):
+    import zipfile
+    body = "".join(f"<w:p><w:r><w:t>{p}</w:t></w:r></w:p>" for p in paragraphs)
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("word/document.xml", f'<?xml version="1.0"?><w:document xmlns:w="x"><w:body>{body}</w:body></w:document>')
+    return path
+
+
+def test_a_podcast_is_made_from_a_document_in_one_request(engine):
+    c, tmp = engine["client"], engine["tmp"]
+    assert c.get("/api/sound").json()["text_model"]
+    assert c.post("/api/sound/jobs", json={"kind": "podcast"}).status_code == 400
+    # a long document: read part by part, outlined, and each part of the script written with the pieces of the
+    # document that belong to it in front of the model
+    topics = [("Solar pumps lift water for small farms in dry seasons", "solar pumps water farms irrigation"),
+              ("Costs and savings were measured over three years of use", "costs savings money years diesel"),
+              ("Next steps are training for technicians and spare parts", "next steps training technicians parts")]
+    paragraphs = [f"{head}. " + " ".join(f"Finding {i} about {words}." for i in range(60)) for head, words in topics]
+    doc = minimal_docx(tmp / "Solar pumps report.docx", paragraphs)
+    up = c.post("/api/sound/upload", files={"file": (doc.name, doc.read_bytes(), "application/octet-stream")}).json()
+    assert Path(up["path"]).name.startswith("Solar-pumps-report-") and up["path"].endswith(".docx")
+    job = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "podcast", "sources": [up["path"]], "minutes": 5}).json(), timeout=120)
+    assert job["state"] == "done" and job["title"].startswith("Podcast: Solar-pumps-report-"), job
+    rec = job["result"]
+    p = rec["params"]
+    assert p["mode"] == "podcast" and p["title"] == "The Stand-in Report" and p["parts"] == 3 and p["voices"] == {"Alex": "Heart", "Sam": "Michael"}
+    assert rec["name"].startswith("the-stand-in-report-") and rec["name"].endswith(".mp3") and p["seconds"] > 5 and p["words"] > 30
+    lines = rec["lines"]
+    assert [ln["speaker"] for ln in lines] == ["Alex", "Sam"] * 3
+    assert lines[0]["text"].startswith("Part 1 of 3. The document says: Solar pumps lift water for small farms")
+    assert lines[2]["text"].startswith("Part 2 of 3. The document says: Costs and savings were measured over")
+    assert lines[4]["text"].startswith("Part 3 of 3. The document says: Next steps are training for technicians")
+    # a hesitation is spelled so that the voice can say it, a stage direction is gone, pauses are kept as pauses
+    assert lines[1]["text"] == "Um… that is interesting, and it costs $45… really."
+    script = Path(p["script"]).read_text()
+    assert script.startswith("# The Stand-in Report") and "**Sam:** Um… that is interesting" in script and "Made from: Solar-pumps-report-" in script
+    spoken = sound_jobs(tmp, "speak")[-1]["segments"]
+    assert [(s["text"], s["pause"]) for s in spoken[:5]] == [
+        ("Part one of three. The document says: Solar pumps lift water for small farms.", 0.32),
+        ("Um", 0.6), ("that is interesting, and it costs forty-five dollars", 0.45), ("really.", 0.9),      # then a new part begins
+        ("Part two of three. The document says: Costs and savings were measured over three.", 0.38)]
+    assert spoken[-1]["pause"] == 0.0 and {s["sid"] for s in spoken} == {3, 16} and len(spoken) == 12
+    item = c.get("/api/sound/library").json()["items"][0]
+    assert item["id"] == rec["id"] and item["params"]["mode"] == "podcast" and item["prompt"].startswith("The Stand-in Report:")
+    # a short pasted text is used as it is; one narrator; a length of two minutes is two parts
+    short = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "podcast", "text": "Electric pressure cookers save energy. " * 12,
+                                                          "minutes": 2, "style": "narration", "hosts": ["Mia"]}).json(), timeout=120)
+    assert short["state"] == "done" and short["result"]["params"]["voices"] == {"Mia": "Heart"} and short["result"]["params"]["parts"] == 2, short
+    assert short["result"]["lines"][0]["text"].startswith("Part 1 of 2. The document says: Electric pressure cookers save energy.")
+    assert short["result"]["lines"][1]["text"] == "Um… that is interesting, and it costs $45… really."
+    for body, said in (({"text": "too short"}, "too little text"), ({"sources": [str(tmp / "nope.pdf")]}, "no file")):
+        bad = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "podcast", **body}).json())
+        assert bad["state"] == "failed" and said in bad["error"], bad
+    # in a chat: attach the document and ask; the agent needs no path and writes no script itself
+    chat = c.post("/api/chats", json={"harness": "agent"}).json()
+    c.post(f"/api/chats/{chat['id']}/upload", files={"file": (doc.name, doc.read_bytes(), "application/octet-stream")})
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "make a podcast from the attached document"}).json()
+    assert wait_job(c, job["job_id"], timeout=120)["status"] == "done"
+    step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
+    assert step["name"] == "make_podcast" and step["ok"] and step["label"] == "Make podcast", step
+    assert "The podcast “The Stand-in Report” is recorded" in step["result"] and "Script: " in step["result"]
+    clip = step["media"][0]
+    assert clip["kind"] == "audio" and clip["params"]["mode"] == "podcast" and clip["params"]["parts"] == 2 and Path(clip["path"]).exists()
+
+
+def test_podcast_pieces_and_what_belongs_to_a_segment():
+    from dva.podcast import nearest, pieces, script_markdown
+    text = "--- page 1 ---\nAlpha beta gamma.\n\nMore of alpha.\n--- page 2 ---\n" + "Delta epsilon zeta. " * 300 + "\n\nEnd."
+    got = pieces(text, size=1000)
+    assert got[0] == {"text": "Alpha beta gamma.\nMore of alpha.", "page": 2} or got[0]["text"].startswith("Alpha beta gamma.")
+    assert all(len(g["text"]) <= 1100 for g in got) and got[-1]["text"].endswith("End.") and len(got) >= 6
+    assert "--- page" not in " ".join(g["text"] for g in got)
+    chunks = [{"text": "Solar pumps lift water on farms."}, {"text": "The budget and the costs of diesel."},
+              {"text": "Training of technicians comes next."}, {"text": "Solar panels and pumps need parts."}]
+    assert [c["text"][:5] for c in nearest("costs of diesel", chunks, 1)] == ["The b"]
+    assert [c["text"][:5] for c in nearest("solar pumps", chunks, 2)] == ["Solar", "Solar"]        # in the document's order
+    assert nearest("", chunks, 2) == chunks[:2]
+    # talk, not text: hesitations the voices can say, pauses as pieces, and a little added when the script has none
+    from dva.podcast import natural, parts_of, timed
+    assert parts_of("Uhm... that is **nice** (laughs), and [pause] yes.") == ["Um", "that is nice, and", "yes."]
+    assert parts_of("Mm-hmm. So the pump, erm , pays… in four seasons [chuckles].") == ["Mhm. So the pump, um, pays", "in four seasons."]
+    assert parts_of(" [music] ") == []
+    mk = lambda *rows: [{"speaker": s, "parts": parts_of(t), "new_part": n} for s, t, n in rows]      # noqa: E731
+    clean = mk(("A", "Welcome to the show about solar pumps today.", True), ("B", "Glad to be here with you.", False),
+               ("A", "The study followed farmers for three years.", False), ("B", "Three years is a long time.", False),
+               ("A", "The pumps paid for themselves in under four seasons of use.", True), ("B", "Really?", False),
+               ("A", "Yes, because diesel is expensive.", False), ("B", "That makes sense, but who pays first?", False))
+    out = natural(clean)
+    assert out[1]["parts"] == ["Glad to be here with you."] and out[5]["parts"] == ["Really?"]            # greeting and reaction untouched
+    assert out[4]["parts"] == ["So, the pumps paid for themselves in under four seasons of use."]
+    assert out[7]["parts"] == ["Hmm", "That makes sense, but who pays first?"]                                # thinks, then asks
+    gaps = [(t["text"][:6], t["pause"]) for t in timed(out, {"A": "Alex", "B": "Sam"})]
+    assert gaps[3] == ("Three ", 0.9) and gaps[4] == ("So, th", 0.18) and gaps[5] == ("Really", 0.18)        # long before a new part, short around a reaction
+    assert gaps[-2] == ("Hmm", 0.6) and gaps[-1][1] == 0.0
+    talky = mk(("A", "Well, here we go again.", True), ("B", "Oh, nice one.", False), ("A", "Right, so it is.", False), ("B", "Hmm, I see.", False))
+    assert [ln["parts"] for ln in natural(talky)] == [["Well, here we go again."], ["Oh, nice one."], ["Right, so it is."], ["Hmm, I see."]]
+    md = script_markdown("T", "S", ["a.pdf"], [{"speaker": "A", "text": "Hi."}, {"speaker": "B", "text": "Yo."}], {"A": "Alex", "B": "Sam"})
+    assert md.startswith("# T\n\nS\n\nMade from: a.pdf") and "**Alex:** Hi." in md and "**Sam:** Yo." in md
+
+
+def test_the_composer_cuts_fades_previews_and_saves(engine):
+    c, tmp = engine["client"], engine["tmp"]
+    made = [wait_sound(c, c.post("/api/sound/jobs", json={"kind": "speak", "text": text, "format": "wav"}).json())["result"]
+            for text in ("one two three four five six seven eight", "nine ten eleven twelve")]
+    a, b = made
+    drawn = c.get("/api/sound/peaks", params={"path": a["path"], "n": 50}).json()
+    assert abs(drawn["seconds"] - a["params"]["seconds"]) < 0.1 and len(drawn["peaks"]) == 50 and 0.2 < max(drawn["peaks"]) <= 1
+    assert c.get("/api/sound/peaks", params={"path": str(tmp / "sound-jobs.log")}).status_code == 404      # only files the window may see
+    count = len(c.get("/api/sound/library").json()["items"])
+    # listening is a preview: not kept in the library, and the next one replaces it
+    tracks = [{"path": a["path"], "from": 0.5, "to": 1.5, "fade_in": 0.2, "fade_out": 0.2},
+              {"path": b["path"], "start": 2.0, "volume": 0.3}, {"path": b["path"], "start": 30, "mute": True}]
+    first = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "mix", "preview": True, "tracks": tracks, "length": "longest", "fade": 0}).json())
+    assert first["state"] == "done" and first["result"]["id"] == "" and Path(first["result"]["path"]).parent.name == "previews", first
+    assert abs(first["result"]["params"]["seconds"] - (2.0 + b["params"]["seconds"])) < 0.05 and first["result"]["name"].endswith(".wav")
+    second = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "mix", "preview": True, "tracks": tracks[:1], "length": "longest", "fade": 0}).json())
+    assert abs(second["result"]["params"]["seconds"] - 1.0) < 0.05                      # only the part from 0.5 to 1.5 seconds
+    assert len(list((tmp / "data" / "sound" / "previews").glob("*"))) == 1 and len(c.get("/api/sound/library").json()["items"]) == count
+    from dva.sound import read_pcm
+    cut = read_pcm(second["result"]["path"], 8000, 1).reshape(-1)
+    assert abs(cut[:80]).max() < 0.05 < abs(cut[3000:5000]).max() and abs(cut[-80:]).max() < 0.05      # fades in and out
+    saved = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "mix", "name": "My mix", "tracks": tracks, "length": "longest", "fade": 0,
+                                                          "format": "mp3"}).json())
+    assert saved["state"] == "done" and saved["result"]["id"] and saved["result"]["name"].startswith("my-mix-") and saved["result"]["name"].endswith(".mp3")
+    assert len(c.get("/api/sound/library").json()["items"]) == count + 1
+    nothing = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "mix", "tracks": [{"path": a["path"], "mute": True}]}).json())
+    assert nothing["state"] == "failed" and "Give the recordings" in nothing["error"]
+
+
+def test_words_the_dictionary_lacks_are_still_pronounced():
+    from dva.sound_worker import ed_ending, pronounce, s_ending
+    lex = {"household": "h ˈ W s h ˌ O l d", "make": "m ˈ A k", "describe": "d ə s k ɹ ˈ I b", "season": "s ˈ i z ᵊ n", "replace": "ɹ ə p l ˈ A s",
+           "class": "k l ˈ æ s", "stop": "s t ˈ ɑ p", "run": "ɹ ˈ ʌ n", "times": "t ˈ I m z", "quick": "k w ˈ ɪ k", "user": "j ˈ u z ə ɹ",
+           "open": "ˈ O p ə n", "carry": "k ˈ æ ɹ i", "c": "s ˈ i", "p": "p ˈ i", "u": "j ˈ u", "a": "ˈ A", "i": "ˈ I", "l": "ˈ ɛ l", "m": "ˈ ɛ m"}
+    tokens = set("h ˈ W s ˌ O l d m A k ə ɹ I b i z ᵊ n p æ t ɑ ʌ w ɪ j u ɛ ŋ ᵻ ʃ ʧ θ f v ɡ ʤ Y".split())
+    said = lambda w: pronounce(w, lex, tokens)                                        # noqa: E731
+    assert said("households") == "h ˈ W s h ˌ O l d z" and said("makes") == "m ˈ A k s" and said("classes") == "k l ˈ æ s ᵻ z"
+    assert said("described") == "d ə s k ɹ ˈ I b d" and said("replaced") == "ɹ ə p l ˈ A s t" and said("stopped") == "s t ˈ ɑ p t"
+    assert said("making") == "m ˈ A k ɪ ŋ" and said("running") == "ɹ ˈ ʌ n ɪ ŋ" and said("quickly") == "k w ˈ ɪ k l i"
+    assert said("user's") == "j ˈ u z ə ɹ z" and said("carries") == "k ˈ æ ɹ i z" and said("runtimes") == "ɹ ˈ ʌ n t ˈ I m z"
+    assert said("CPU") == "s ˈ i p ˈ i j ˈ u" and said("OpenAI") == "ˈ O p ə n ˈ A ˈ I"                     # as letters; Open + AI
+    assert said("KimiLM") == "k ˈ i m i ˈ ɛ l ˈ ɛ m" and said("amapiano") == "ˈ ɑ m ɑ p i ɑ n O"             # names: plain vowels
+    assert said("make") == "m ˈ A k" and pronounce("§", lex, tokens) is None
+    assert s_ending("k æ t") == "k æ t s" and s_ending("d ɔ ɡ") == "d ɔ ɡ z" and ed_ending("w ɑ n t") == "w ɑ n t ᵻ d"

@@ -4,6 +4,7 @@ import asyncio
 import hmac
 import mimetypes
 import os
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -473,8 +474,10 @@ def create_app(data_dir=None, resources_dir=None, token=None):
             raise ValueError("Describe the music")
         if kind == "transcribe" and not data.get("audio"):
             raise ValueError("Choose a recording")
-        if kind not in ("speak", "transcribe", "music", "mix"):
-            raise ValueError("kind must be speak, transcribe, music or mix")
+        if kind == "podcast" and not (data.get("sources") or str(data.get("text") or "").strip()):
+            raise ValueError("Choose a document, or paste the text")
+        if kind not in ("speak", "transcribe", "music", "mix", "podcast"):
+            raise ValueError("kind must be speak, transcribe, music, mix or podcast")
         return A().sound.start_job(kind, data)
 
     @api.delete("/api/sound/jobs/{job_id}")
@@ -482,12 +485,33 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         A().sound.stop_job(job_id)
         return {"ok": True}
 
+    @api.post("/api/sound/music-engine")
+    async def sound_music_engine(request: Request):
+        """Install the music programs from KimiLM's own release, or point at a folder that holds them."""
+        a = A()
+        data = await body(request)
+        if "folder" in data:
+            a.sound.set_music_engine(data["folder"])
+        elif "timeout_minutes" in data:
+            a.db.set_setting("music_timeout_minutes", max(5, min(720, int(data["timeout_minutes"] or 90))))
+        else:
+            a.spawn(a.sound.install_music_engine())
+        return await asyncio.to_thread(a.sound.status)
+
+    @api.delete("/api/sound/music-engine")
+    async def sound_music_engine_remove():
+        a = A()
+        a.sound.remove_music_engine()
+        a.db.set_setting("music_engine_dir", "")
+        return await asyncio.to_thread(a.sound.status)
+
     @api.post("/api/sound/upload")
     async def sound_upload(file: UploadFile = File(...)):
         """A recording from the Sound window or the microphone (kept in the app's own folder)."""
         folder = A().paths.data / "sound" / "uploads"
         folder.mkdir(parents=True, exist_ok=True)
-        dest = folder / (new_id("rec_") + (Path(file.filename or "recording.webm").suffix.lower() or ".webm"))
+        name = re.sub(r"[^\w.-]+", "-", Path(file.filename or "recording.webm").stem)[:60] or "file"
+        dest = folder / f"{name}-{new_id('')[-6:]}{Path(file.filename or 'recording.webm').suffix.lower() or '.webm'}"
         size = 0
         with dest.open("wb") as f:
             while chunk := await file.read(1 << 20):
@@ -498,6 +522,12 @@ def create_app(data_dir=None, resources_dir=None, token=None):
                     raise ValueError("Recordings up to 500 MB")
                 f.write(chunk)
         return {"path": str(dest), "name": file.filename}
+
+    @api.get("/api/sound/peaks")
+    async def sound_peaks(path: str, n: int = 240):
+        """How loud a recording is over its length, for drawing it in the composer."""
+        p = (await get_file(path)).path                  # the same files the window may be shown
+        return await asyncio.to_thread(A().sound.peaks, p, max(20, min(1000, n)))
 
     @api.get("/api/sound/library")
     async def sound_library(limit: int = 80, chat_id: str = ""):

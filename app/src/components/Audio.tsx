@@ -1,12 +1,29 @@
 // Sound in the interface (2.12.0): a player for recordings, recording from the microphone, dictation into a
 // text field, and reading a reply aloud.
 import React, { useEffect, useRef, useState } from "react";
-import { Download, FolderOpen, Loader2, Mic, Square, Volume2 } from "lucide-react";
+import { Download, FolderOpen, Layers, Loader2, Mic, Square, Volume2 } from "lucide-react";
 import { api, desktop, fileUrl, onEvent } from "../api";
-import { useApp } from "../store";
+import { go, useApp } from "../store";
 import { PictureGrid } from "./Pictures";
 
 const mmss = (s: number) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`;
+
+// The composer's tracks are kept on this computer between visits (a convenience: the files themselves are in the library).
+const COMPOSER = "kimilm-composer";
+export function composerTracks(): any[] { try { return JSON.parse(localStorage.getItem(COMPOSER) || "[]"); } catch { return []; } }
+export function saveComposer(tracks: any[]) { try { localStorage.setItem(COMPOSER, JSON.stringify(tracks)); } catch { /* not kept this time */ } }
+export function newTrack(item: any, tracks: any[]) {
+  const seconds = item.params?.seconds || item.seconds || 0;
+  return { id: `${Date.now()}-${Math.round(Math.random() * 1e6)}`, path: item.path, name: item.name, seconds, start: 0, from: 0, to: seconds,
+    volume: tracks.length && item.params?.mode === "music" ? 0.25 : 1, fade_in: 0, fade_out: 0, mute: false };
+}
+export function addToComposer(item: any) {
+  const tracks = composerTracks();
+  saveComposer([...tracks, newTrack(item, tracks)]);
+  sessionStorage.setItem("kimilm-sound-tab", "composer");
+  go("sound");
+  window.dispatchEvent(new Event("kimilm-composer"));
+}
 
 export function AudioClip({ item, onRemove }: any) {
   const p = item.params || {};
@@ -20,6 +37,7 @@ export function AudioClip({ item, onRemove }: any) {
         <div className="ellipsis" title={item.prompt}>{item.name}</div>
         <div className="small muted ellipsis">{facts}</div>
       </div>
+      {item.id !== "" && <button className="icon-btn" title="Open in the composer: cut it, add music or other recordings" onClick={() => addToComposer(item)}><Layers size={15} /></button>}
       <a className="icon-btn" href={fileUrl(item.path)} download={item.name} title="Download"><Download size={15} /></a>
       {desktop && <button className="icon-btn" title="Show in folder" onClick={() => desktop.showItem(item.path)}><FolderOpen size={15} /></button>}
       {onRemove}
