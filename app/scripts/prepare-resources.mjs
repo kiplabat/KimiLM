@@ -102,17 +102,42 @@ async function llama() {
     return body;
   };
   const match = (rel) => (rel.assets || []).find((a) => pats.every((p) => a.name.includes(p)) && a.name.endsWith(".zip") && !a.name.startsWith("cudart"));
-  const pinned = await get(`${api}/tags/${versions.llama_cpp_tag}`).catch((e) => { console.warn(`   ${e.message}`); return { assets: [] }; });
-  let asset = match(pinned);
-  if (!asset) {
-    console.warn(`   llama.cpp ${versions.llama_cpp_tag} has no file matching ${pats.join(" + ")} (it lists: ${(pinned.assets || []).map((a) => a.name).join(", ") || "nothing"}).`);
-    for (const rel of await get(`${api}?per_page=30`)) {
-      asset = match(rel);
-      if (asset) { console.warn(`   using the newest release that has it: ${rel.tag_name}. Consider setting llama_cpp_tag to ${rel.tag_name} in engine/dva/versions.json.`); break; }
+  // The archive of the pinned release, once downloaded, is used again without asking GitHub: its API allows 60
+  // questions an hour per internet address without a token (addresses are often shared), and a build that stops
+  // there after ten minutes of other work helps nobody. A token in GITHUB_TOKEN lifts the limit.
+  const tag = versions.llama_cpp_tag;
+  const fits = (name) => pats.every((p) => name.includes(p)) && name.endsWith(".zip") && !name.startsWith("cudart");
+  const kept = fs.readdirSync(cache).find((n) => n.includes(`-${tag}-`) && fits(n));
+  let zip, name;
+  if (kept) {
+    console.log(`   cached ${kept} (GitHub was not asked)`);
+    zip = path.join(cache, kept);
+    name = kept;
+  } else {
+    let asset = null;
+    try {
+      const pinned = await get(`${api}/tags/${tag}`).catch((e) => { console.warn(`   ${e.message}`); return null; });
+      asset = pinned ? match(pinned) : null;
+      if (pinned && !asset) {
+        console.warn(`   llama.cpp ${tag} has no file matching ${pats.join(" + ")} (it lists: ${(pinned.assets || []).map((a) => a.name).join(", ") || "nothing"}).`);
+        for (const rel of await get(`${api}?per_page=30`)) {
+          asset = match(rel);
+          if (asset) { console.warn(`   using the newest release that has it: ${rel.tag_name}. Consider setting llama_cpp_tag to ${rel.tag_name} in engine/dva/versions.json.`); break; }
+        }
+      }
+    } catch (e) { console.warn(`   ${e.message}`); }
+    if (asset) {
+      name = asset.name;
+      zip = await download(asset.browser_download_url, path.join(cache, name));
+    } else if (pats.length === 1) {
+      // GitHub's API could not be asked. The file of a release has a fixed address, which needs no API.
+      name = `llama-${tag}-${pats[0]}.zip`;
+      console.warn(`   GitHub's API gave no answer: fetching ${name} by its address instead.`);
+      zip = await download(`https://github.com/${versions.llama_cpp_repo}/releases/download/${tag}/${name}`, path.join(cache, name));
+    } else {
+      throw new Error(`No llama.cpp release with a file matching ${pats.join(" + ")} could be found (GitHub's API may have refused: wait an hour, or set GITHUB_TOKEN).`);
     }
   }
-  if (!asset) throw new Error(`No recent llama.cpp release has a file matching ${pats.join(" + ")}`);
-  const zip = await download(asset.browser_download_url, path.join(cache, asset.name));
   const dest = path.join(out, "llama", backend);
   fs.rmSync(dest, { recursive: true, force: true });
   const tmp = dest + ".tmp";
@@ -131,7 +156,7 @@ async function llama() {
   if (!folder) throw new Error("llama-server was not found in the download");
   fs.renameSync(folder, dest);
   fs.rmSync(tmp, { recursive: true, force: true });
-  console.log(`   ${asset.name} → ${dest}`);
+  console.log(`   ${name} → ${dest}`);
 }
 
 fs.mkdirSync(out, { recursive: true });
