@@ -1914,9 +1914,38 @@ def test_what_connected_services_promise_is_put_into_words():
     assert cn.digest(["a"], tools=1).endswith("; and 1 more")
 
 
-def test_the_browser_tools_click_type_and_download_in_a_real_browser(tmp_path):
-    """With a real Chrome and the bundled browser helper (skipped where there is none): open a page, type into
-    a field, click a button, follow a download, take a screenshot — each answer shows the page afterwards."""
+SHOP = """<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Test shop</title>
+<meta name="generator" content="TestKit 1.0"><link rel="next" href="page2.html"></head><body>
+<div role="dialog" aria-label="Cookie consent"><p>We use cookies to improve your experience.</p>
+<button onclick="document.cookie='consent=all;path=/';this.parentNode.remove()">Accept all</button>
+<button onclick="document.cookie='consent=necessary;path=/';this.parentNode.remove()">Reject all</button></div>
+<h1>Test shop</h1><a href="prices.html">Price list</a> <a href="login.html">Sign in</a>
+<h2>Datasets</h2><div id="items">Loading…</div>
+<form onsubmit="document.getElementById('out').textContent='Hello, '+document.getElementById('n').value;return false">
+<label for="n">Your name</label><input id="n"><button>Greet</button></form><p id="out"></p>
+<form id="order" action="/order" method="post" onsubmit="document.getElementById('out').textContent='Ordered '+this.qty.value+' of '+this.item.value+(this.gift.checked?' as a gift':'');return false">
+<label for="item">Dataset</label><select id="item" name="item"><option>Glaciers</option><option>Rainfall</option></select>
+<label for="qty">Copies</label><input id="qty" name="qty" type="number" value="1" required>
+<label><input type="checkbox" name="gift"> This is a gift</label><button type="submit">Place order</button></form>
+<a href="/files/prices.csv">Download prices</a> <a href="/files/report.pdf">Annual report</a>
+<a href="terms.html" target="_blank">Terms</a>
+<select aria-label="Colour"><option>Red</option><option>Blue</option></select>
+<button onclick="alert('Saved!')">Save</button>
+<button onclick="document.getElementById('out').textContent=confirm('Delete everything?')?'deleted':'kept'">Delete</button>
+<button onclick="setTimeout(()=>{document.getElementById('late').textContent='The late result is 42'},1200)">Compute</button><p id="late"></p>
+<label for="f">Your file</label><input type="file" id="f" onchange="document.getElementById('out').textContent='Got '+this.files[0].name">
+<table><caption>Stock</caption><tr><th>Item</th><th>Units</th></tr><tr><td>Glaciers</td><td>12</td></tr><tr><td>Rainfall</td><td>7</td></tr></table>
+<script>fetch('/api/items.json').then(r=>r.json()).then(d=>{document.getElementById('items').innerHTML='<ul>'+d.items.map(i=>'<li>'+i.name+': '+i.rows+' rows</li>').join('')+'</ul>'})</script>
+</body></html>"""
+
+
+def test_the_browser_tools_work_a_website_like_a_careful_person(tmp_path):
+    """With a real Chrome and the bundled browser helper (skipped where there is none). 2.9.0: open a page, type,
+    click, follow a download, take a screenshot, each answer showing the page afterwards. 2.16.0: the page is
+    waited for and its cookie banner answered with the choice that allows least; elements are found by their
+    words; the page's messages and questions are handled; a new tab is followed; a whole form is filled in;
+    how the page is served and where its data comes from is found out; files are saved with the page's own
+    session; a file is given to the page only after asking; paying asks even when clicks are allowed."""
     import asyncio
     import functools
     import http.server
@@ -1929,19 +1958,21 @@ def test_the_browser_tools_click_type_and_download_in_a_real_browser(tmp_path):
         pytest.skip("needs Node, the browser helper (app/node_modules) and Chrome")
     site = tmp_path / "site"
     (site / "files").mkdir(parents=True)
-    (site / "index.html").write_text(
-        "<!doctype html><title>Test shop</title><h1>Test shop</h1><a href='prices.html'>Price list</a>"
-        "<form onsubmit=\"document.getElementById('out').textContent='Hello, '+document.getElementById('n').value;"
-        "return false\"><label for='n'>Your name</label><input id='n'><button>Greet</button></form><p id='out'></p>"
-        "<a href='/files/prices.csv'>Download prices</a>"
-        "<select aria-label='Colour'><option>Red</option><option>Blue</option></select>")
+    (site / "api").mkdir()
+    (site / "index.html").write_text(SHOP, encoding="utf-8")
     (site / "prices.html").write_text("<!doctype html><title>Price list</title><h1>Price list</h1><p>Tea 4.50</p>")
+    (site / "terms.html").write_text("<!doctype html><title>Terms</title><h1>Terms of use</h1><button>I agree</button>")
+    (site / "login.html").write_text("<!doctype html><title>Sign in</title><form><label for='u'>User name</label><input id='u'>"
+                                     "<label for='p'>Password</label><input id='p' type='password'><button>Sign in</button></form>")
     (site / "files" / "prices.csv").write_text("item,price\ntea,4.50\n")
+    (site / "files" / "report.pdf").write_bytes(b"%PDF-1.4\n" + b"x" * 5000)
+    (site / "api" / "items.json").write_text('{"items":[{"name":"Glacier mass balance","rows":1200}]}')
 
     class Handler(http.server.SimpleHTTPRequestHandler):
         def end_headers(self):
             if self.path.endswith(".csv"):
                 self.send_header("Content-Disposition", "attachment; filename=prices.csv")
+            self.send_header("Set-Cookie", "session=abc123; HttpOnly; Path=/")
             super().end_headers()
 
         def log_message(self, *a):
@@ -1953,32 +1984,47 @@ def test_the_browser_tools_click_type_and_download_in_a_real_browser(tmp_path):
     old = {k: os.environ.get(k) for k in env}
     os.environ.update(env)
     os.environ.pop("DVA_NODE_IS_ELECTRON", None)
+    home = f"http://127.0.0.1:{port}"
 
     async def scenario():
         from dva.app_state import App
-        from dva.tools import ToolContext, ToolError, browser
+        from dva.tools import ToolContext, ToolDenied, ToolError, browser
         app = App(str(tmp_path / "data"))
         app.db.set_setting("browser_channel", "chrome")
         app.db.set_setting("browser_headless", True)
-        events = []
+        events, asked, allow = [], [], [True]
+
+        async def approve(tool, args, description, ignore_auto=False):
+            asked.append((tool.name, ignore_auto))
+            return allow[0]
         ctx = ToolContext(app=app, chat={"id": "chat_x"}, project=None, workspace=tmp_path / "work", folders=[],
-                          readonly=[], emit=lambda kind, **d: events.append((kind, d)), approve=None)
+                          readonly=[], emit=lambda kind, **d: events.append((kind, d)), approve=approve)
         (tmp_path / "work").mkdir()
+        downloads = tmp_path / "work" / "downloads"
         try:
-            page = await browser.browser_open(ctx, f"http://127.0.0.1:{port}/index.html")
+            page = await browser.browser_open(ctx, f"{home}/index.html")
             assert "Page: Test shop" in page and 'textbox "Your name"' in page and 'button "Greet"' in page
+            # the banner was answered with the choice that allows least, and is gone; what loads late is there
+            assert "Its cookie banner was answered with “Reject all”." in page and "Accept all" not in page
+            assert "Glacier mass balance: 1200 rows" in page
+            # the page as an agent reads it: links carry their address, table rows are one line each, and only
+            # what can be acted on has a reference
+            assert f'link "Price list" [ref=' in page and f"→ {home}/prices.html" in page
+            assert "- row: Glaciers | 12" in page and 'heading "Test shop" [level=1]\n' in page
+            assert re.search(r"On it: .*", page).group(0).startswith("On it: 2 headings, 5 links, 6 buttons, 5 fields, 1 table.")
             ref = lambda label: re.search(re.escape(label) + r".*?\[ref=(\w+)\]", page).group(1)   # noqa: E731
             typed = await browser.browser_type(ctx, ref('textbox "Your name"'), "Labatt", submit=True)
             assert "Hello, Labatt" in typed
             chosen = await browser.browser_select(ctx, ref('combobox "Colour"'), "Blue")
             assert 'option "Blue" [selected]' in chosen
             got = await browser.browser_click(ctx, ref('link "Download prices"'), "Download prices")
-            saved = tmp_path / "work" / "downloads" / "prices.csv"
+            saved = downloads / "prices.csv"
             assert "Downloaded:" in got and saved.read_text().startswith("item,price")
             assert ("file_changed", {"path": str(saved), "action": "downloaded"}) in events
-            other = await browser.browser_click(ctx, ref('link "Price list"'), "Price list")
+            other = await browser.browser_click(ctx, text="Price list")              # by its words
             assert "Page: Price list" in other and "Tea 4.50" in other
-            assert "Tea 4.50" in await browser.browser_look(ctx, "Tea")
+            assert "paragraph: Tea 4.50" in await browser.browser_look(ctx, "Tea")
+            assert "Nothing on the page has the words “coffee”" in await browser.browser_look(ctx, "coffee")
             shot = await browser.browser_screenshot(ctx)
             files = list((tmp_path / "work" / "screenshots").glob("*.png"))
             assert len(files) == 1 and files[0].stat().st_size > 1000 and str(files[0]) in shot
@@ -1986,6 +2032,78 @@ def test_the_browser_tools_click_type_and_download_in_a_real_browser(tmp_path):
                 await browser.browser_click(ctx, "e999")          # a reference from an older page
             with pytest.raises(ToolError):
                 await browser.browser_open(ctx, "file:///etc/passwd")
+            assert "Page: Test shop" in await browser.browser_back(ctx)
+            # other ways to look at a page
+            assert "The page's structure:" in await browser.browser_look(ctx, show="outline")
+            links = await browser.browser_look(ctx, show="links")
+            assert f"Annual report → {home}/files/report.pdf  (a file)" in links and "5 links:" in links
+            assert "Table 1 “Stock” (3 rows):\nItem | Units\nGlaciers | 12" in await browser.browser_look(ctx, show="tables")
+            assert 'spinbutton "Copies"' in await browser.browser_look(ctx, show="forms")
+            assert "Glacier mass balance: 1200 rows" in await browser.browser_look(ctx, show="text")
+            # words that fit several elements, or none: said, with what there is
+            with pytest.raises(ToolError, match="Several elements have the words “e”"):
+                await browser.browser_click(ctx, text="e")
+            with pytest.raises(ToolError, match='Close: "Download prices"'):
+                await browser.browser_click(ctx, text="Download price list")
+            # a message of the page is read and closed; a question waits for the agent's answer
+            said = await browser.browser_click(ctx, text="Save")
+            assert "The page showed a message: “Saved!” (closed)." in said and "Page: Test shop" in said
+            asks = await browser.browser_click(ctx, text="Delete")
+            assert "The page asks: “Delete everything?”" in asks and "Page:" not in asks
+            with pytest.raises(ToolError, match="waits for an answer"):
+                await browser.browser_look(ctx)
+            kept = await browser.browser_click(ctx, text="Cancel")
+            assert "with Cancel" in kept and "paragraph: kept" in kept
+            # something that takes a moment
+            await browser.browser_click(ctx, text="Compute")
+            assert "“late result is 42” is on the page now." in await browser.browser_wait(ctx, text="late result is 42")
+            with pytest.raises(ToolError, match="did not happen"):
+                await browser.browser_wait(ctx, text="never shown", seconds=1)
+            # a whole form at once; ordering asks every time, even where clicks are allowed
+            asked.clear()
+            done = await browser.browser_fill(ctx, [{"field": "Dataset", "value": "Rainfall"}, {"field": "Copies", "value": "3"},
+                                                    {"field": "This is a gift", "value": "true"}], submit="Place order")
+            assert "Ordered 3 of Rainfall as a gift" in done and asked == [("browser_pay", True)]
+            allow[0] = False
+            with pytest.raises(ToolDenied, match="paying or ordering"):
+                await browser.browser_click(ctx, text="Place order")
+            with pytest.raises(ToolError, match="no field “Shoe size”"):
+                await browser.browser_fill(ctx, [{"field": "Shoe size", "value": "9"}])
+            # how the page is served, where its data comes from, what it keeps
+            told = await browser.browser_inspect(ctx)
+            assert "Answer of the server: 200, text/html; made with TestKit 1.0" in told
+            assert "the content is in the page as the server sends it" in told
+            assert f"- GET {home}/api/items.json → 200" in told
+            assert "session [not readable by scripts]" in told and "consent" in told and "from other sites" not in told
+            assert f"Annual report → {home}/files/report.pdf" in told and "next page:" in told
+            assert f"Form: sends POST to {home}/order with item, qty*, gift" in told
+            # files saved by the browser itself: one it would only show, and the data address
+            pdf = await browser.browser_save(ctx, text="Annual report")
+            assert (downloads / "report.pdf").stat().st_size == 5009 and "application/pdf" in pdf
+            await browser.browser_save(ctx, url="/api/items.json")
+            assert json.loads((downloads / "items.json").read_text())["items"][0]["rows"] == 1200
+            # a link that opens a new tab is followed; tabs are listed and closed
+            terms = await browser.browser_click(ctx, text="Terms")
+            assert "It opened in a new tab (tab 2 of 2)" in terms and "Page: Terms" in terms
+            assert "cookie banner" not in terms                     # "I agree" to terms is not a cookie banner
+            assert "- 2: Terms" in await browser.browser_tabs(ctx) and "Page: Test shop" in await browser.browser_tabs(ctx, "close", 2)
+            # a page that wants a password
+            assert "It asks for a password: never guess one." in await browser.browser_click(ctx, text="Sign in")
+            await browser.browser_back(ctx)
+            # giving the page one of the user's files: asked every time, and declined here
+            note = tmp_path / "work" / "note.txt"
+            note.write_text("hello")
+            asked.clear()
+            with pytest.raises(ToolDenied):
+                await browser.browser_upload(ctx, "note.txt", field="Your file")
+            assert asked == [("browser_send_file", True)]
+            allow[0] = True
+            assert "Got note.txt" in await browser.browser_upload(ctx, "note.txt", field="Your file")
+            assert not list((app.services.browser_dir / "uploads").iterdir())       # the copy for the helper is gone
+            # the setting that leaves banners to the agent
+            app.db.set_setting("browser_consent", "ask")
+            again = await browser.browser_open(ctx, f"{home}/index.html")
+            assert 'button "Reject all"' in again and "was answered" not in again
         finally:
             await app.services.shutdown()
     import re
@@ -1998,6 +2116,175 @@ def test_the_browser_tools_click_type_and_download_in_a_real_browser(tmp_path):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+def test_a_page_is_read_the_way_an_agent_needs_it():
+    """The page view without a browser: the helper's snapshot made short and usable."""
+    from dva.tools import browser as b
+    snap = """### Page
+- Page URL: https://shop.example/list
+- Page Title: Shop
+### Snapshot
+```yaml
+- generic [active] [ref=e1]:
+  - dialog "Cookie consent" [ref=e2]:
+    - paragraph [ref=e3]: We use cookies and similar technologies.
+    - button "Accept all" [ref=e5]
+    - button "Only necessary" [ref=e6]
+  - main [ref=e13]:
+    - heading "Shop \\"Best\\"" [level=1] [ref=e14]
+    - generic [ref=e15]:
+      - link "Prices" [ref=e16] [cursor=pointer]:
+        - /url: /prices.csv
+      - textbox "Email" [ref=e25]:
+        - /placeholder: you@example.org
+      - generic [ref=e26] [cursor=pointer]: Open menu
+    - paragraph
+    - table "Stock" [ref=e39]:
+      - rowgroup [ref=e41]:
+        - row [ref=e42]:
+          - columnheader "Item" [ref=e43]
+          - columnheader "Units" [ref=e44]
+      - rowgroup [ref=e46]:
+        - row [ref=e47]:
+          - cell "Glaciers" [ref=e48]
+          - cell "12" [ref=e49]
+        - row [ref=e50]:
+          - cell [ref=e51]:
+            - link "Rain" [ref=e52] [cursor=pointer]:
+              - /url: rain.html
+          - cell "7" [ref=e53]
+```"""
+    assert b.page_head(snap) == ("Shop", "https://shop.example/list")
+    nodes = b.parse(snap)
+    lines = b.compact(nodes, "https://shop.example/list")
+    text = "\n".join(lines)
+    assert lines[0] == '- dialog "Cookie consent"' and '  - button "Only necessary" [ref=e6]' in lines
+    assert '  - heading "Shop "Best"" [level=1]' in lines                      # no reference: nothing to act on
+    assert '  - link "Prices" [ref=e16] → https://shop.example/prices.csv' in lines
+    assert '  - textbox "Email" [ref=e25] (placeholder: you@example.org)' in lines
+    assert "  - generic [ref=e26]: Open menu" in lines                         # a clickable box keeps its reference
+    assert "    - row: Item | Units" in lines and "    - row: Glaciers | 12" in lines
+    assert '- link "Rain" [ref=e52] → https://shop.example/rain.html' in text  # a row with a link in it stays whole
+    assert "rowgroup" not in text and "cursor" not in text and "[active]" not in text and len(text) < len(snap) * 0.62
+    assert b.digest(nodes) == "On it: 1 heading, 2 links, 2 buttons, 1 field, 1 table."
+    assert "answered with “Only necessary”" in b.digest(nodes, "Only necessary")
+    # the banner's buttons: the choice that allows least is known from its words
+    for words in ("Reject all", "Only necessary", "Necessary only", "Decline", "Use necessary cookies only",
+                  "Reject non-essential", "Continue without accepting", "No, thanks"):
+        assert b.REJECT.match(words), words
+    for words in ("Accept all", "Accept", "I agree", "Got it", "OK", "Allow all cookies", "Agree and close"):
+        assert b.ACCEPT.match(words) and not b.REJECT.match(words), words
+    for words in ("Accept terms and pay", "Reject this offer", "Sign in", "Continue"):
+        assert not b.ACCEPT.match(words) and not b.REJECT.match(words), words
+    for words in ("Pay now", "Place order", "Buy", "Checkout", "Confirm payment", "Subscribe"):
+        assert b.PAY.search(words), words
+    assert not b.PAY.search("Download prices") and not b.PAY.search("Display options")
+    # finding an element by its words; the parts of a page that have some words; a long page in parts
+    assert [n["ref"] for n in b.match(nodes, "prices", b.ACT)] == ["e16"]
+    assert [n["ref"] for n in b.match(nodes, "a", b.ACT)] == ["e5", "e6", "e25", "e52"]
+    hit = b.found(lines, "glaciers")
+    assert hit.startswith("1 place with “glaciers”:") and '- table "Stock"' in hit and "Rain" not in hit
+    assert "Nothing on the page has the words “tea”" in b.found(lines, "tea")
+    long = [f"- paragraph: line {i} " + "x" * 80 for i in range(300)]
+    first, parts = b.paged(long, 1)
+    assert parts == 5 and "part 1 of 5" in first and "browser_look(page=2)" in first
+    assert "line 299" in b.paged(long, 9)[0] and "browser_look(page=1)" in b.paged(long, 5)[0]
+    assert b.dialog_in('- ["confirm" dialog with message "Delete everything?"]: can be handled by browser_handle_dialog') == \
+        {"kind": "confirm", "message": "Delete everything?"}
+    assert b.result_of('### Result\n{"a": 1}\n### Ran Playwright code\n```js\nx\n```') == {"a": 1}
+    groups = {t.name: t.group for t in b.TOOLS}
+    assert sum(g == "browser" for g in groups.values()) == 7 and groups["browser_inspect"] == "browsing"
+
+
+def test_tool_calls_are_repaired_or_refused_with_what_to_change():
+    """2.16.0: what a model plainly meant is repaired and said; what cannot be repaired is not run, and the answer
+    says what is missing and how the tool is called."""
+    from dva.toolcheck import how_to_call, loose_json, repair
+    from dva.tools import Tool
+    S = lambda props, req, **kw: {"type": "object", "properties": props, "required": req, **kw}  # noqa: E731
+    tools = {t.name: t for t in (
+        Tool("read_file", "Read a file", S({"path": {"type": "string", "description": "The file to read."},
+                                            "max_chars": {"type": "integer"}}, ["path"]), None, "files"),
+        Tool("write_file", "Write", S({"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]), None, "files"),
+        Tool("web_search", "Search", S({"query": {"type": "string"}, "fresh": {"type": "boolean"}}, ["query"]), None, "web"),
+        Tool("browser_look", "Look", S({"show": {"type": "string", "enum": ["page", "outline", "links"]}}, []), None, "browser"),
+        Tool("make_list", "List", S({"items": {"type": "array", "items": {"type": "string"}}, "count": {"type": "number"}}, ["items"]), None, "files"),
+        Tool("notes__add", "A connector's tool", S({"title": {"type": "string"}}, ["title"]), None, "connector", source="connector:notes"),
+        Tool("free", "No parameters said", {"type": "object"}, None, "connector", source="connector:x"))}
+    ok = repair(tools, "read_file", {"path": "a.txt", "max_chars": 500})
+    assert ok == {"name": "read_file", "args": {"path": "a.txt", "max_chars": 500}, "notes": [], "error": None}   # untouched
+    # the tool's name
+    got = repair(tools, "Read-File", {"path": "a.txt"})
+    assert got["name"] == "read_file" and got["notes"] == ["`Read-File` was read as the tool `read_file`."]
+    assert repair(tools, "functions.web_search", {"query": "x"})["name"] == "web_search"
+    assert repair(tools, "web_serch", {"query": "x"})["name"] == "web_search"
+    none = repair(tools, "open_door", {})
+    assert none["error"].startswith("There is no tool called 'open_door'.") and "read_file" in none["error"]
+    # the parameters' names, the wrapping, the types
+    got = repair(tools, "read_file", {"file": "a.txt", "max_chars": "500", "colour": "red"})
+    assert got["args"] == {"path": "a.txt", "max_chars": 500} and not got["error"]
+    assert got["notes"] == ["`file` was read as `path`.", "`colour` is not a parameter of read_file and was left out."]
+    got = repair(tools, "web_search", {"arguments": {"q": "glaciers", "fresh": "yes"}})
+    assert got["args"] == {"query": "glaciers", "fresh": True} and "inside `arguments`" in got["notes"][0]
+    assert repair(tools, "make_list", {"items": "tea", "count": "2.5"})["args"] == {"items": ["tea"], "count": 2.5}
+    assert repair(tools, "make_list", {"items": '["tea", "milk"]'})["args"] == {"items": ["tea", "milk"]}
+    assert repair(tools, "read_file", {"path": "a.txt", "max_chars": None})["args"] == {"path": "a.txt"}
+    assert repair(tools, "read_file", {"Path": "a.txt"})["args"] == {"path": "a.txt"}
+    assert repair(tools, "write_file", {"path": "a.txt", "content": ""})["error"] is None      # an empty file is a file
+    assert repair(tools, "write_file", {"path": "a.txt", "text": "hi"})["args"] == {"path": "a.txt", "content": "hi"}
+    # arguments that are almost JSON, or just the one thing the tool needs
+    assert loose_json("```json\n{'path': 'a.txt',}\n```") == {"path": "a.txt"} and loose_json('{"a": [1, 2,], "b": {"c": 1') == {"a": [1, 2], "b": {"c": 1}}
+    got = repair(tools, "read_file", {"_unparsed": '{"path": "a.txt",}'})
+    assert got["args"] == {"path": "a.txt"} and got["notes"] == ["The arguments were not valid JSON and were repaired."]
+    assert repair(tools, "read_file", {"_unparsed": "a.txt"})["args"] == {"path": "a.txt"}
+    bad = repair(tools, "write_file", {"_unparsed": "path=a.txt content=hi"})
+    assert bad["error"].startswith("The arguments were not valid JSON") and "write_file(path, content)" in bad["error"]
+    # a value outside the choices: the nearest one, else said
+    assert repair(tools, "browser_look", {"show": "Outline"})["args"] == {"show": "outline"}
+    wrong = repair(tools, "browser_look", {"show": "everything"})
+    assert wrong["error"] == "Error: 'everything' is not a value `show` of browser_look can have. It is one of: page, outline, links."
+    # what is missing is said, with how the tool is called
+    miss = repair(tools, "read_file", {"max_chars": 10})
+    assert miss["error"].startswith("Error: read_file was not run: it needs `path`, which is missing.")
+    assert "How to call it: read_file(path, max_chars?)\n- path (string, required): The file to read.\n- max_chars (integer)" in miss["error"]
+    assert "which are missing" in repair(tools, "write_file", {})["error"]
+    # a connector's tool may take more than it says; one that says nothing is not checked
+    assert repair(tools, "notes__add", {"title": "x", "tags": ["a"]})["args"] == {"title": "x", "tags": ["a"]}
+    assert repair(tools, "free", {"anything": 1})["args"] == {"anything": 1}
+    assert how_to_call(tools["free"]) == "How to call it: free() — it takes no arguments"
+
+
+def test_a_nearly_right_call_runs_and_the_browser_specialist_has_its_own_kit(engine):
+    """2.16.0, end to end: an agent's call with the wrong tool spelling, the arguments wrapped and a parameter by
+    another name is repaired, run, and the agent is told what was read as what; a call that lacks what the tool
+    needs is not run and says how the tool is called. The Browser harness has the specialist's tools; an
+    ordinary agent does not get them."""
+    c, tmp = engine["client"], engine["tmp"]
+    folder = tmp / "calls"
+    folder.mkdir()
+    (folder / "note.txt").write_text("the note says hello")
+    chat = c.post("/api/chats", json={"harness": "agent", "folders": [str(folder)]}).json()
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "make a sloppy call for note.txt please"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
+    assert step["name"] == "read_file" and step["ok"] and step["arguments"] == {"path": "note.txt"}, step
+    assert "the note says hello" in step["result"] and "`file` was read as `path`." in step["result"]
+    assert "`max_chars` is not a parameter of read_file and was left out." in step["result"]
+    assert step["repaired"][0] == "`Read-File` was read as the tool `read_file`."
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "now a call without a path"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
+    assert not step["ok"] and step["result"].startswith("Error: read_file was not run: it needs `path`, which is missing.")
+    assert "How to call it: read_file(path" in step["result"]
+    # the Browser harness: its method, and a kit of its own
+    listed = {h["id"]: h for h in c.get("/api/harnesses").json()["harnesses"]}
+    assert listed["browser"]["tools"] == ["browser", "browsing", "web", "files"] and "browsing" not in listed["agent"]["tools"]
+    chat = c.post("/api/chats", json={"harness": "browser"}).json()
+    shown = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "show system prompt"}).json()
+    assert wait_job(c, shown["job_id"])["status"] == "done"
+    said = last_assistant(c, chat["id"])["content"]
+    assert "Prefer the data to the page." in said and "never guess a user name or a password" in said
 
 
 def test_a_cut_off_long_task_continues_by_itself_but_not_forever(tmp_path, monkeypatch):

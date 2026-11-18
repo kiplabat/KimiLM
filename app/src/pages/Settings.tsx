@@ -230,6 +230,13 @@ export default function Settings() {
       <div className="card stack-s">
         <h3>Web and downloads</h3>
         <Toggle checked={s.browser_search ?? true} onChange={(v: boolean) => set({ browser_search: v })} label="When search engines return nothing useful, search again in a real browser window (Edge)" />
+        <Field label="Cookie banners on websites an agent opens" help="Answered without asking, as a person would in passing. Agreeing to terms, signing in, sending a file and paying are never done this way.">
+          <select className="input" style={{ maxWidth: 560 }} value={s.browser_consent ?? "necessary"} onChange={(e) => set({ browser_consent: e.target.value })}>
+            <option value="necessary">Choose what allows least (“Reject all”, “Only necessary”), else accept</option>
+            <option value="accept">Accept them</option>
+            <option value="ask">Leave them to the agent (a click then asks you)</option>
+          </select>
+        </Field>
         <Field label="Hugging Face token (optional)" help="Only for models that require you to accept a licence on huggingface.co. Stored in Windows Credential Manager.">
           <div className="row gap-s"><input className="input" type="password" value={hf} placeholder={boot.has_hf_token ? "saved ••••" : "hf_…"} onChange={(e) => setHf(e.target.value)} />
             <Button onClick={async () => { await set({ hf_token: hf }); setHf(""); toast("Saved", "ok"); }}>Save</Button></div>

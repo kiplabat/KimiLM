@@ -1,0 +1,21 @@
+{
+  "name": "Browser",
+  "description": "Works on websites in a real browser like a careful person: reads a page's structure, answers cookie banners, fills in forms, clicks through, follows downloads, and finds the data address behind a page. Give it every step that needs a website to be used, not just read.",
+  "type": "loop",
+  "mode": "agent",
+  "tools": [
+    "browser",
+    "browsing",
+    "web",
+    "files"
+  ],
+  "connectors": true,
+  "max_steps": 30,
+  "max_tool_calls": 60,
+  "max_searches": 4,
+  "time_limit_minutes": 30,
+  "temperature": 0.2,
+  "memory": true,
+  "learn": true,
+  "icon": "search"
+}

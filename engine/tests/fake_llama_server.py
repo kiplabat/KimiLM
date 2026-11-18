@@ -141,6 +141,10 @@ def decide(body):
     if "repaint " in text and "edit_image" in tools and not after_tool:      # "repaint <path> so that <what>"
         path, _, what = text.split("repaint ", 1)[1].partition(" so that ")
         return {"tool": ("edit_image", {"image": path.strip(), "prompt": what.strip()})}
+    if "sloppy call for " in text and not after_tool:     # a call that is nearly right (2.16.0): repaired by the app
+        return {"tool": ("Read-File", {"arguments": {"file": text.split("sloppy call for ", 1)[1].split()[0], "max_chars": "200"}})}
+    if "call without a path" in text and not after_tool:  # one that cannot be repaired: said, with how to call it
+        return {"tool": ("read_file", {"max_chars": 10})}
     if after_tool and msgs[-1].get("content", "").startswith(("- chat_id", "[", "Added to the project notes",
                                                               "No earlier chat")):
         return {"text": "Found: " + msgs[-1]["content"][:600].replace("\n", " ")}
