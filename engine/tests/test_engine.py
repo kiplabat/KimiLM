@@ -2598,7 +2598,12 @@ def test_pictures_are_made_and_changed_on_this_computer(engine):
     first, size = asked(made["images"][0]["path"])
     assert size == (640, 480)                                     # sizes are rounded to what the models accept
     assert first["model"] == str(weights) and first["prompt"] == "a red kite over a green hill"
-    assert (first["seed"], first["count"], first["steps"], first["cfg"], first["negative"]) == ("7", "2", "6", "5.5", "people")
+    # each picture is a run of the engine of its own, so that a finished one is kept whatever happens to the
+    # next; picture i is drawn with seed + i, as the engine does within a batch
+    assert (first["seed"], first["count"], first["steps"], first["cfg"], first["negative"]) == ("7", "1", "6", "5.5", "people")
+    second, _ = asked(made["images"][1]["path"])
+    assert (second["seed"], second["count"]) == ("8", "1") and made["images"][1]["params"]["seed"] == 8
+    assert made["images"][0]["path"].endswith("-01.png") and made["images"][1]["path"].endswith("-02.png")
     assert made["images"][0]["params"]["seed"] == 7 and made["images"][0]["params"]["mode"] == "new"
     assert made["images"][0]["params"]["engine"] == "custom" and made["images"][1]["params"]["index"] == 1
     assert Path(made["images"][0]["path"]).parent == tmp / "data" / "images"
@@ -2789,7 +2794,8 @@ def test_the_image_engine_is_chosen_by_the_cards_and_memory_is_shared_with_text_
     from dva.images import EXE, Images
     monkeypatch.delenv("DVA_SD_CLI", raising=False)
     settings = {}
-    db = types.SimpleNamespace(setting=lambda k, d=None: settings.get(k, d), set_setting=settings.__setitem__)
+    db = types.SimpleNamespace(setting=lambda k, d=None: settings.get(k, d), set_setting=settings.__setitem__,
+                               all=lambda *a: [])
     stopped = []
 
     class Runtime:
@@ -3726,3 +3732,260 @@ def test_an_agent_makes_a_video_and_cuts_it(engine):
     job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "film a clip of a kite"}).json()
     assert wait_job(c, job["job_id"])["status"] == "done"
     assert not [s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool"]
+
+
+# ---------------------------------------------------------------------------------------------- 2.17.0
+def work_job(c, window, job_id, until, timeout=60):
+    """A request of the Images or the Video window, once `until(job)` holds."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        job = next(j for j in c.get(f"/api/{window}").json()["jobs"] if j["id"] == job_id)
+        if until(job):
+            return job
+        time.sleep(0.1)
+    raise AssertionError(f"{window} job never got there: {job}")
+
+
+def test_pictures_are_paused_stopped_and_continued_with_what_they_made(engine):
+    """2.17.0. A picture on a processor takes a quarter of an hour: the request can be paused where it is (the
+    engine is frozen and goes on from the same step), stopped (the finished pictures are kept), and continued
+    (only the missing pictures are made, with the seeds they would have had)."""
+    import psutil
+    c, tmp = engine["client"], engine["tmp"]
+    ready_for_media(c, tmp)
+    assert c.get("/api/images").json()["pause_stop_minutes"] == 20
+    job = c.post("/api/images/generate", json={"prompt": "a slow picture of three kites", "count": 3, "steps": 4,
+                                               "width": 256, "height": 256}).json()
+    assert job["state"] == "running" and job["count"] == 3 and job["request"]["seed"] > 0      # the seed is chosen and kept
+    seed = job["request"]["seed"]
+    # pause while the first picture is drawn: the engine is frozen, nothing moves, nothing is called stuck
+    work_job(c, "images", job["id"], lambda j: "picture 1 of 3, step" in j["text"] and j["can_pause"])
+    paused = c.post(f"/api/images/jobs/{job['id']}/pause").json()
+    assert paused["state"] == "paused" and paused["programs"], paused
+    pid = paused["programs"][0][0]
+    if os.name != "nt":
+        assert psutil.Process(pid).status() == psutil.STATUS_STOPPED
+    row = c.get(f"/api/jobs/{job['job_id']}").json()
+    assert row["status"] == "running" and row["paused"] and row["can_pause"] and row["quiet"] is None
+    at = row["progress"]
+    time.sleep(1.6)                                           # three steps' worth of time
+    row = c.get(f"/api/jobs/{job['job_id']}").json()
+    assert row["progress"] == at and row["paused"]
+    assert [j for j in c.get("/api/jobs", params={"status": "active", "kinds": "images"}).json()["jobs"]
+            if j["id"] == job["job_id"]][0]["paused"]
+    assert c.post(f"/api/images/jobs/{job['id']}/resume").json()["state"] == "running"
+    assert not c.get(f"/api/jobs/{job['job_id']}").json()["paused"]
+    # stop when the first picture is finished: it is kept, and is in the library although the request did not finish
+    work_job(c, "images", job["id"], lambda j: len(j["images"]) >= 1)
+    c.delete(f"/api/images/jobs/{job['id']}")
+    stopped = work_job(c, "images", job["id"], lambda j: j["state"] not in ("running", "paused"))
+    kept = len(stopped["images"])
+    assert stopped["state"] == "stopped" and 1 <= kept < 3 and stopped["can_continue"], stopped
+    assert stopped["text"] == f"Stopped: {kept} of 3 pictures are kept" and "programs" not in stopped
+    first = stopped["images"][0]
+    assert Path(first["path"]).exists() and first["id"] in {m["id"] for m in c.get("/api/images/library").json()["images"]}
+    for _ in range(50):                                       # the engine it had started is ended, not left behind
+        if not psutil.pid_exists(pid):
+            break
+        time.sleep(0.1)
+    assert not psutil.pid_exists(pid)
+    trail = [e["text"] for e in c.get(f"/api/jobs/{job['job_id']}").json()["trail"]]
+    assert any(t.startswith("Paused: it stops by itself after 20 minutes") for t in trail) and "Continued" in trail
+    # continue: the same request goes on as a new task; only the missing pictures are drawn, with their own seeds
+    again = c.post(f"/api/images/jobs/{job['id']}/continue").json()
+    assert again["id"] == job["id"] and again["state"] == "running" and again["job_id"] != job["job_id"]
+    done = work_job(c, "images", job["id"], lambda j: j["state"] not in ("running", "paused"))
+    assert done["state"] == "done" and len(done["images"]) == 3 and not done["can_continue"], done
+    assert done["images"][0]["path"] == first["path"]
+    assert [asked(m["path"])[0]["seed"] for m in done["images"]] == [str(seed), str(seed + 1), str(seed + 2)]
+    assert [m["params"]["index"] for m in done["images"]] == [0, 1, 2]
+    task = task_of(c, again["job_id"])
+    assert any(e["text"] == f"Continuing: {kept} of 3 pictures exist already and are kept" for e in task["trail"])
+    assert task["detail"]["picture"]["already_made"] == kept and len(task["result"]["media"]) == 3
+    started = [e["text"] for e in task["trail"] if e["text"].startswith("Started: ")]
+    assert len(started) == 3 - kept                           # one run of the engine for each missing picture
+    assert c.post(f"/api/images/jobs/{job['id']}/continue").status_code == 400      # nothing to continue
+    assert c.post(f"/api/images/jobs/{job['id']}/pause").status_code == 400
+
+    # a pause that lasts too long becomes a stop, so that the engine's memory is free again; it can be continued
+    c.put("/api/settings", json={"pause_stop_minutes": 0.02})
+    long = c.post("/api/images/generate", json={"prompt": "a slow picture, paused too long", "steps": 6, "seed": 5,
+                                                "width": 256, "height": 256}).json()
+    work_job(c, "images", long["id"], lambda j: ", step" in j["text"] or "step " in j["text"])
+    assert c.post(f"/api/jobs/{long['job_id']}/pause").json() == {"paused": True}      # the task's own page pauses it too
+    assert work_job(c, "images", long["id"], lambda j: j["state"] != "running")["state"] == "paused"
+    ended = work_job(c, "images", long["id"], lambda j: j["state"] not in ("running", "paused"), timeout=20)
+    assert ended["state"] == "stopped" and ended["text"].startswith("Stopped after being paused for 0.02 minutes")
+    assert ended["can_continue"] and not ended["images"]
+    assert task_of(c, long["job_id"])["error"].startswith("Stopped after being paused")
+    c.put("/api/settings", json={"pause_stop_minutes": 20})
+    full = work_job(c, "images", c.post(f"/api/images/jobs/{long['id']}/continue").json()["id"],
+                    lambda j: j["state"] not in ("running", "paused"))
+    assert full["state"] == "done" and asked(full["images"][0]["path"])[0]["seed"] == "5"
+    # a finished request is taken off the list; what it made stays
+    assert c.post(f"/api/images/jobs/{full['id']}/forget").json() == {"ok": True}
+    assert full["id"] not in {j["id"] for j in c.get("/api/images").json()["jobs"]} and Path(full["images"][0]["path"]).exists()
+    assert c.post(f"/api/images/jobs/{full['id']}/forget").status_code == 404
+    # work that is not a picture or a video on this computer cannot be paused
+    chat = c.post("/api/chats", json={}).json()
+    reply = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "hello"}).json()
+    assert c.post(f"/api/jobs/{reply['job_id']}/pause").json() == {"paused": False}
+    wait_job(c, reply["job_id"])
+
+
+def test_a_video_is_paused_stopped_and_continued_without_redoing_its_parts(engine):
+    """2.17.0. A video keeps the pictures of its scenes, the narration and the music it has made: one that was
+    stopped goes on with what is missing. The encoder and a clip's engine can be paused where they are."""
+    c, tmp = engine["client"], engine["tmp"]
+    ready_for_media(c, tmp)
+    scenes = [{"picture": "a slow picture of a tea field", "narration": "Tea grows on the hills."},
+              {"picture": "a slow picture of a tea factory", "narration": "The leaves are dried here."},
+              {"caption": "The end", "seconds": 40}]
+    job = c.post("/api/video/jobs", json={"kind": "make", "title": "Tea, continued", "scenes": scenes, "shape": "square"}).json()
+    assert job["state"] == "running" and len(job["request"]["scenes"]) == 3
+    # stop after the first scene's picture: it is kept in the request, so continuing does not draw it again
+    work_job(c, "video", job["id"], lambda j: len(j["made"]) >= 1, timeout=90)
+    c.delete(f"/api/video/jobs/{job['id']}")
+    stopped = work_job(c, "video", job["id"], lambda j: j["state"] not in ("running", "paused"))
+    assert stopped["state"] == "stopped" and stopped["can_continue"] and len(stopped["made"]) == 1, stopped
+    assert stopped["text"] == "Stopped: the pictures of 1 scene are kept"
+    first_picture = stopped["request"]["scenes"][0]["image"]
+    assert Path(first_picture).exists() and not stopped["request"]["scenes"][1].get("image")
+    again = c.post(f"/api/video/jobs/{job['id']}/continue").json()
+    assert again["id"] == job["id"] and again["state"] == "running"
+    # pause while it is put together: the encoder waits between two frames; then stop it there
+    work_job(c, "video", job["id"], lambda j: j["text"].startswith("Encoding: frame") and j["can_pause"], timeout=120)
+    assert c.post(f"/api/video/jobs/{job['id']}/pause").json()["state"] == "paused"
+    time.sleep(0.6)                                           # the frame in hand is finished
+    at = c.get(f"/api/jobs/{again['job_id']}").json()["progress"]
+    time.sleep(1.0)
+    row = c.get(f"/api/jobs/{again['job_id']}").json()
+    assert row["progress"] == at and row["paused"] and row["quiet"] is None
+    c.delete(f"/api/video/jobs/{job['id']}")
+    halfway = work_job(c, "video", job["id"], lambda j: j["state"] not in ("running", "paused"))
+    assert halfway["state"] == "stopped" and len(halfway["made"]) == 2 and not halfway.get("result")
+    for _ in range(30):                                       # a stopped video leaves no half file
+        if not list((tmp / "data" / "video").glob("tea-continued-*.mp4")):
+            break
+        time.sleep(0.1)
+    assert not list((tmp / "data" / "video").glob("tea-continued-*.mp4"))
+    second = task_of(c, again["job_id"])
+    assert any(e["text"] == "Continuing: the pictures of 1 scene exist already and are kept" for e in second["trail"])
+    assert len([e for e in second["trail"] if e["text"].startswith("Saved 1 picture")]) == 1      # only the missing one
+    work = tmp / "data" / "work" / job["id"]
+    assert (work / "scene-1.json").exists() and (work / "scene-2.json").exists()
+    # continue again: nothing is drawn or spoken a second time, the video is put together
+    third = c.post(f"/api/video/jobs/{job['id']}/continue").json()
+    done = work_job(c, "video", job["id"], lambda j: j["state"] not in ("running", "paused"), timeout=120)
+    assert done["state"] == "done" and not done["can_continue"], done
+    p = done["result"]["params"]
+    assert len(p["pictures_made"]) == 2 and p["scenes"][0]["image"] == first_picture and p["voices"] and p["seconds"] > 40
+    last = task_of(c, third["job_id"])
+    texts = [e["text"] for e in last["trail"]]
+    assert "Narration 1 of 3: recorded before, used as it is" in texts and "Narration 2 of 3: recorded before, used as it is" in texts
+    assert not any(t.startswith("Started: ") for t in texts) and "Make the pictures" not in last["detail"]["stages"]
+    assert not work.exists()                                  # what was kept for continuing is cleared when it is done
+    assert not [m for m in c.get("/api/sound/library").json()["items"] if m["name"].startswith("scene-")]
+
+    # a clip made by a model on this computer: the engine is frozen and thawed; continuing makes the same clip
+    files = {}
+    for slot in ("diffusion_model", "vae", "t5xxl"):
+        files[slot] = str(tmp / f"wan2-{slot}.safetensors")
+        Path(files[slot]).write_bytes(b"\0" * 2048)
+    model = c.post("/api/video/models", json={"name": "Test Wan 2", "files": files,
+                                              "settings": {"steps": 6, "frames": 9, "width": 320, "height": 176}}).json()
+    clip = c.post("/api/video/jobs", json={"kind": "clip", "prompt": "a slow picture of a kite that moves"}).json()
+    seed = clip["request"]["seed"]
+    assert seed > 0
+    work_job(c, "video", clip["id"], lambda j: "step " in j["text"] and j["can_pause"])
+    assert c.post(f"/api/video/jobs/{clip['id']}/pause").json()["state"] == "paused"
+    at = c.get(f"/api/jobs/{clip['job_id']}").json()["progress"]
+    time.sleep(1.6)
+    assert c.get(f"/api/jobs/{clip['job_id']}").json()["progress"] == at
+    c.delete(f"/api/video/jobs/{clip['id']}")                 # stopped while paused: the frozen engine is ended
+    assert work_job(c, "video", clip["id"], lambda j: j["state"] not in ("running", "paused"))["state"] == "stopped"
+    made = work_job(c, "video", c.post(f"/api/video/jobs/{clip['id']}/continue").json()["id"],
+                    lambda j: j["state"] not in ("running", "paused"), timeout=90)
+    assert made["state"] == "done" and made["result"]["params"]["seed"] == seed, made
+    sent = json.loads(Path(files["diffusion_model"]).with_name("asked-video.json").read_text())
+    assert sent["seed"] == str(seed)
+    c.delete(f"/api/video/models/{model['id']}")
+
+
+def test_work_that_was_cut_off_comes_back_and_leaves_no_engine_behind(tmp_path):
+    """2.17.0. The requests of the Images and Video windows are kept in the database: one that was running when
+    the app went away comes back as cut off and can be continued, and an engine it left behind (frozen, if the
+    request was paused) is ended, so that it does not hold its memory for ever."""
+    import asyncio
+    import subprocess
+    import types
+    import psutil
+    from dva.db import DB
+    from dva.work import Control, Works, end_leftover, watch
+    db = DB(tmp_path / "t.db")
+    said = []
+    app = types.SimpleNamespace(db=db, log=said.append, paths=types.SimpleNamespace(data=tmp_path),
+                                bus=types.SimpleNamespace(publish=lambda *a, **k: None),
+                                jobs=types.SimpleNamespace(controls={}, listeners={}))
+    works = Works(app, "images", "image_job")
+    job = works.new("picture", "a kite", {"prompt": "a kite", "count": 2, "seed": 3}, images=[], count=2)
+    left = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        psutil.Process(left.pid).suspend()                     # the request was paused when the app went away
+        works.save(job, state="paused", images=[{"path": str(tmp_path / "one.png"), "name": "one.png"}],
+                   programs=[[left.pid, psutil.Process(left.pid).create_time()],
+                             [other.pid, psutil.Process(other.pid).create_time() - 500]])      # that number is another program now
+        works.folder(job["id"]).joinpath("kept.txt").write_text("x")
+        back = Works(app, "images", "image_job")               # the app starts again
+        again = back.get(job["id"])
+        assert again["state"] == "interrupted" and again["text"] == "The app was closed while this was running"
+        assert again["request"] == {"prompt": "a kite", "count": 2, "seed": 3} and again["images"][0]["name"] == "one.png"
+        assert back.view(again)["can_continue"] and not back.view(again)["can_pause"] and "programs" not in again
+        assert left.wait(timeout=10) != 0 and other.poll() is None           # only the program that was really its own
+        assert any("ended the engine it had left running" in line for line in said)
+        assert db.get("media_work", job["id"])["state"] == "interrupted"
+        assert end_leftover([[other.pid, 1.0], [99999999, 5.0], ["x", None]]) == 0 and other.poll() is None
+        with pytest.raises(ValueError):
+            back.pause(job["id"])
+        back.forget(job["id"])
+        assert not db.get("media_work", job["id"]) and not (tmp_path / "work" / job["id"]).exists()
+        with pytest.raises(KeyError):
+            back.get(job["id"])
+    finally:
+        for p in (left, other):
+            if p.poll() is None:
+                p.kill()
+
+    async def limits():
+        # time spent paused does not count against a time limit; a limit that is passed ends the program
+        ctl = Control()
+        proc = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(0.5); print('ok')",
+                                                    stdout=asyncio.subprocess.PIPE)
+        out = []
+
+        async def read():
+            out.append(await proc.stdout.read())
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.2, ctl.pause)
+        loop.call_later(3.2, ctl.resume)
+        began = time.monotonic()
+        code = await watch(proc, read(), 3.0, ctl)             # frozen for 3 s, with a limit of 3 s of work
+        assert code == 0 and out == [b"ok\n".replace(b"\n", os.linesep.encode())] and time.monotonic() - began > 3.1
+        assert 2.8 < ctl.paused_for() < 3.6 and not ctl.pids
+        slow = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(30)",
+                                                    stdout=asyncio.subprocess.PIPE)
+        with pytest.raises(asyncio.TimeoutError):
+            await watch(slow, slow.stdout.read(), 1.0, ctl)
+        assert await slow.wait() != 0
+        # the gate for work in a thread (the video encoder) opens on resume, or when the work is stopped
+        ctl.pause()
+        loop.call_later(0.4, ctl.resume)
+        t = time.monotonic()
+        await asyncio.to_thread(ctl.hold)
+        assert 0.3 < time.monotonic() - t < 1.5
+        ctl.pause()
+        t = time.monotonic()
+        await asyncio.to_thread(ctl.hold, lambda: time.monotonic() - t > 0.3)
+        assert time.monotonic() - t < 1.5
+    asyncio.run(limits())

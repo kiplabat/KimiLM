@@ -8,7 +8,12 @@ installs, and every task keeps a trail that can be read while it runs and afterw
   detail   its plan and what is known so far: the model, the settings, an episode's parts, the script written so
            far (`<data>/jobs/<id>.detail.json`);
   quiet    for a running task, the seconds since its last sign of life, so that "working on a long step" and
-           "stuck" can be told apart by looking."""
+           "stuck" can be told apart by looking.
+
+From 2.17.0 a task whose work is a picture, a clip or a video can be paused and continued (work.py): the
+programs it runs are frozen where they are, and time spent paused counts neither as silence nor against a time
+limit. A task that stays paused for longer than `pause_stop_minutes` is stopped, so that its memory is free
+again; what it had finished is kept, and the window it came from can continue it."""
 import asyncio
 import contextlib
 import json
@@ -16,6 +21,7 @@ import re
 import time
 
 from .db import new_id, now
+from .work import Control
 
 ACTIVE = ("queued", "running", "waiting")
 MEDIA = ("images", "sound", "video")          # tasks that are one piece of work, with stages of their own
@@ -104,6 +110,9 @@ class Jobs:
         self.fraction = {}   # id -> how far it is (0..1), when that is known
         self.pace = {}       # id -> seconds of silence that are normal right now (a slow program's step), if known
         self._last_step = {}
+        self.controls = {}   # id -> what Pause and Stop reach of a running task (media work only)
+        self._pause_end = {} # id -> the timer that turns a long pause into a stop
+        self.listeners = {}  # id -> called when the task can be paused, is paused or continued (a window's job)
         for row in self.db.all("SELECT id FROM jobs WHERE status IN ('queued','running','waiting')"):
             self.db.update("jobs", row["id"], {"status": "interrupted", "finished": now(),
                                                "error": "The app was closed while this was running"})
@@ -140,8 +149,15 @@ class Jobs:
             self.fraction.pop(job_id, None)
             self.pace.pop(job_id, None)
             self._last_step.pop(job_id, None)
+            ctl = self.controls.pop(job_id, None)
+            self.listeners.pop(job_id, None)
+            timer = self._pause_end.pop(job_id, None)
+            if timer:
+                timer.cancel()
+            if ctl and ctl.why and status == "cancelled":
+                error = ctl.why
         if error:
-            self.trail(job_id, error if status != "cancelled" else "Stopped", "error" if status == "failed" else "note", final=True)
+            self.trail(job_id, error, "error" if status == "failed" else "note", final=True)
         else:
             self.trail(job_id, "Finished", "note", final=True)
         self.db.update("jobs", job_id, {"status": status, "error": error, "finished": now(),
@@ -229,8 +245,9 @@ class Jobs:
             return {}
 
     def quiet(self, job_id):
-        """Seconds since a running task's last sign of life (None when it is not running)."""
-        if job_id not in self.tasks:
+        """Seconds since a running task's last sign of life (None when it is not running, or paused: a paused
+        task is silent because it was asked to be)."""
+        if job_id not in self.tasks or self.paused(job_id):
             return None
         return round(time.time() - self.seen[job_id]) if job_id in self.seen else None
 
@@ -329,6 +346,76 @@ class Jobs:
             return ""
         return "\n".join(path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:])
 
+    # ------------------------------------------------------------------ pause and continue (2.17.0)
+    def control(self, job_id):
+        """What Pause and Stop reach of this task. Only a task that is one piece of media work can be paused: a
+        picture drawn for a chat's reply belongs to the reply, which has limits of its own, so there the work
+        gets a control that nobody can pause."""
+        if not job_id or job_id not in self.tasks:
+            return Control()
+        if job_id not in self.controls:
+            if (self.db.get("jobs", job_id) or {}).get("kind") not in MEDIA:
+                return Control()
+            ctl = self.controls[job_id] = Control()
+            ctl.listen = lambda: (self.listeners.get(job_id) or (lambda: None))()
+            self._said(job_id)                       # the windows learn that it can be paused now
+            ctl.tell()
+        return self.controls[job_id]
+
+    def why(self, job_id):
+        """Why a task was stopped when it was not the user who stopped it (a pause that lasted too long)."""
+        ctl = self.controls.get(job_id)
+        return ctl.why if ctl else None
+
+    def paused(self, job_id):
+        ctl = self.controls.get(job_id)
+        return bool(ctl and ctl.paused)
+
+    def _said(self, job_id):
+        row = self.db.get("jobs", job_id) or {}
+        self.app.bus.publish("job", id=job_id, status=row.get("status"), title=row.get("title"), job_kind=row.get("kind"),
+                             chat_id=row.get("chat_id"), progress=self.live.get(job_id), paused=self.paused(job_id),
+                             can_pause=job_id in self.controls)
+
+    def pause(self, job_id):
+        """Freeze a running task where it is. False when this task cannot be paused."""
+        ctl = self.controls.get(job_id)
+        if not ctl or job_id not in self.tasks:
+            return False
+        if ctl.paused:
+            return True
+        ctl.pause()
+        minutes = float(self.db.setting("pause_stop_minutes", 20) or 0)
+        self.trail(job_id, "Paused" + (f": it stops by itself after {minutes:g} minutes, keeping what is finished, "
+                                       "so that its memory is free again" if minutes > 0 else ""), "note")
+        if minutes > 0:
+            def give_up():
+                if self.paused(job_id):
+                    ctl.why = (f"Stopped after being paused for {minutes:g} minutes, to free the memory it held. "
+                               "What was finished is kept: it can be continued.")
+                    self.cancel(job_id)
+            self._pause_end[job_id] = asyncio.get_running_loop().call_later(minutes * 60, give_up)
+        self.seen[job_id] = time.time()
+        self._said(job_id)
+        ctl.tell()
+        return True
+
+    def resume(self, job_id):
+        """Let a paused task go on from where it was."""
+        ctl = self.controls.get(job_id)
+        if not ctl or job_id not in self.tasks:
+            return False
+        if ctl.paused:
+            timer = self._pause_end.pop(job_id, None)
+            if timer:
+                timer.cancel()
+            ctl.resume()
+            self.seen[job_id] = time.time()
+            self.trail(job_id, "Continued", "note")
+            self._said(job_id)
+            ctl.tell()
+        return True
+
     def cancel(self, job_id):
         task = self.tasks.get(job_id)
         if task:
@@ -364,6 +451,8 @@ class Jobs:
             r["quiet"] = self.quiet(r["id"])
             r["fraction"] = self.fraction.get(r["id"])
             r["pace"] = self.pace.get(r["id"])
+            r["paused"] = self.paused(r["id"])
+            r["can_pause"] = r["id"] in self.controls
         return rows
 
     def get(self, job_id):
@@ -376,9 +465,13 @@ class Jobs:
             row["quiet"] = self.quiet(job_id)
             row["fraction"] = self.fraction.get(job_id)
             row["pace"] = self.pace.get(job_id)
+            row["paused"] = self.paused(job_id)
+            row["can_pause"] = job_id in self.controls
         return row
 
     async def shutdown(self):
+        for ctl in self.controls.values():           # a picture or a video that was being made says why it ended
+            ctl.why = ctl.why or "The app was closed while this was running. What was finished is kept: it can be continued."
         for task in list(self.tasks.values()):
             task.cancel()
         if self.tasks:

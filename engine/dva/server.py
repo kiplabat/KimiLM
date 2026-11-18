@@ -21,6 +21,23 @@ from .runtime import RuntimeError_
 TOKEN = os.environ.get("DVA_TOKEN", "")
 
 
+def media_job_action(window, job_id, action):
+    """Pause, resume, continue or forget a request of the Images or the Video window."""
+    try:
+        if action == "pause":
+            return window.work.pause(job_id)
+        if action == "resume":
+            return window.work.resume(job_id)
+        if action == "continue":
+            return window.continue_job(job_id)
+        if action == "forget":
+            window.work.forget(job_id)
+            return {"ok": True}
+    except KeyError:
+        raise KeyError(f"There is no such request any more: {job_id}") from None
+    raise ValueError("action must be pause, resume, continue or forget")
+
+
 def create_app(data_dir=None, resources_dir=None, token=None):
     token = token or TOKEN
     state = {}
@@ -308,6 +325,8 @@ def create_app(data_dir=None, resources_dir=None, token=None):
             a.db.set_setting("image_compute", data["image_compute"])
         if "image_timeout_minutes" in data:
             a.db.set_setting("image_timeout_minutes", max(1, min(720, int(data["image_timeout_minutes"] or 60))))
+        if "pause_stop_minutes" in data:          # 0: a paused picture or video waits until it is continued
+            a.db.set_setting("pause_stop_minutes", max(0, min(1440, int(data["pause_stop_minutes"] or 0))))
         a.bus.publish("images_changed")
         return await asyncio.to_thread(a.images.status)
 
@@ -382,6 +401,12 @@ def create_app(data_dir=None, resources_dir=None, token=None):
     async def images_job_stop(job_id: str):
         A().images.stop_job(job_id)
         return {"ok": True}
+
+    # pause, continue and forget a request of the Images window (2.17.0). `continue` goes on with a request that
+    # was stopped, cut off or failed: the pictures it made are kept, the others are made
+    @api.post("/api/images/jobs/{job_id}/{action}")
+    async def images_job_action(job_id: str, action: str):
+        return media_job_action(A().images, job_id, action)
 
     @api.post("/api/images/upload")
     async def images_upload(file: UploadFile = File(...)):
@@ -579,6 +604,10 @@ def create_app(data_dir=None, resources_dir=None, token=None):
     async def video_job_stop(job_id: str):
         A().video.stop_job(job_id)
         return {"ok": True}
+
+    @api.post("/api/video/jobs/{job_id}/{action}")
+    async def video_job_action(job_id: str, action: str):
+        return media_job_action(A().video, job_id, action)
 
     @api.post("/api/video/recipes/{key}/download")
     async def video_download(key: str):
@@ -1579,6 +1608,15 @@ def create_app(data_dir=None, resources_dir=None, token=None):
     @api.post("/api/jobs/{job_id}/cancel")
     async def job_cancel(job_id: str):
         return {"cancelled": A().jobs.cancel(job_id)}
+
+    # a task that is one piece of media work on this computer can be paused where it is and continued (2.17.0)
+    @api.post("/api/jobs/{job_id}/pause")
+    async def job_pause(job_id: str):
+        return {"paused": A().jobs.pause(job_id)}
+
+    @api.post("/api/jobs/{job_id}/resume")
+    async def job_resume(job_id: str):
+        return {"resumed": A().jobs.resume(job_id)}
 
     # ------------------------------------------------------------------ the window's files
     ui_dir = os.environ.get("DVA_UI_DIR")

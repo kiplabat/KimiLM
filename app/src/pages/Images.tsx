@@ -1,12 +1,12 @@
 // Images (2.11.0): make and change pictures, look through the ones made, and choose what makes them:
 // a model on this computer (stable-diffusion.cpp), or an online one (OpenAI, Google).
 import React, { useEffect, useRef, useState } from "react";
-import { Cloud, Cpu, Download, ExternalLink, Image as ImageIcon, Plus, Square, Star, Trash2, Upload, Wand2, X } from "lucide-react";
+import { Cloud, Cpu, Download, ExternalLink, Image as ImageIcon, Plus, Star, Trash2, Upload, Wand2, X } from "lucide-react";
 import { api, desktop, fileUrl, fmtBytes, fmtTime } from "../api";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, ConfirmButton, Empty, Field, Modal, PageHeader, Progress, Spinner, Tabs } from "../components/ui";
 import { EDIT_KEY, PictureGrid } from "../components/Pictures";
-import { WorkLine } from "../components/Work";
+import { WorkButtons, WorkLine, WorkNote } from "../components/Work";
 
 const SHAPES: Record<string, [string, number]> = {
   square: ["Square", 1], landscape: ["Landscape (3:2)", 1.5], portrait: ["Portrait (2:3)", 2 / 3],
@@ -142,12 +142,12 @@ function Create({ state, toModels }: any) {
           <div key={j.id} className="card stack-s">
             <div className="row between gap-s">
               <div className="ellipsis" title={j.prompt}><b>{j.prompt}</b></div>
-              {j.state === "running" ? <Button small icon={<Square size={12} />} onClick={() => api.del(`/images/jobs/${j.id}`)}>Stop</Button>
-                : j.state === "done" ? <Badge kind="ok">done</Badge> : <Badge kind={j.state === "failed" ? "bad" : "neutral"}>{j.state}</Badge>}
+              <WorkButtons base="/images" job={j} onForget={() => setJobs((l) => l.filter((x) => x.id !== j.id))} />
             </div>
-            {j.state === "running" && <div className="note"><Spinner size={14} /> {j.text}</div>}
+            <WorkNote job={j} pauseStop={state.pause_stop_minutes} />
             {j.error && <div className="small bad">{j.error}</div>}
-            <WorkLine jobId={j.job_id} running={j.state === "running"} />
+            {j.count > 1 && !["done", "stopped"].includes(j.state) && j.images?.length > 0 && <div className="small muted">{j.images.length} of {j.count} pictures are finished and kept.</div>}
+            <WorkLine jobId={j.job_id} running={j.state === "running" || j.state === "paused"} paused={j.state === "paused"} />
             <PictureGrid large items={j.images} onChange={(p: any) => setSource({ path: p.path, name: p.name })} />
           </div>
         ))}
@@ -332,8 +332,11 @@ function ModelsTab({ state, reload }: any) {
               {eng.installed.filter((b: string) => !["cpu", "custom"].includes(b)).map((b: string) => <option key={b} value={b}>{ENGINE_NAMES[b]}</option>)}
             </select>
           </Field>
-          <Field label="Stop a picture after (minutes)" inline>
+          <Field label="Stop a picture after (minutes of work)" inline>
             <input className="input narrow" type="number" min={1} max={720} defaultValue={state.timeout_minutes} onBlur={(e) => api.put("/images/settings", { image_timeout_minutes: Number(e.target.value) })} />
+          </Field>
+          <Field label="Stop a paused picture or video after (minutes, 0: never)" inline>
+            <input className="input narrow" type="number" min={0} max={1440} defaultValue={state.pause_stop_minutes} onBlur={(e) => api.put("/images/settings", { pause_stop_minutes: Number(e.target.value) }).then(reload)} />
           </Field>
         </div>
       </div>
