@@ -75,10 +75,7 @@ async def _make(ctx, prompt, image=None, mask=None, model=None, shape=None, widt
     if not source or shape or (width and height):               # a change keeps the picture's own shape
         width, height = size_for(row, shape, width, height)
 
-    def status(text):
-        ctx.emit("status", text=text)
-        if ctx.job_id:
-            ctx.app.jobs.progress(ctx.job_id, text)
+    status = ctx.reporter()
     try:
         records = await ctx.app.images.generate(
             prompt, model=row["id"], out_dir=ctx.primary / "images", negative=negative_prompt or "", width=width,

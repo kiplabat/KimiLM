@@ -81,11 +81,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (e.kind === "runtime" && e.action === "install_failed") toast(`Runtime install failed: ${e.error}`, "error");
     if (e.kind === "image_engine" && e.action === "installed") toast("The image engine is installed", "ok");
     if (e.kind === "image_engine" && e.action === "install_failed") toast(`The image engine could not be installed: ${e.error}`, "error");
-    if (e.kind === "image_download" && e.state === "done") toast(`Downloaded ${e.name}: it can make pictures now`, "ok");
+    if (e.kind === "image_download" && e.state === "done") toast(`Downloaded ${e.name}: it can make ${/video/i.test(e.name) ? "clips" : "pictures"} now`, "ok");
     if (e.kind === "image_download" && e.state === "failed") toast(`${e.name} could not be downloaded: ${e.error}`, "error");
     if (e.kind === "sound_download" && e.state === "done") toast(`Downloaded ${e.name}`, "ok");
     if (e.kind === "music_engine" && e.action === "installed") toast("The music engine is installed", "ok");
     if (e.kind === "sound_job" && e.state === "done" && e.result?.params?.mode === "podcast") toast(`Your podcast “${e.result.params.title}” is ready`, "ok");
+    if (e.kind === "video_job" && e.state === "done" && e.result?.path) toast(`Your video “${e.result.params?.title || e.result.name}” is ready`, "ok");
+    if (e.kind === "video_job" && e.state === "failed" && e.what !== "storyboard") toast(`The video could not be made: ${e.error}`, "error");
     if (e.kind === "sound_download" && e.state === "failed") toast(`${e.name} could not be downloaded: ${e.error}`, "error");
   });
 

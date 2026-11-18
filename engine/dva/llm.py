@@ -290,7 +290,7 @@ class LLM:
 
     # ------------------------------------------------------------------ calls
     async def complete(self, messages, *, schema=None, tools=None, max_tokens=1024, temperature=0.2,
-                       thinking=False, timeout=900, server=None, on_status=None):
+                       thinking=False, timeout=900, server=None, on_status=None, on_token=None):
         """One call, returned whole. With a schema, returns the parsed object in result['json'] (or raises).
         Local models are streamed underneath, so the watchdog sees a stuck model (timeout applies to online
         models, which have their own adapters)."""
@@ -305,6 +305,8 @@ class LLM:
         async for kind, value in self._events(picked, body):
             if kind == "end":
                 end = value
+            elif on_token:                     # a local model writing: the caller can show that it is alive
+                on_token(kind, value)
         out = {"content": end.get("content") or "", "reasoning": end.get("reasoning") or "",
                "tool_calls": [{"id": c["id"], "type": "function",
                                "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}}
@@ -321,12 +323,12 @@ class LLM:
             out["json"] = value
         return out
 
-    async def json(self, messages, schema, *, max_tokens=512, retries=1, temperature=0.1, server=None):
+    async def json(self, messages, schema, *, max_tokens=512, retries=1, temperature=0.1, server=None, on_token=None):
         last = None
         for _ in range(retries + 1):
             try:
                 return (await self.complete(messages, schema=schema, max_tokens=max_tokens,
-                                            temperature=temperature, server=server))["json"]
+                                            temperature=temperature, server=server, on_token=on_token))["json"]
             except LLMError as exc:
                 if is_recoverable(exc) or isinstance(exc, LLMContextFull):
                     raise                     # asking again does not help: the caller restarts or shrinks

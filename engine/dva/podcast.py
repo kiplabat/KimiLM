@@ -161,7 +161,7 @@ async def make(app, *, sources=(), text="", minutes=5, style="conversation", hos
                model=None, music=False, out_dir, chat_id=None, job_id=None, on_status=None):
     """Returns the recording's record (see Sound._record), with params: title, summary, script (path), lines."""
     from .knowledge import extract_text
-    status = on_status or (lambda t: None)
+    status, track = app.jobs.reporter(on_status, job_id)
     sound = app.sound
     if not sound.can()["tts"]:
         raise SoundError("No voice is set up yet. Open Sound → Voices & models and download Kokoro (or press "
@@ -171,7 +171,10 @@ async def make(app, *, sources=(), text="", minutes=5, style="conversation", hos
     a, b = (list(hosts or []) + ["Alex", "Sam"])[:2] if len(hosts or []) < 2 else list(hosts)[:2]
     if style == "narration":
         b = a
+    track.stages(["Read the document", "Take notes", "Plan the episode", "Write the script", "Record the voices"]
+                 + (["Opening music"] if music else []))
     # 1. read
+    track.at("Read the document")
     status("Reading the document…")
     docs, names = [], []
     for path in sources:
@@ -194,31 +197,49 @@ async def make(app, *, sources=(), text="", minutes=5, style="conversation", hos
     if not model_id:
         raise SoundError("No text model is installed to write the script. Download one in Models first.")
     started = time.monotonic()
+    writer = app.models.get_any(model_id)
+    track.plan(podcast={"documents": names, "characters": len(full), "pieces": len(chunks), "minutes": minutes,
+                        "style": style, "hosts": [a] if style == "narration" else [a, b], "focus": focus or None,
+                        "writer": (writer or {}).get("name") or model_id})
+    track.note(f"Read {len(full):,} characters from {', '.join(names)}; cut into {len(chunks)} piece{'s' if len(chunks) != 1 else ''} "
+               "to look things up in while writing.")
+    status(f"Starting the text model ({(writer or {}).get('name') or model_id})…")
     system = {"role": "system", "content": "You make podcasts from documents. You are accurate: every fact you use is in "
                                            "the material you are given. You write for the ear, in plain spoken English."}
     async with app.runtime.lease(model_id, as_loaded=True) as server:
-        async def ask(prompt, schema, max_tokens, temperature=0.4):
+        async def ask(prompt, schema, max_tokens, temperature=0.4, doing=""):
+            written = [0, 0.0]
+
+            def token(kind, value):               # the model is writing: a sign of life, with how far it is
+                written[0] += len(str(value))
+                if doing and time.monotonic() - written[1] > 1.0:
+                    written[1] = time.monotonic()
+                    status.beat(f"{doing} · about {written[0] // 6} words {'thought' if kind == 'reasoning' else 'written'} so far")
             return await app.llm.json([system, {"role": "user", "content": prompt}], schema, max_tokens=max_tokens,
-                                      temperature=temperature, server=server)
+                                      temperature=temperature, server=server, on_token=token)
         # 2. notes
         if len(full) <= 12000:
             notes = full
+            track.note("The document is short enough to be planned from whole: no notes step.")
         else:
+            track.at("Take notes")
             use = chunks if len(chunks) <= 24 else [chunks[round(i * (len(chunks) - 1) / 23)] for i in range(24)]
             found = []
             for i, c in enumerate(use):
-                status(f"Reading part {i + 1} of {len(use)}…")
+                status(f"Taking notes: piece {i + 1} of {len(use)}…")
                 got = await ask("Write down what matters in this part of a document: facts, numbers, names, findings and "
                                 "claims, each as one full sentence that can be understood on its own. At most six."
                                 + (f" The listener cares most about: {focus}." if focus else "")
                                 + "\n\nPART:\n" + c["text"] + "\n\nJSON only.",
                                 {"type": "object", "properties": {"points": {"type": "array", "maxItems": 6,
                                                                              "items": {"type": "string"}}},
-                                 "required": ["points"]}, 500, 0.2)
+                                 "required": ["points"]}, 500, 0.2, doing=f"Taking notes: piece {i + 1} of {len(use)}")
                 found += [str(p).strip() for p in got.get("points") or [] if str(p).strip()]
+                track.plan(notes=found[-60:])
             notes = "\n".join(f"- {p}" for p in found)[:14000]
         # 3. outline
         count = max(2, min(8, round(minutes / 1.5)))
+        track.at("Plan the episode")
         status("Planning the episode…")
         outline = await ask(
             f"Plan a podcast episode of about {minutes:g} minutes about the document below, as {count} segments that "
@@ -232,10 +253,15 @@ async def make(app, *, sources=(), text="", minutes=5, style="conversation", hos
                 "segments": {"type": "array", "minItems": 1, "maxItems": 8, "items": {
                     "type": "object", "required": ["title", "points"], "properties": {
                         "title": {"type": "string"}, "points": {"type": "array", "items": {"type": "string"}}}}}}},
-            900, 0.3)
+            900, 0.3, doing="Planning the episode")
         segments = [s for s in outline.get("segments") or [] if s.get("title")][:8] or [{"title": "The document", "points": []}]
         title = str(outline.get("title") or Path(names[0]).stem)[:120]
         summary = str(outline.get("summary") or "")[:400]
+        track.plan(episode={"title": title, "summary": summary,
+                            "parts": [{"title": str(s["title"])[:160], "points": [str(p)[:300] for p in (s.get("points") or [])[:6]]}
+                                      for s in segments]})
+        track.note(f"Planned “{title}” in {len(segments)} part{'s' if len(segments) != 1 else ''}.")
+        track.at("Write the script")
         # 4. script
         budget = max(60, int(minutes * WORDS_A_MINUTE / len(segments)))
         people = STYLES[style].format(a=a, b=b)
@@ -264,7 +290,7 @@ async def make(app, *, sources=(), text="", minutes=5, style="conversation", hos
                 {"type": "object", "required": ["lines"], "properties": {"lines": {"type": "array", "minItems": 1, "items": {
                     "type": "object", "required": ["speaker", "text"], "properties": {
                         "speaker": {"type": "string", "enum": speakers}, "text": {"type": "string"}}}}}},
-                int(budget * 2.2) + 250, 0.6)
+                int(budget * 2.2) + 250, 0.6, doing=f"Writing part {i + 1} of {len(segments)}")
             first = True
             for ln in got.get("lines") or []:
                 said = parts_of(ln.get("text"))
@@ -272,6 +298,8 @@ async def make(app, *, sources=(), text="", minutes=5, style="conversation", hos
                     lines.append({"speaker": ln.get("speaker") if ln.get("speaker") in speakers else "A", "parts": said,
                                   "text": "… ".join(said), "new_part": first})
                     first = False
+            track.plan(script=[{"speaker": names_of(ln["speaker"], a, b), "text": ln["text"][:600]} for ln in lines][-200:],
+                       written={"parts": i + 1, "of": len(segments), "words": sum(len(ln["text"].split()) for ln in lines)})
     if not lines:
         raise SoundError("The model wrote no script. Try again, or use a larger text model.")
     # 5. record
@@ -282,17 +310,20 @@ async def make(app, *, sources=(), text="", minutes=5, style="conversation", hos
     spoken = timed(lines, names_map)
     cast = {names_map[k]: v for k, v in (voices or {}).items() if k in names_map} | {k: v for k, v in (voices or {}).items() if k in (a, b)}
     out_dir = Path(out_dir)
+    track.at("Record the voices")
+    track.note(f"The script is written: {len(lines)} turns, {sum(len(ln['text'].split()) for ln in lines)} words. Recording it now.")
     record = await sound.speak(spoken, out_dir=out_dir, voices=cast or None, name=title, chat_id=chat_id, job_id=job_id,
-                               on_status=status)
+                               on_status=on_status)
     if music and sound.can()["music"]:
         try:
+            track.at("Opening music")
             status("Making the opening music…")
             tune = await sound.music(f"Short podcast opening theme for an episode called “{title}”: warm, modern, "
                                      "light percussion, positive", out_dir=out_dir, seconds=14, instrumental=True,
-                                     chat_id=chat_id, job_id=job_id, on_status=status)
+                                     chat_id=chat_id, job_id=job_id, on_status=on_status)
             mixed = await sound.mix([{"path": record["path"], "start": 6.0},
                                      {"path": tune["path"], "volume": 0.55, "fade_in": 0.5, "fade_out": 6.0}],
-                                    out_dir=out_dir, name=title, length="longest", fade=0, chat_id=chat_id)
+                                    out_dir=out_dir, name=title, length="longest", fade=0, chat_id=chat_id, job_id=job_id)
             for old in (record, tune):
                 sound.forget(old["id"], delete_file=True)
             mixed["params"].update(voices=record["params"]["voices"])

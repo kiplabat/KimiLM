@@ -27,13 +27,14 @@ from .secrets import Secrets
 from .services import Services
 from .skills import Skills
 from .sound import Sound
+from .video import Video
 
 STATE = None
 
 DEFAULT_SETTINGS = {
     "default_harness": "agent", "default_compute": "auto", "default_ctx": 8192, "max_reply_tokens": 2048,
     "unload_after_minutes": 20, "memory_enabled": True, "learn_enabled": True, "learn_delay_seconds": 45,
-    "allow_python": True, "approval_timeout_minutes": 360, "max_native_tools": 44, "python_timeout_seconds": 180,
+    "allow_python": True, "approval_timeout_minutes": 360, "max_native_tools": 47, "python_timeout_seconds": 180,
     "max_loaded_models": 3, "browser_search": True, "max_parallel_agents": 4, "turn_time_limit_minutes": 30,
     "cloud_privacy": "ask", "cloud_budget_monthly": 10.0, "cloud_max_parallel": 4,
     "team_mode": "auto", "max_team_tasks": 8, "team_time_limit_minutes": 120,
@@ -60,6 +61,11 @@ DEFAULT_SETTINGS = {
     "image_compute": "auto", "image_timeout_minutes": 60,
     # 2.13.0: music on this computer. music_engine_dir: a folder with ace-lm and ace-synth, if the user has one
     "music_engine_dir": "", "music_timeout_minutes": 90,
+    # 2.14.0: video. video_online: Google's video model may be used (it costs money); video_clip_cost: what a clip
+    # is counted as against the online budget (KimiLM does not know the provider's price); video_timeout_minutes:
+    # a clip made by a model on this computer is stopped after this long
+    "video_online": False, "video_online_model": "gemini-omni-1.1-flash", "video_clip_cost": 1.0,
+    "video_timeout_minutes": 240,
 }
 CHAT_LIMIT_KEYS = ("max_reply_tokens", "max_steps", "time_limit_minutes", "temperature", "max_searches",
                    "max_tool_calls")
@@ -94,10 +100,12 @@ class App:
         self.embedder = Embedder(self)
         self.knowledge = Knowledge(self)
         self.jobs = Jobs(self)
+        self.models.jobs = self.jobs          # downloads are tasks too
         self.scheduler = Scheduler(self)
         self.services = Services(self)
         self.images = Images(self)
         self.sound = Sound(self)
+        self.video = Video(self)
         self.approvals = {}
         self.pauses = {}          # chat id -> {"event", "reason"}: paused agent loops (orchestrator.pause_chat)
         self.orchestras = {}      # chat id -> running Orchestra (a team led from that chat)
@@ -123,6 +131,10 @@ class App:
         if self.db.setting("max_native_tools") == 38 and not self.db.setting("native_tools_2_12"):
             self.db.set_setting("max_native_tools", 44)
         self.db.set_setting("native_tools_2_12", True)
+        # 2.14.0 adds up to three video tools (two always, the clip tool once a video model is set up).
+        if self.db.setting("max_native_tools") == 44 and not self.db.setting("native_tools_2_14"):
+            self.db.set_setting("max_native_tools", 47)
+        self.db.set_setting("native_tools_2_14", True)
 
     def _release_pending_after_restart(self):
         """Follow-ups queued while a reply was running are not sent if the app closed meanwhile: they show as

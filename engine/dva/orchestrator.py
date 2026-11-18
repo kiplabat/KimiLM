@@ -217,6 +217,8 @@ KIT_WORDS = {
               r"photo of|retouch|inpaint|change the background",
     "sound": r"audio|sound|voice|speak|speech|narrat|podcast|music|song|jingle|transcri|recording|subtitle|read aloud|"
              r"dictat|\bmp3\b|\bwav\b",
+    "video": r"video|clip\b|footage|film|movie|animation|animate|slideshow|explainer|reel\b|trailer|\bmp4\b|subtitle|"
+             r"screen recording",
 }
 
 

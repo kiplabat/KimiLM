@@ -359,6 +359,7 @@ class Turn:
     def status(self, text):
         self.emit("status", text=text)
         self.app.jobs.progress(self.job["id"], text)
+        self.app.jobs.trail(self.job["id"], text)          # the task's trail: what it did, with times (Activity)
 
     def note(self, text):
         self.steps.append({"type": "note", "text": text})
@@ -428,6 +429,7 @@ class Turn:
             groups.discard("images")
         if not self.app.sound.available():
             groups.discard("sound")
+        # the video tools are always there: a video from pictures, narration and music needs no video model
         if self.chat.get("parent_chat_id"):   # agents in a team do not start their own teams
             groups.discard("agents")
         return groups
@@ -440,6 +442,8 @@ class Turn:
         if "sound" in groups:                      # only the sound tools that have a model to work with
             hidden = self.app.sound.hidden_tools()
             tools = [t for t in tools if t.name not in hidden]
+        if "video" in groups and not self.app.video.can()["clip"]:      # no video model: no clip tool
+            tools = [t for t in tools if t.name != "generate_video_clip"]
         if "agents" in groups:
             tools.append(self._delegate_tool())
         team = self.app.team_of_chat.get(self.chat["id"])
@@ -1110,7 +1114,12 @@ class Turn:
         step = {"type": "tool", "id": call["id"], "name": call["name"], "arguments": call["arguments"],
                 "label": tool.label if tool else call["name"]}
         self.steps.append(step)
-        self.emit("tool_call", call={**step, "description": tool.describe_call(call["arguments"]) if tool else ""})
+        described = tool.describe_call(call["arguments"]) if tool else ""
+        self.emit("tool_call", call={**step, "description": described})
+        self.app.jobs.trail(self.job["id"], f"{step['label']}: {described}" if described else step["label"], "step",
+                            tool=call["name"])
+        self.ctx.notes["call_id"] = call["id"]            # what the tool reports is shown inside this step
+        self.ctx.notes.pop("log", None)
         blocked = self.guard.check(call["name"], call["arguments"]) if tool else None
         if blocked:
             result, ok = blocked, False
@@ -1133,7 +1142,9 @@ class Turn:
                 # (it is unloaded only if the image model does not fit beside it) and taken again afterwards
                 lend = not is_cloud(self.model_id) and (
                     (tool.group == "images" and self.app.images.local_default())
-                    or (tool.name == "generate_music" and self.app.sound.local_music()))
+                    or (tool.name == "generate_music" and self.app.sound.local_music())
+                    or (tool.name == "make_video" and self.app.images.local_default())
+                    or (tool.name == "generate_video_clip" and self.app.video.can()["clip_local"]))
                 if lend:
                     await self.drop_model()
                 try:
@@ -1159,11 +1170,17 @@ class Turn:
             except Exception as exc:
                 result, ok = f"Error: {type(exc).__name__}: {str(exc)[:400]}", False
         result = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+        log = self.ctx.notes.pop("log", None)
+        if log:                                           # what the tool said it was doing, kept with the step
+            step["trail"] = log
+        self.ctx.notes.pop("call_id", None)
+        self.app.jobs.trail(self.job["id"], ("Done: " if ok else "Did not work: ") + step["label"]
+                            + ("" if ok else " (" + result.splitlines()[0][:200] + ")" if result else ""), "note", ok=ok)
         self.guard.record(call["name"], call["arguments"], ok, result, blocked=bool(blocked),
                           changed=bool(ok and tool and (tool.changes or call["name"] == "use_connector_tool")))
         step.update(ok=ok, result=result[:4000])
         self.emit("tool_result", call_id=call["id"], ok=ok, result=result[:4000], declined=step.get("declined", False),
-                  blocked=bool(blocked), media=step.get("media"))
+                  blocked=bool(blocked), media=step.get("media"), trail=step.get("trail"))
         limit = self.result_limit()
         if len(result) > limit:
             result = result[:limit] + f"\n…(trimmed; {len(result) - limit:,} more characters)"

@@ -1879,7 +1879,7 @@ def test_connectors_are_taken_over_tested_and_used(engine):
     row = next(x for x in c.get("/api/connectors").json()["connectors"] if x["id"] == cid)
     assert row["env"] == {"API_KEY": "", "REGION": ""}
     assert c.delete(f"/api/connectors/{cid}/delete").json()["ok"]
-    c.put("/api/settings", json={"max_native_tools": 36})
+    c.put("/api/settings", json={"max_native_tools": 47})
 
 
 def test_remote_connectors_send_headers_speak_both_transports_and_sign_in(tmp_path, monkeypatch):
@@ -2790,3 +2790,327 @@ def test_words_the_dictionary_lacks_are_still_pronounced():
     assert said("KimiLM") == "k ˈ i m i ˈ ɛ l ˈ ɛ m" and said("amapiano") == "ˈ ɑ m ɑ p i ɑ n O"             # names: plain vowels
     assert said("make") == "m ˈ A k" and pronounce("§", lex, tokens) is None
     assert s_ending("k æ t") == "k æ t s" and s_ending("d ɔ ɡ") == "d ɔ ɡ z" and ed_ending("w ɑ n t") == "w ɑ n t ᵻ d"
+
+
+# ---------------------------------------------------------------------- 2.14.0: what is happening, and video
+def task_of(c, job_id, timeout=60):
+    """A task once it has ended, with its trail and its plan."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        task = c.get(f"/api/jobs/{job_id}").json()
+        if task["status"] not in ("queued", "running", "waiting"):
+            return task
+        time.sleep(0.1)
+    raise AssertionError(f"task still running: {task}")
+
+
+def wait_video(c, job, timeout=120):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        state = next(j for j in c.get("/api/video").json()["jobs"] if j["id"] == job["id"])
+        if state["state"] != "running":
+            return state
+        time.sleep(0.1)
+    raise AssertionError(f"video job still running: {state}")
+
+
+def ready_for_media(c, tmp):
+    """A voice, a transcription model and an image model, whatever the tests before left."""
+    if not c.get("/api/sound").json()["can"]["tts"]:
+        c.post("/api/sound/models", json={"key": "kokoro-v1", "path": model_folder(tmp, "kokoro-v")})
+    if not c.get("/api/sound").json()["can"]["stt"]:
+        c.post("/api/sound/models", json={"key": "whisper-base", "path": model_folder(tmp, "whisper-v")})
+    if not c.get("/api/images").json()["default"]:
+        weights = tmp / "checkpoints-v" / "small-sd.safetensors"
+        weights.parent.mkdir(exist_ok=True)
+        weights.write_bytes(b"\0" * 4096)
+        c.post("/api/images/models", json={"name": "Small SD", "files": {"model": str(weights)}, "settings": {"steps": 6}})
+    assert c.get("/api/sound").json()["can"]["tts"] and c.get("/api/images").json()["default"]
+
+
+def test_every_piece_of_work_is_a_task_with_a_plan_and_a_trail(engine):
+    """2.14.0: nobody could tell what a picture or a recording was doing, or whether it was stuck. Everything that
+    works in the background is a task now: listed in Activity, with its plan, each step with its time, what the
+    program printed, and the seconds since its last sign of life."""
+    c, tmp = engine["client"], engine["tmp"]
+    ready_for_media(c, tmp)
+    # a recording made in the Sound window
+    job = c.post("/api/sound/jobs", json={"kind": "speak", "text": "Host: Hello and welcome.\nGuest: Thank you for having me."}).json()
+    assert job["job_id"].startswith("job_")
+    assert wait_sound(c, job)["state"] == "done"
+    task = task_of(c, job["job_id"])
+    assert task["kind"] == "sound" and task["status"] == "done" and task["title"].startswith("Speak: ") and task["quiet"] is None
+    steps = [e for e in task["trail"] if e["kind"] == "step"]
+    assert len(steps) >= 2 and all(e["t"] and e["text"] for e in steps) and task["trail"][-1]["text"] == "Finished"
+    assert len({e["text"] for e in steps}) == len(steps)                   # a step said twice is one line
+    plan = task["detail"]
+    assert plan["stages"] == ["Prepare the voices", "Speak", "Join and save"] and plan["stage"] == 2
+    assert plan["speech"]["lines"] == 2 and plan["speech"]["where"] == "on this computer" and plan["speech"]["words"] == 8
+    assert task["result"]["media"][0]["path"].endswith(".mp3") and Path(task["result"]["media"][0]["path"]).exists()
+    # a failure is in the trail too, in words
+    bad = c.post("/api/sound/jobs", json={"kind": "transcribe", "audio": str(tmp / "no-such.wav")}).json()
+    failed = task_of(c, bad["job_id"])
+    assert failed["status"] == "failed" and "There is no file" in failed["error"]
+    assert failed["trail"][-1]["kind"] == "error" and "There is no file" in failed["trail"][-1]["text"]
+
+    # a picture: while it works the list says where it is and how long it has been quiet; the program's own lines are kept
+    slow = c.post("/api/images/generate", json={"prompt": "a slow picture of a boat", "steps": 8, "seed": 3}).json()
+    seen = None
+    for _ in range(100):
+        rows = c.get("/api/jobs", params={"status": "active", "kinds": "images"}).json()["jobs"]
+        seen = next((r for r in rows if r["id"] == slow["job_id"] and r.get("fraction")), None)
+        if seen:
+            break
+        time.sleep(0.1)
+    assert seen and seen["status"] == "running" and 0 < seen["fraction"] <= 1 and " of 8" in seen["progress"]
+    assert isinstance(seen["quiet"], int) and seen["quiet"] < 5
+    live = c.get(f"/api/jobs/{slow['job_id']}").json()
+    assert live["detail"]["stages"] == ["Get ready", "Load the model", "Draw", "Save"] and live["detail"]["stage"] == 2
+    assert live["detail"]["picture"]["prompt"] == "a slow picture of a boat" and live["detail"]["picture_run"]["steps"] == 8
+    assert live["detail"]["picture_run"]["seed"] == 3 and "stable-diffusion.cpp" in live["detail"]["picture_run"]["engine"]
+    assert any(e["kind"] == "output" and "stand-in" in e["text"] for e in live["trail"])
+    assert any(e["kind"] == "note" and e["text"].startswith("Started: ") and "--steps 8" in e["text"] for e in live["trail"])
+    drawn = [e["text"] for e in live["trail"] if e["kind"] == "step"]          # a counter that moves is not a line each time
+    assert drawn[-1].endswith("drawing, 8 steps") and not any("step 2 of 8" in t for t in drawn)
+    assert any(e["kind"] == "output" and "/8 " in e["text"] for e in live["trail"])       # the program's own lines have every step
+    assert c.post(f"/api/jobs/{slow['job_id']}/cancel").json()["cancelled"]          # stopped from Activity
+    assert wait_picture(c, slow["id"])["state"] == "stopped"
+    assert task_of(c, slow["job_id"])["status"] == "cancelled"
+    listed = c.get("/api/jobs", params={"kinds": "sound,images"}).json()["jobs"]
+    assert {r["kind"] for r in listed} == {"sound", "images"} and c.get("/api/busy").json()["active"] == 0
+
+    # in a chat the tool's own steps are shown inside its step and kept with it; the chat's task has them in its trail
+    chat = c.post("/api/chats", json={"harness": "agent"}).json()
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "paint a picture of a red kite"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
+    said = [t["text"] for t in step["trail"]]
+    assert step["ok"] and any(t.startswith("Loading ") for t in said) and said[-1].endswith("drawing, 6 steps")
+    trail = c.get(f"/api/jobs/{job['job_id']}").json()["trail"]
+    texts = [e["text"] for e in trail]
+    assert any(t.startswith("Make picture") or "red kite" in t for t in texts) and any(t.startswith("Done: ") for t in texts)
+    assert any(e["kind"] == "output" for e in trail)
+    # a chat does many things in turn: one tool's stages are not the chat's plan (what the tool made is noted)
+    chat_plan = c.get(f"/api/jobs/{job['job_id']}").json()["detail"]
+    assert "stages" not in chat_plan and chat_plan["picture"]["prompt"] == "a red kite"
+
+
+def test_a_followed_download_is_a_task_that_can_be_stopped(tmp_path):
+    """Downloads and installs keep a state of their own; as tasks they are followed: a new file is a step, bytes
+    are progress, and stopping the task asks the download to stop in its own way."""
+    import asyncio
+    import types
+    from dva.db import DB
+    from dva.jobs import Jobs
+    events = []
+    paths = types.SimpleNamespace(data=tmp_path / "data")
+    paths.data.mkdir()
+    app = types.SimpleNamespace(db=DB(tmp_path / "t.sqlite3"), paths=paths, log=lambda m: None, approvals={},
+                                bus=types.SimpleNamespace(publish=lambda kind, /, **k: events.append((kind, k))))
+
+    async def run():
+        jobs = app.jobs = Jobs(app)
+        state = {"state": "starting", "done": 0, "total": 3000, "file": "", "cancel": False}
+
+        async def work(fail=False, forever=False):
+            for name in ("model.gguf", "vae.safetensors"):
+                state.update(state="downloading", file=name)
+                for _ in range(3):
+                    await asyncio.sleep(0.45)
+                    state["done"] += 500
+                    if state["cancel"]:
+                        state.update(state="cancelled")
+                        return
+            if fail:
+                state.update(state="failed", error="The publisher moved the file")
+                return
+            while forever and not state["cancel"]:
+                await asyncio.sleep(0.1)
+            state.update(state="cancelled" if state["cancel"] else "done")
+        row = jobs.follow("download", "Download: Test model", work(), lambda: state, stop=lambda: state.update(cancel=True))
+        await asyncio.wait_for(jobs.tasks[row["id"]], 20)
+        done = jobs.get(row["id"])
+        assert done["status"] == "done" and done["kind"] == "download"
+        steps = [e["text"] for e in done["trail"] if e["kind"] == "step"]
+        assert steps == ["Downloading model.gguf", "Downloading vae.safetensors"] and done["trail"][-1]["text"] == "Finished"
+        moved = [k for kind, k in events if kind == "job_progress"]
+        assert moved and moved[-1]["fraction"] == 1.0 and " of " in moved[-1]["text"]
+        # it fails in the download's own words
+        state.update(state="starting", done=0, cancel=False)
+        row = jobs.follow("download", "Download: Test model", work(fail=True), lambda: state)
+        await asyncio.wait_for(jobs.tasks[row["id"]], 20)
+        failed = jobs.get(row["id"])
+        assert failed["status"] == "failed" and "The publisher moved the file" in failed["error"]
+        # stopped from Activity: the download is asked to stop, and the task says stopped
+        state.update(state="starting", done=0, cancel=False, error=None)
+        row = jobs.follow("download", "Download: Test model", work(forever=True), lambda: state, stop=lambda: state.update(cancel=True))
+        await asyncio.sleep(1.2)
+        assert jobs.quiet(row["id"]) is not None and jobs.list(status="active", kinds=["download"])[0]["id"] == row["id"]
+        task = jobs.tasks[row["id"]]
+        assert jobs.cancel(row["id"])
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 20)
+        assert jobs.get(row["id"])["status"] == "cancelled" and state["state"] == "cancelled"
+        # quiet: the seconds since the last sign of life, only while it runs
+        assert jobs.quiet(row["id"]) is None
+        # work that goes one at a time says when it waits its turn (it would look stuck otherwise), and only then
+        from dva.jobs import turn
+        lock, said = asyncio.Lock(), []
+
+        async def one(delay, hold):
+            await asyncio.sleep(delay)
+            async with turn(lock, said.append, "Waiting for another picture"):
+                await asyncio.sleep(hold)
+        await asyncio.gather(one(0, 0.4), one(0.1, 0))
+        assert said == ["Waiting for another picture"] and not lock.locked()
+        await one(0, 0)
+        assert len(said) == 1
+    asyncio.run(run())
+
+
+def test_a_video_is_built_from_scenes_changed_and_kept(engine):
+    """2.14.0: a video made entirely on this computer from scenes (pictures, narration, captions), written by a
+    text model from an idea, then cut, joined and subtitled; every one of them a task with a plan and a trail."""
+    import av
+    from PIL import Image
+    c, tmp = engine["client"], engine["tmp"]
+    ready_for_media(c, tmp)
+    start = c.get("/api/video").json()
+    assert start["can"]["assemble"] and start["can"]["voice"] and start["can"]["pictures"] and not start["can"]["clip"]
+    assert "ended in September 2026" in start["notes"]["openai"] and start["recipes"][0]["key"] == "wan21-t2v-small"
+    assert not start["online"]["on"] and start["online"]["model"] == "gemini-omni-1.1-flash"
+    assert c.post("/api/video/jobs", json={"kind": "make", "scenes": []}).status_code == 400
+    assert c.post("/api/video/jobs", json={"kind": "clip", "prompt": " "}).status_code == 400
+    # the user's own pictures, a narration for each, captions in step with the voice
+    for name, colour in (("one.png", (200, 120, 40)), ("two.png", (40, 120, 200))):
+        Image.new("RGB", (900, 600), colour).save(tmp / name)
+    job = c.post("/api/video/jobs", json={"kind": "make", "title": "Two pictures", "shape": "square", "scenes": [
+        {"image": str(tmp / "one.png"), "narration": "Solar pumps lift water with sunlight, and they cost less every year."},
+        {"image": str(tmp / "two.png"), "narration": "That is why farmers choose them."},
+        {"caption": "The end", "seconds": 2}]}).json()
+    made = wait_video(c, job)
+    assert made["state"] == "done", made
+    video = made["result"]
+    p = video["params"]
+    assert video["kind"] == "video" and video["path"].endswith(".mp4") and p["mode"] == "assembled" and len(p["scenes"]) == 3
+    assert (p["width"], p["height"]) == (960, 960) and p["captions"] and p["voices"] and p["music"] is None
+    facts = c.get("/api/video/info", params={"path": video["path"]}).json()
+    assert facts["audio"] and facts["width"] == 960 and abs(facts["seconds"] - p["seconds"]) < 0.3 and p["seconds"] > 5
+    subtitles = Path(p["subtitles"]).read_text(encoding="utf-8")
+    assert "Solar pumps lift water" in subtitles and "The end" in subtitles and "-->" in subtitles
+    task = task_of(c, job["job_id"])
+    assert task["kind"] == "video" and task["status"] == "done" and task["result"]["media"][0]["path"] == video["path"]
+    assert task["detail"]["stages"] == ["Record the narration", "Put it together", "Save"] and task["detail"]["stage"] == 2
+    assert task["detail"]["video"]["scenes"] == 3 and task["detail"]["video_run"]["frames"] > 100
+    assert task["detail"]["narration"]["scenes_spoken"] == 2 and "speech" not in task["detail"]
+    texts = [e["text"] for e in task["trail"]]
+    assert "Narration 1 of 3…" in texts and any(t.startswith("Putting 3 scenes together") for t in texts)
+    assert any(t.startswith("Saved ") and "3 scenes" in t for t in texts)
+    with av.open(video["path"]) as box:                     # the picture is really in the frames: the first scene is orange
+        frame = next(box.decode(video=0)).to_image()
+    r, g, b = frame.getpixel((480, 200))
+    assert r > 150 and b < 90, (r, g, b)
+    assert not [m for m in c.get("/api/sound/library").json()["items"] if m["name"].startswith("scene-")]   # no leftovers
+
+    # from an idea: a text model writes the scenes, the image model makes their pictures
+    board = wait_video(c, c.post("/api/video/jobs", json={"kind": "storyboard", "idea": "tea farming", "minutes": 0.5}).json())
+    assert board["state"] == "done", board
+    scenes = board["result"]["scenes"]
+    assert len(scenes) == 3 and all(s["narration"] and s["picture"] for s in scenes) and "tea farming" in board["result"]["title"]
+    job = c.post("/api/video/jobs", json={"kind": "make", "title": board["result"]["title"], "scenes": scenes, "captions": False}).json()
+    film = wait_video(c, job)
+    assert film["state"] == "done", film
+    fp = film["result"]["params"]
+    assert len(fp["pictures_made"]) == 3 and (fp["width"], fp["height"]) == (1280, 720) and not fp["captions"]
+    assert all(Path(s["image"]).exists() for s in fp["scenes"])
+    ftask = task_of(c, job["job_id"])
+    assert ftask["detail"]["stages"] == ["Make the pictures", "Record the narration", "Put it together", "Save"]
+    assert ftask["detail"]["pictures"]["made"] == 3 and "picture_run" not in ftask["detail"]
+    # a picture made for the video has a "Save" of its own: it did not move the video's plan to its last stage
+    saved = [n for n, e in enumerate(ftask["trail"]) if e["text"].startswith("Saved 1 picture")]
+    spoke = [n for n, e in enumerate(ftask["trail"]) if e["text"].startswith("Narration 1 of 3")]
+    assert len(saved) == 3 and saved[-1] < spoke[0] and ftask["detail"]["stage"] == 3
+    assert any(e["kind"] == "output" for e in ftask["trail"])              # the image engine's own lines are in the video's trail
+
+    # changing a video: a part of it without its sound; two joined; subtitles written from what is said
+    part = wait_video(c, c.post("/api/video/jobs", json={"kind": "edit", "source": video["path"], "start": 1, "end": 3, "mute": True}).json())
+    assert part["state"] == "done", part
+    cut = c.get("/api/video/info", params={"path": part["result"]["path"]}).json()
+    assert abs(cut["seconds"] - 2.0) < 0.2 and not cut["audio"] and part["result"]["params"]["sound"] == "none"
+    joined = wait_video(c, c.post("/api/video/jobs", json={"kind": "edit", "subtitles": "auto", "name": "Both", "clips": [
+        {"path": video["path"], "start": 0, "end": 2}, part["result"]["path"]]}).json())
+    assert joined["state"] == "done", joined
+    jp = joined["result"]["params"]
+    assert jp["mode"] == "joined" and abs(jp["seconds"] - 4.0) < 0.3 and jp["sound"] == "own" and jp["captions"]
+    assert Path(jp["subtitles"]).exists() and Path(joined["result"]["path"]).name.startswith("both-")
+    empty = wait_video(c, c.post("/api/video/jobs", json={"kind": "edit", "source": video["path"], "start": 50, "end": 60}).json())
+    assert empty["state"] == "failed" and "is empty" in empty["error"]
+    gone = wait_video(c, c.post("/api/video/jobs", json={"kind": "edit", "source": str(tmp / "nope.mp4")}).json())
+    assert gone["state"] == "failed" and "There is no video" in gone["error"]
+
+    # a recording from the camera or the screen is kept like the others; what is not a video is refused
+    with open(part["result"]["path"], "rb") as f:
+        up = c.post("/api/video/upload", params={"keep": 1}, files={"file": ("My recording.mp4", f, "video/mp4")}).json()
+    assert up["record"]["source"] == "recorded" and up["info"]["width"] == 960
+    assert c.post("/api/video/upload", files={"file": ("notes.exe", b"MZ", "application/octet-stream")}).status_code == 400
+    assert c.post("/api/video/upload", files={"file": ("broken.mp4", b"not a video", "video/mp4")}).status_code == 400
+    library = c.get("/api/video/library").json()["videos"]
+    assert {v["source"] for v in library} == {"local", "recorded"} and len(library) == 5 and all(v["exists"] for v in library)
+    c.delete(f"/api/video/library/{up['record']['id']}", params={"file": 1})
+    assert not Path(up["record"]["path"]).exists()
+
+    # a clip by a video model on this computer: the engine is asked the way its own notes say
+    none = wait_video(c, c.post("/api/video/jobs", json={"kind": "clip", "prompt": "a kite in the wind"}).json())
+    assert none["state"] == "failed" and "No video model is set up" in none["error"]
+    files = {}
+    for slot in ("diffusion_model", "vae", "t5xxl"):
+        files[slot] = str(tmp / f"wan-{slot}.safetensors")
+        Path(files[slot]).write_bytes(b"\0" * 2048)
+    assert c.post("/api/video/models", json={"name": "x", "files": {"vae": files["vae"]}}).status_code == 400
+    model = c.post("/api/video/models", json={"name": "Test Wan", "files": files, "settings": {"steps": 4, "frames": 9, "width": 320, "height": 176}}).json()
+    assert model["ready"] and model["settings"]["video"]
+    assert model["id"] not in {m["id"] for m in c.get("/api/images").json()["models"]}          # not offered for pictures
+    assert c.get("/api/images").json()["default"] != model["id"] and c.get("/api/video").json()["can"]["clip_local"]
+    job = c.post("/api/video/jobs", json={"kind": "clip", "prompt": "a kite in the wind", "seed": 11}).json()
+    clip = wait_video(c, job)
+    assert clip["state"] == "done", clip
+    sent = json.loads((tmp / "wan-asked-video.json").read_text()) if (tmp / "wan-asked-video.json").exists() \
+        else json.loads(Path(files["diffusion_model"]).with_name("asked-video.json").read_text())
+    assert sent["mode"] == "vid_gen" and sent["diffusion_model"] == files["diffusion_model"] and sent["t5xxl"] == files["t5xxl"]
+    assert (sent["frames"], sent["fps"], sent["steps"], sent["seed"], sent["width"], sent["height"]) == ("9", "16", "4", "11", "320", "176")
+    assert sent["output"].endswith(".avi") and sent["flow_shift"] == "3" and sent["sampler"] == "euler"
+    cp = clip["result"]["params"]
+    assert clip["result"]["path"].endswith(".mp4") and cp["mode"] == "clip" and cp["width"] == 320 and cp["seconds"] > 0.3
+    ctask = task_of(c, job["job_id"])
+    assert ctask["detail"]["stages"] == ["Get ready", "Load the model", "Make the frames", "Save"]
+    assert ctask["detail"]["clip"]["frames"] == 9 and any(e["kind"] == "output" for e in ctask["trail"])
+    c.delete(f"/api/video/models/{model['id']}")
+    assert not c.get("/api/video").json()["models"]
+
+
+def test_an_agent_makes_a_video_and_cuts_it(engine):
+    c, tmp = engine["client"], engine["tmp"]
+    ready_for_media(c, tmp)
+    chat = c.post("/api/chats", json={"harness": "video-producer"}).json()
+    shown = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "show system prompt"}).json()
+    assert wait_job(c, shown["job_id"])["status"] == "done"
+    assert "make_video once with all of them" in last_assistant(c, chat["id"])["content"]
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "make a film about a lighthouse"}).json()
+    assert wait_job(c, job["job_id"], timeout=120)["status"] == "done"
+    step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
+    assert step["name"] == "make_video" and step["ok"], step
+    film = step["media"][0]
+    assert film["kind"] == "video" and film["path"].endswith(".mp4") and Path(film["path"]).parent.name == "video"
+    assert "2 scenes" in step["result"] and "narrated" in step["result"] and "with captions" in step["result"]
+    said = [t["text"] for t in step["trail"]]                    # the chat's step says what the tool was doing
+    assert any(t.startswith("Picture 1 of 2") for t in said) and "Narration 2 of 2…" in said
+    assert any(t.startswith("Putting 2 scenes together") for t in said)
+    # the same chat cuts it
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": f"cut the video {film['path']} to 0.5-2.5"}).json()
+    assert wait_job(c, job["job_id"], timeout=120)["status"] == "done"
+    step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
+    assert step["name"] == "edit_video" and step["ok"] and "2 seconds" in step["result"], step
+    assert len(c.get("/api/video/library", params={"chat_id": chat["id"]}).json()["videos"]) == 2
+    # no video model is set up: the clip tool is not offered, so the model cannot call it in vain
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "film a clip of a kite"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    assert not [s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool"]

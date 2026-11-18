@@ -276,7 +276,10 @@ def create_app(data_dir=None, resources_dir=None, token=None):
     @api.post("/api/runtime/install")
     async def runtime_install(request: Request):
         backend = (await body(request))["backend"]
-        A().spawn(A().runtime.install_backend(backend))
+        a = A()
+        if backend not in a.runtime.installing:
+            a.jobs.follow("install", f"Install the model engine ({backend})", a.runtime.install_backend(backend),
+                          lambda: a.runtime.installing.get(backend) or {}, payload={"what": "model engine", "backend": backend})
         return {"ok": True}
 
     @api.delete("/api/runtime/{backend}")
@@ -318,10 +321,11 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         async def run():
             try:
                 await a.images.install_engine(backend)
-            except Exception as exc:               # already reported through event image_engine
-                a.log(f"image engine install ({backend}): {type(exc).__name__}: {exc}")
-            a.bus.publish("images_changed")
-        a.spawn(run())
+            finally:                               # a failure is also reported through event image_engine
+                a.bus.publish("images_changed")
+        if backend not in a.images.installing:
+            a.jobs.follow("install", f"Install the image engine ({backend})", run(),
+                          lambda: a.images.installing.get(backend) or {}, payload={"what": "image engine", "backend": backend})
         return {"ok": True}
 
     @api.delete("/api/images/engine/{backend}")
@@ -494,8 +498,11 @@ def create_app(data_dir=None, resources_dir=None, token=None):
             a.sound.set_music_engine(data["folder"])
         elif "timeout_minutes" in data:
             a.db.set_setting("music_timeout_minutes", max(5, min(720, int(data["timeout_minutes"] or 90))))
-        else:
-            a.spawn(a.sound.install_music_engine())
+        elif not getattr(a.sound, "engine_installing", None):
+            a.jobs.follow("install", "Install the music engine", a.sound.install_music_engine(),
+                          lambda: getattr(a.sound, "engine_last", None) or {},
+                          stop=lambda: (getattr(a.sound, "engine_last", None) or {}).update(cancel=True),
+                          payload={"what": "music engine"})
         return await asyncio.to_thread(a.sound.status)
 
     @api.delete("/api/sound/music-engine")
@@ -538,14 +545,118 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         A().sound.forget(media_id, delete_file=bool(file))
         return {"ok": True}
 
+    # ------------------------------------------------------------------ video (2.14.0)
+    @api.get("/api/video")
+    async def video_overview():
+        return await asyncio.to_thread(A().video.status)
+
+    @api.post("/api/video/settings")
+    async def video_settings(request: Request):
+        a = A()
+        data = await body(request)
+        a.video.set_online(on=data.get("online"), model=data.get("model"), cost=data.get("cost"))
+        if "timeout_minutes" in data:
+            a.db.set_setting("video_timeout_minutes", max(5, min(1440, int(data["timeout_minutes"] or 240))))
+        return await asyncio.to_thread(a.video.status)
+
+    @api.post("/api/video/jobs")
+    async def video_job(request: Request):
+        data = await body(request)
+        kind = data.get("kind")
+        if kind == "storyboard" and not (str(data.get("idea") or "").strip() or data.get("sources") or str(data.get("text") or "").strip()):
+            raise ValueError("Say what the video is about, or choose a document")
+        if kind == "make" and not data.get("scenes"):
+            raise ValueError("A video needs at least one scene")
+        if kind == "edit" and not (data.get("source") or data.get("clips")):
+            raise ValueError("Choose the video to change")
+        if kind == "clip" and not str(data.get("prompt") or "").strip():
+            raise ValueError("Describe the clip")
+        if kind not in ("storyboard", "make", "edit", "clip"):
+            raise ValueError("kind must be storyboard, make, edit or clip")
+        return A().video.start_job(kind, data)
+
+    @api.delete("/api/video/jobs/{job_id}")
+    async def video_job_stop(job_id: str):
+        A().video.stop_job(job_id)
+        return {"ok": True}
+
+    @api.post("/api/video/recipes/{key}/download")
+    async def video_download(key: str):
+        return {k: v for k, v in A().video.start_download(key).items() if k != "cancel"}
+
+    @api.delete("/api/video/recipes/{key}/download")
+    async def video_download_cancel(key: str):
+        A().video.cancel_download(key)
+        return {"ok": True}
+
+    @api.post("/api/video/models")
+    async def video_model_add(request: Request):
+        data = await body(request)
+        return A().video.add_local(data.get("name") or "", data.get("files") or {}, data.get("settings") or {})
+
+    @api.delete("/api/video/models/{model_id}")
+    async def video_model_remove(model_id: str):
+        A().video.remove_model(model_id)
+        return {"ok": True}
+
+    @api.post("/api/video/upload")
+    async def video_upload(file: UploadFile = File(...), keep: int = 0):
+        """A video from the Video window: a file to change, or a recording from the camera or the screen
+        (`keep=1` puts it in the library)."""
+        from .video import IMAGE_EXT, VIDEO_EXT, VideoError, info
+        a = A()
+        folder = a.paths.data / "video" / "uploads"
+        folder.mkdir(parents=True, exist_ok=True)
+        given = Path(file.filename or "recording.webm")
+        ending = given.suffix.lower() or ".webm"
+        if ending not in VIDEO_EXT + IMAGE_EXT + (".mp3", ".wav", ".m4a", ".srt"):
+            raise ValueError(f"{ending} is not a video, a picture, a recording or a subtitle file")
+        name = re.sub(r"[^\w.-]+", "-", given.stem)[:60] or "file"
+        dest = folder / f"{name}-{new_id('')[-6:]}{ending}"
+        size = 0
+        with dest.open("wb") as f:
+            while chunk := await file.read(1 << 20):
+                size += len(chunk)
+                if size > 4 * 2**30:
+                    f.close()
+                    dest.unlink(missing_ok=True)
+                    raise ValueError("Videos up to 4 GB")
+                f.write(chunk)
+        out = {"path": str(dest), "name": file.filename}
+        if ending in VIDEO_EXT:
+            try:
+                out["info"] = await asyncio.to_thread(info, dest)
+            except VideoError as exc:
+                dest.unlink(missing_ok=True)
+                raise ValueError(str(exc)) from exc
+            if keep:
+                out["record"] = await asyncio.to_thread(a.video.keep, dest, given.stem)
+        return out
+
+    @api.get("/api/video/info")
+    async def video_info(path: str):
+        from .video import VideoError, info
+        try:
+            return await asyncio.to_thread(info, path)
+        except VideoError as exc:
+            raise ValueError(str(exc)) from exc
+
+    @api.get("/api/video/library")
+    async def video_library(limit: int = 80, chat_id: str = ""):
+        return {"videos": A().video.library(max(1, min(300, limit)), chat_id or None)}
+
+    @api.delete("/api/video/library/{media_id}")
+    async def video_forget(media_id: str, file: int = 0):
+        A().video.forget(media_id, delete_file=bool(file))
+        return {"ok": True}
+
     # ------------------------------------------------------------------ long-running tasks (2.9.0)
     @api.get("/api/busy")
     async def busy():
         """What is running right now (the desktop shell keeps the computer awake while this is not empty)."""
         a = A()
+        # pictures, sound, video, downloads and installs are tasks too (2.14.0): one list counts them all
         rows = [a.db.get("jobs", jid) or {} for jid in list(a.jobs.tasks)]
-        rows += [{"title": "Making a picture"} for _ in a.images.tasks]
-        rows += [{"title": "Working on sound"} for _ in a.sound.tasks]
         return {"active": len(rows), "titles": [r.get("title") or "Task" for r in rows][:6],
                 "waiting": sum(r.get("status") == "waiting" for r in rows)}
 
@@ -1450,8 +1561,13 @@ def create_app(data_dir=None, resources_dir=None, token=None):
 
     # ------------------------------------------------------------------ jobs
     @api.get("/api/jobs")
-    async def jobs(status: str = ""):
-        return {"jobs": A().jobs.list(status=status or None)}
+    async def jobs(status: str = "", kinds: str = "", limit: int = 150):
+        """Everything that works or worked in the background: chats, scheduled and long tasks, pictures, sound, video,
+        downloads and installs. `kinds` narrows it (comma-separated)."""
+        a = A()
+        rows = a.jobs.list(limit=max(1, min(500, limit)), status=status or None,
+                           kinds=[k for k in kinds.split(",") if k] or None)
+        return {"jobs": rows, "running": len(a.jobs.tasks)}
 
     @api.get("/api/jobs/{job_id}")
     async def job_get(job_id: str):

@@ -19,7 +19,8 @@ VALUE = {"-M": "mode", "--mode": "mode", "-m": "model", "--model": "model", "--d
          "-o": "output", "--output": "output", "-i": "init", "--init-img": "init", "--mask": "mask",
          "--strength": "strength", "--sampling-method": "sampler", "--scheduler": "scheduler", "-t": "threads",
          "--threads": "threads", "--backend": "backend", "--max-vram": "max_vram", "--ref-image-args": "ref_args",
-         "--upscale-model": "upscale_model", "--lora-model-dir": "lora_dir", "--log-level": "log_level"}
+         "--upscale-model": "upscale_model", "--lora-model-dir": "lora_dir", "--log-level": "log_level",
+         "--video-frames": "frames", "--fps": "fps", "--flow-shift": "flow_shift", "--clip_vision": "clip_vision"}
 MANY = {"-r": "refs", "--ref-image": "refs"}
 FLAGS = {"--offload-to-cpu", "--vae-tiling", "--auto-fit", "--mmap", "-v", "--disable-image-metadata"}
 FILES = ("model", "diffusion_model", "vae", "llm", "clip_l", "clip_g", "t5xxl", "tae", "init", "mask")
@@ -72,6 +73,26 @@ def main(argv):
             sys.stdout.flush()
     out = a.get("output", "./output.png")
     seed = int(a.get("seed", 42))
+    if a.get("mode") == "vid_gen":           # a clip: the real program writes .avi (or .webm) frames, as here
+        import av
+        path = Path(out)
+        if path.suffix.lower() not in (".avi", ".webm"):
+            path = path.with_suffix(".avi")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        (path.parent / "asked.json").write_text(json.dumps(a))
+        Path(a.get("diffusion_model")).with_name("asked-video.json").write_text(json.dumps(a))
+        frames, fps = int(a.get("frames", 33)), int(a.get("fps", 24))
+        with av.open(str(path), "w") as box:
+            stream = box.add_stream("mjpeg", rate=fps)
+            stream.width, stream.height, stream.pix_fmt = width, height, "yuvj420p"
+            for n in range(frames):
+                frame = av.VideoFrame.from_image(Image.new("RGB", (width, height), ((seed + n * 7) % 256, (n * 5) % 256, 120)))
+                for packet in stream.encode(frame):
+                    box.mux(packet)
+            for packet in stream.encode(None):
+                box.mux(packet)
+        print(f"[INFO ] main.cpp:560 - save result video to '{path}' (success)", flush=True)
+        return 0
     for n in range(count):
         path = Path(out % n if "%" in out else out)
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -6,6 +6,7 @@ import { api, desktop, fileUrl, fmtBytes, fmtTime } from "../api";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, ConfirmButton, Empty, Field, Modal, PageHeader, Progress, Spinner, Tabs } from "../components/ui";
 import { AudioClip, RecordButton, composerTracks, newTrack, saveComposer, soundJob } from "../components/Audio";
+import { WorkLine } from "../components/Work";
 
 const ROLE: Record<string, string> = { tts: "Speech", stt: "Transcription", music: "Music", clone: "Voice from a recording" };
 function external(url: string) { return (e: React.MouseEvent) => { if (desktop) { e.preventDefault(); desktop.openExternal(url); } }; }
@@ -45,6 +46,7 @@ function Jobs({ jobs, kinds, render }: any) {
       </div>
       {j.state === "running" && <div className="note"><Spinner size={14} /> {j.text}</div>}
       {j.error && <div className="small bad">{j.error}</div>}
+      <WorkLine jobId={j.job_id} running={j.state === "running"} />
       {j.result && render(j.result)}
     </div>
   ))}</>;

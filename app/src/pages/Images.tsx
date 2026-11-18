@@ -6,6 +6,7 @@ import { api, desktop, fileUrl, fmtBytes, fmtTime } from "../api";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, ConfirmButton, Empty, Field, Modal, PageHeader, Progress, Spinner, Tabs } from "../components/ui";
 import { EDIT_KEY, PictureGrid } from "../components/Pictures";
+import { WorkLine } from "../components/Work";
 
 const SHAPES: Record<string, [string, number]> = {
   square: ["Square", 1], landscape: ["Landscape (3:2)", 1.5], portrait: ["Portrait (2:3)", 2 / 3],
@@ -138,6 +139,7 @@ function Create({ state, toModels }: any) {
             </div>
             {j.state === "running" && <div className="note"><Spinner size={14} /> {j.text}</div>}
             {j.error && <div className="small bad">{j.error}</div>}
+            <WorkLine jobId={j.job_id} running={j.state === "running"} />
             <PictureGrid large items={j.images} onChange={(p: any) => setSource({ path: p.path, name: p.name })} />
           </div>
         ))}

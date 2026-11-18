@@ -45,14 +45,41 @@ export function AudioClip({ item, onRemove }: any) {
   );
 }
 
-// What a tool step made: pictures as thumbnails, recordings as players.
+// A video where it was made: a player, what it is, and where the file is (2.14.0).
+export function VideoClip({ item, large }: any) {
+  const p = item.params || {};
+  const what = p.mode === "assembled" ? `${p.scenes?.length || ""} scenes` : p.mode === "clip" ? "a clip by " + (item.model_name || "a video model")
+    : p.mode === "joined" ? "joined" : p.mode === "edited" ? "changed" : p.mode === "recorded" ? "recorded" : "";
+  const facts = [what, p.seconds ? mmss(p.seconds) : "", p.width ? `${p.width} × ${p.height}` : "", p.captions ? "captions" : "", p.music ? "music" : "",
+    p.cost ? `counted as US$${p.cost}` : "", item.source === "online" ? "made online" : ""].filter(Boolean).join(" · ");
+  return (
+    <div className={`video-clip${large ? " video-large" : ""}`}>
+      <video controls preload="metadata" src={fileUrl(item.path)} />
+      <div className="row between gap-s">
+        <div className="audio-meta">
+          <div className="ellipsis" title={item.prompt}>{p.title || item.name}</div>
+          <div className="small muted ellipsis">{facts}</div>
+        </div>
+        <span className="row gap-s">
+          <a className="icon-btn" href={fileUrl(item.path)} download={item.name} title="Download"><Download size={15} /></a>
+          {desktop && <button className="icon-btn" title="Show in folder" onClick={() => desktop.showItem(item.path)}><FolderOpen size={15} /></button>}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// What a tool step made: pictures as thumbnails, recordings and videos as players.
 export function MediaStrip({ items }: any) {
-  const pictures = (items || []).filter((m: any) => m.kind !== "audio"), clips = (items || []).filter((m: any) => m.kind === "audio");
-  if (!pictures.length && !clips.length) return null;
+  const all = items || [];
+  const pictures = all.filter((m: any) => m.kind !== "audio" && m.kind !== "video"), clips = all.filter((m: any) => m.kind === "audio"),
+    films = all.filter((m: any) => m.kind === "video");
+  if (!all.length) return null;
   return (
     <div className="tool-media">
       <PictureGrid items={pictures} large={pictures.length === 1} />
       {clips.map((m: any) => <AudioClip key={m.id || m.path} item={m} />)}
+      {films.map((m: any) => <VideoClip key={m.id || m.path} item={m} large />)}
     </div>
   );
 }

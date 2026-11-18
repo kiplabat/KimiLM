@@ -116,12 +116,22 @@ def decide(body):
                                ("read resource ", "read_connector_resource", "uri"),
                                ("paint a picture of ", "generate_image", "prompt"),
                                ("say aloud: ", "speak", "text"), ("write down what is said in ", "transcribe_audio", "path"),
-                               ("compose music: ", "generate_music", "prompt"), ("podcast of ", "make_podcast", "source")):
+                               ("compose music: ", "generate_music", "prompt"), ("podcast of ", "make_podcast", "source"),
+                               ("film a clip of ", "generate_video_clip", "prompt")):
         if trigger in text and tool in tools and not after_tool:
             args = {key: text.split(trigger, 1)[1].strip()}
             if tool == "update_project_notes":
                 args["section"] = "Decisions"
             return {"tool": (tool, args)}
+    if "film about " in text and "make_video" in tools and not after_tool:        # video (2.14.0)
+        subject = text.split("film about ", 1)[1].strip()
+        return {"tool": ("make_video", {"title": f"About {subject}", "scenes": [
+            {"narration": f"This is {subject}.", "picture": f"a photo of {subject}"},
+            {"narration": "And that is all there is to say.", "picture": f"{subject} at sunset"}]})}
+    if "cut the video " in text and "edit_video" in tools and not after_tool:     # "cut the video <path> to <a>-<b>"
+        path, _, part = text.split("cut the video ", 1)[1].partition(" to ")
+        a, _, b = part.partition("-")
+        return {"tool": ("edit_video", {"source": path.strip(), "start": float(a), "end": float(b)})}
     if "podcast from the attached" in text and "make_podcast" in tools and not after_tool:
         return {"tool": ("make_podcast", {"minutes": 3})}
     if "repaint " in text and "edit_image" in tools and not after_tool:      # "repaint <path> so that <what>"
@@ -296,6 +306,13 @@ def structured(schema, body):
     props = schema.get("properties", {})
     users = " ".join(text_of(m.get("content")) for m in body["messages"] if m["role"] == "user").lower()
     raw = " ".join(text_of(m.get("content")) for m in body["messages"] if m["role"] == "user")
+    if "scenes" in props and "title" in props:        # video (2.14.0): the scenes of a short video
+        n = int(re.search(r"as (\d+) scenes", raw).group(1))
+        subject = "solar pumps" if "MATERIAL:" in raw else (re.search(r"about: (.+?)\.", raw) or [None, "the subject"])[1]
+        return {"title": f"A short film about {subject}",
+                "scenes": [{"narration": f"Scene {i + 1} tells one thing about {subject}. It is said in a plain way.",
+                            "picture": f"A wide photo of {subject}, part {i + 1}, soft morning light",
+                            "caption": f"Part {i + 1}"} for i in range(min(n, 3))]}
     if "points" in props and "PART:" in raw:          # podcast (2.13.0): notes of one part of a document
         part = raw.split("PART:", 1)[1].split("JSON only")[0].strip()
         return {"points": [s.strip() + "." for s in part.replace("\n", " ").split(".")[:2] if s.strip()]}

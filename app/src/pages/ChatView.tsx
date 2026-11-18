@@ -6,9 +6,31 @@ import {
 } from "lucide-react";
 import { api, desktop, fileUrl, fmtBytes, fmtTime } from "../api";
 import { MediaStrip, ReadAloud } from "../components/Audio";
+import { Pulse, span, useTick } from "../components/Work";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, Markdown, Spinner, Toggle } from "../components/ui";
 import { Composer, ConnectorPicker, FolderPicker, HarnessPicker, LimitsPicker, ModelPicker, TeamPicker, ThinkingToggle, uploadAll } from "../components/Pickers";
+
+const clock = (iso?: string) => { const d = iso ? new Date(iso) : null; return d && !isNaN(+d) ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : ""; };
+
+// A tool at work says what it is doing (a picture's steps, a podcast's parts): the line it is on, for how long, and
+// whether it still reports. The steps so far open on a click.
+function ToolNow({ step }: any) {
+  const [open, setOpen] = useState(false);
+  useTick(true);
+  const on = step.stepAt ? (Date.now() - step.stepAt) / 1000 : 0;
+  return (
+    <div className="tool-now">
+      <div className="row gap-s wrap">
+        <span className="tool-now-text">{step.now}</span>
+        {on >= 3 && <span className="small muted">{span(on)} on this step</span>}
+        <Pulse seenAt={step.seenAt} running />
+        {step.trail?.length > 1 && <button className="link" onClick={() => setOpen(!open)}>{open ? "Hide the steps" : `${step.trail.length} steps so far`}</button>}
+      </div>
+      {open && <div className="work-trail">{step.trail.map((l: any, i: number) => <div key={i} className="work-step work-step-s"><span className="work-t">{clock(l.t)}</span><span className="work-text">{l.text}</span></div>)}</div>}
+    </div>
+  );
+}
 
 function ToolCard({ step, approval, onDecide }: any) {
   const [open, setOpen] = useState(false);
@@ -24,6 +46,7 @@ function ToolCard({ step, approval, onDecide }: any) {
         {state === "declined" && <Badge>declined</Badge>}
         {state === "blocked" && <Badge kind="warn" title="The loop guard stopped a repeated or over-limit call">repeat stopped</Badge>}
       </div>
+      {state === "running" && step.now && <ToolNow step={step} />}
       <MediaStrip items={step.media} />
       {approval && (
         <div className="approval">
@@ -50,6 +73,8 @@ function ToolCard({ step, approval, onDecide }: any) {
         <div className="tool-body">
           <div className="small muted">Arguments</div>
           <pre>{JSON.stringify(step.arguments, null, 2)}</pre>
+          {step.trail?.length > 0 && <><div className="small muted">What it did</div>
+            <div className="work-trail">{step.trail.map((l: any, i: number) => <div key={i} className="work-step work-step-s"><span className="work-t">{clock(l.t)}</span><span className="work-text">{l.text}</span></div>)}</div></>}
           {step.result !== undefined && <><div className="small muted">Result</div><pre>{step.result}</pre></>}
         </div>
       )}
@@ -580,7 +605,10 @@ export default function ChatView({ chatId }: { chatId: string }) {
         return { ...l, steps };
       }); break;
       case "tool_call": update((l) => ({ ...l, steps: [...l.steps.map((s: any) => s.type === "text" ? { ...s, closed: true } : s), { ...e.call, type: "tool", state: "running" }], status: e.call.label || "Working…" })); break;
-      case "tool_result": update((l) => ({ ...l, steps: l.steps.map((s: any) => s.id === e.call_id ? { ...s, state: "done", ok: e.ok, result: e.result, declined: e.declined, blocked: e.blocked, media: e.media || undefined } : s) })); break;
+      case "tool_progress": update((l) => ({ ...l, steps: l.steps.map((s: any) => s.id === e.call_id ? {
+        ...s, now: e.text, seenAt: Date.now(), ...(e.beat || s.trail?.[s.trail.length - 1]?.text === e.text ? {} : { stepAt: Date.now(), trail: [...(s.trail || []), { t: new Date().toISOString(), text: e.text }].slice(-200) }),
+      } : s) })); break;
+      case "tool_result": update((l) => ({ ...l, steps: l.steps.map((s: any) => s.id === e.call_id ? { ...s, state: "done", ok: e.ok, result: e.result, declined: e.declined, blocked: e.blocked, media: e.media || undefined, trail: e.trail || s.trail } : s) })); break;
       case "approval": update((l) => {
         const lastTool = [...l.steps].reverse().find((s: any) => s.type === "tool" && s.state === "running");
         return { ...l, approvals: [...l.approvals, { ...e, call_id: lastTool?.id }], status: "Waiting for your approval" };

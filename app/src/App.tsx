@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import {
   Activity as ActivityIcon, BookOpen, Brain, CalendarClock, Cpu, AudioLines, FolderKanban, Image as ImageIcon, MessageSquarePlus, Plug, Search,
-  Settings as SettingsIcon, Workflow, Loader2, Pin, Rocket, WifiOff,
+  Settings as SettingsIcon, Workflow, Loader2, Pin, Rocket, WifiOff, Film,
 } from "lucide-react";
 import { api } from "./api";
 import { go, useApp } from "./store";
@@ -18,6 +18,7 @@ import ActivityPage from "./pages/Activity";
 import Missions from "./pages/Missions";
 import Images from "./pages/Images";
 import Sound from "./pages/Sound";
+import Video from "./pages/Video";
 import Memory from "./pages/Memory";
 import Settings from "./pages/Settings";
 import Onboarding from "./pages/Onboarding";
@@ -28,6 +29,7 @@ const NAV = [
   { page: "schedules", label: "Schedules", icon: CalendarClock },
   { page: "images", label: "Images", icon: ImageIcon },
   { page: "sound", label: "Sound", icon: AudioLines },
+  { page: "video", label: "Video", icon: Film },
   { page: "models", label: "Models", icon: Cpu },
   { page: "plugins", label: "Plugins & connectors", icon: Plug },
   { page: "skills", label: "Skills", icon: BookOpen },
@@ -145,6 +147,7 @@ export default function App() {
     case "tasks": page = <Missions />; break;
     case "images": page = <Images />; break;
     case "sound": page = <Sound />; break;
+    case "video": page = <Video tab={route.id} />; break;
     case "memory": page = <Memory />; break;
     case "settings": page = <Settings />; break;
     default: page = <Home projectId={route.page === "home" ? route.id : undefined} />;
