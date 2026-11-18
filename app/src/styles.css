@@ -488,3 +488,16 @@ summary.work-h { cursor: pointer; }
 .video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
 .video-live { width: 100%; max-width: 640px; background: #000; border-radius: 10px; }
 .rec-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); animation: pulse-beat 1.2s ease-in-out infinite; }
+
+/* your own voice (2.18.0): the sentence to read, the takes, the steps of the recording */
+.voice-how { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-soft); }
+.voice-say { font-size: 21px; line-height: 1.45; padding: 16px 18px; background: var(--surface-2); border-radius: 12px; }
+.voice-tips { margin: 4px 0 0; padding-left: 18px; font-size: 13px; color: var(--text-soft); display: grid; gap: 3px; }
+.voice-take { border-top: 1px solid var(--line); padding: 10px 0; display: grid; gap: 6px; }
+.voice-take audio, .list-row audio { height: 32px; width: 250px; max-width: 100%; }
+.voice-pair { display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap; }
+.voice-lead { background: rgba(255, 92, 58, .06); margin: 0 -10px; padding: 10px; border-radius: 10px; }
+.voice-dots { display: flex; gap: 7px; margin-bottom: 12px; }
+.voice-dots i { width: 10px; height: 10px; border-radius: 50%; background: var(--line); cursor: pointer; }
+.voice-dots i.ok { background: var(--sage); } .voice-dots i.bad { background: var(--ember); }
+.voice-dots i.now { outline: 2px solid var(--coral); outline-offset: 2px; }

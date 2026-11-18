@@ -1,12 +1,13 @@
 // Sound (2.12.0): speak texts and scripts, write down recordings, make music, keep the recordings, and choose
 // the voices and models: on this computer, or online (OpenAI, Google).
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { AudioLines, Cloud, Copy, Cpu, Download, ExternalLink, FileText, FolderOpen, Layers, Mic, Music, Play, Save, Plus, Podcast as PodcastIcon, Square, Star, Trash2, Upload, UserRound, X } from "lucide-react";
+import { AudioLines, Cloud, Copy, Cpu, Download, ExternalLink, FileText, FolderOpen, Layers, Music, Play, Save, Plus, Podcast as PodcastIcon, Square, Star, Trash2, Upload, X } from "lucide-react";
 import { api, desktop, fileUrl, fmtBytes, fmtTime } from "../api";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, ConfirmButton, Empty, Field, Modal, PageHeader, Progress, Spinner, Tabs } from "../components/ui";
 import { AudioClip, RecordButton, composerTracks, newTrack, saveComposer, soundJob } from "../components/Audio";
 import { WorkLine } from "../components/Work";
+import { MyVoices } from "../components/Voices";
 
 const ROLE: Record<string, string> = { tts: "Speech", stt: "Transcription", music: "Music", clone: "Voice from a recording" };
 function external(url: string) { return (e: React.MouseEvent) => { if (desktop) { e.preventDefault(); desktop.openExternal(url); } }; }
@@ -417,8 +418,8 @@ function AddVoice({ onClose }: any) {
   };
   const ok = name.trim() && audio && (whose === "mine" ? confirmed : person.trim() && proof);
   return (
-    <Modal title="A voice from a recording" onClose={onClose} footer={<Button kind="primary" busy={busy} disabled={!ok} onClick={save}>Make the voice</Button>}>
-      <p className="small muted">10 to 30 seconds of clear speech in a quiet room, one person, no music. The voice then reads English texts on this computer; the recording stays here.</p>
+    <Modal title="A voice from a recording you have" onClose={onClose} footer={<Button kind="primary" busy={busy} disabled={!ok} onClick={save}>Make the voice</Button>}>
+      <p className="small muted">Five seconds or more of clear speech in a quiet room, one person, no music. The voice model takes the voice from about one second of it: KimiLM finds the clearest one. The voice then reads English texts on this computer; the recording stays here. Afterwards you can open the voice, hear it, and add sentences to choose from.</p>
       <Field label="Name of the voice"><input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. My voice" /></Field>
       <Field label="The recording">
         <div className="row gap-s wrap">
@@ -487,7 +488,6 @@ function ModelsTab({ state, reload }: any) {
   const [adding, setAdding] = useState(false);
   const [downloads, setDownloads] = useState<any>({});
   useEvent((e) => { if (e.kind === "sound_download") setDownloads((d: any) => ({ ...d, [e.key]: e })); });
-  const mine = state.voices.filter((v: any) => v.kind === "recording");
   const eng = state.music_engine;
   const [engine, setEngine] = useState<any>(null);
   useEvent((e) => { if (e.kind === "music_engine") setEngine(e.action === "installed" ? null : e); });
@@ -495,18 +495,7 @@ function ModelsTab({ state, reload }: any) {
   return (
     <div className="stack">
       <div className="card stack-s">
-        <div className="row between"><h3><UserRound size={16} /> Voices from recordings</h3><Button small icon={<Mic size={13} />} disabled={!state.can.clone} onClick={() => setAdding(true)}>Add a voice</Button></div>
-        {!state.can.clone && <div className="small muted">Download “Pocket TTS” below first: it is the model that speaks with a voice from a recording.</div>}
-        {mine.length === 0 && state.can.clone && <div className="small muted">None yet. Record 10 to 30 seconds of your own voice and KimiLM can read texts with it.</div>}
-        {mine.map((v: any) => (
-          <div key={v.id} className="list-row" style={{ cursor: "default" }}>
-            <div><b>{v.name}</b> <Badge>{v.whose === "mine" ? "my own voice" : "with recorded consent"}</Badge></div>
-            <div className="row gap-s">
-              {!v.default && <Button small kind="ghost" icon={<Star size={13} />} title="Use by default" onClick={() => api.put("/sound/settings", { voice: v.id }).then(reload)} />}
-              <ConfirmButton small kind="ghost" onConfirm={() => api.del(`/sound/voices/${encodeURIComponent(v.id)}`).then(reload)}><Trash2 size={13} /></ConfirmButton>
-            </div>
-          </div>
-        ))}
+        <MyVoices state={state} reload={reload} onFile={() => setAdding(true)} />
         <Field label="Default voice" inline>
           <select className="input narrow-auto" value={state.voices.find((v: any) => v.default)?.id || ""} onChange={(e) => api.put("/sound/settings", { voice: e.target.value }).then(reload).catch((err) => toast(err.message, "error"))}>
             <option value="">Chosen for you</option>

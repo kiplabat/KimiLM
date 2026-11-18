@@ -28,6 +28,7 @@ from .services import Services
 from .skills import Skills
 from .sound import Sound
 from .video import Video
+from .voices import Voices
 
 STATE = None
 
@@ -116,6 +117,7 @@ class App:
         self.services = Services(self)
         self.images = Images(self)
         self.sound = Sound(self)
+        self.voices = Voices(self)                   # your own voice: takes, checks, the reference (2.18.0)
         self.video = Video(self)
         self.approvals = {}
         self.pauses = {}          # chat id -> {"event", "reason"}: paused agent loops (orchestrator.pause_chat)

@@ -3989,3 +3989,274 @@ def test_work_that_was_cut_off_comes_back_and_leaves_no_engine_behind(tmp_path):
         await asyncio.to_thread(ctl.hold, lambda: time.monotonic() - t > 0.3)
         assert time.monotonic() - t < 1.5
     asyncio.run(limits())
+
+
+# ---------------------------------------------------------------------------------------------- 2.18.0
+def speechlike(path, seconds=5.0, loud=0.3, noise=0.002, rate=24000):
+    """A recording shaped like a spoken sentence: a breath of room at both ends, stretches of sound with short gaps
+    between them, and the room's noise underneath. Values above 1 are cut off, as an overdriven microphone does."""
+    import wave
+    import numpy as np
+    rng = np.random.default_rng(7)
+    t = np.arange(int(seconds * rate)) / rate
+    on = ((t % 1.45) < 1.3) & (t > 0.3) & (t < seconds - 0.3)
+    x = np.clip(loud * np.sin(2 * np.pi * 220 * t) * on + rng.normal(0, noise, len(t)), -1, 1)
+    with wave.open(str(path), "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(rate)
+        f.writeframes((x * 32767).astype("<i2").tobytes())
+    return path
+
+
+def test_your_own_voice_is_recorded_sentence_by_sentence_checked_kept_and_changed(engine):
+    """2.18.0. A voice is made from sentences read aloud: each take is checked at once; the voice is taken from
+    the clearest second of one take, which the user chooses by ear; it keeps its takes and can be heard, renamed,
+    extended, recorded again take by take, and deleted with all that belongs to it."""
+    import sqlite3
+    import numpy as np
+    from dva.sound import read_pcm
+    from dva.voices import SAMPLE, SCRIPT, SECOND, words_of
+    c, tmp = engine["client"], engine["tmp"]
+    ready_for_media(c, tmp)
+    if not c.get("/api/sound").json()["can"].get("clone"):
+        c.post("/api/sound/models", json={"key": "pocket-tts", "path": model_folder(tmp, "pocket")})
+    script = c.get("/api/sound/voices/script").json()
+    assert [s["id"] for s in script["sentences"]] == ["plain", "question", "joy", "list", "calm", "emphasis", "soft", "sounds"]
+    assert script["ready"] and script["words_checked"] and script["heard"] == 1.04 and len(script["tips"]) == 5
+    assert all(s["text"] and s["how"] for s in script["sentences"]) and "English" in script["language"]
+    texts = {s["id"]: s["text"] for s in SCRIPT}
+    uploads, voices_dir = tmp / "data" / "sound" / "uploads", tmp / "data" / "voices"
+
+    def record(sentence=None, name=None, **shape):
+        """A take as the window sends it: recorded, uploaded. Its name tells the stand-in what was said."""
+        said = name or "says-" + "-".join(words_of(texts[sentence]))
+        src = speechlike(tmp / "take.wav", **shape)
+        return c.post("/api/sound/upload", files={"file": (said + ".wav", src.read_bytes(), "audio/wav")}).json()["path"]
+
+    def begins_with(reference, take):
+        """The reference starts with the take's best second: that second is what the voice model hears."""
+        ref = read_pcm(reference, 24000, 1).reshape(-1)[:SECOND]
+        own = read_pcm(take["path"], 24000, 1).reshape(-1)[int(take["best"] * 24000):][:SECOND]
+        return len(ref) == len(own) == SECOND and float(np.corrcoef(ref, own)[0, 1]) > 0.99
+
+    # every take is checked at once: what is in it, and whether the words of the sentence were heard
+    good = record("question")
+    check = c.post("/api/sound/voices/check", json={"audio": good, "sentence": "question"}).json()
+    assert check["verdict"] == "good" and not check["problems"] and not check["notes"], check
+    assert check["match"] >= 0.8 and check["heard"].startswith("did you know") and check["text"] == texts["question"]
+    assert 3 < check["speech_seconds"] < 5 and -16 < check["level_db"] < -11 and check["noise_db"] < -45 and check["clipped"] == 0
+    assert check["steady"] == 1.0 and 0.25 <= check["best"] <= 3.7            # there is a full second of speech in it
+    for shape, said, told in (({"loud": 0.003, "noise": 0.0002}, None, "far too quiet"),
+                              ({"loud": 1.6}, None, "too loud and distorts"),
+                              ({"noise": 0.1}, None, "a lot of noise"),
+                              ({"loud": 0.0, "noise": 0.0005}, None, "Almost nothing was heard"),
+                              ({"seconds": 2.0}, None, "much shorter than the sentence"),
+                              ({}, "says-something-else-entirely-now", "Other words were heard")):
+        bad = c.post("/api/sound/voices/check", json={"audio": record("question", name=said, **shape), "sentence": "question"}).json()
+        assert bad["verdict"] == "again" and any(told in p for p in bad["problems"]), (told, bad)
+    fair = c.post("/api/sound/voices/check", json={"audio": record("question", noise=0.03), "sentence": "question"}).json()
+    assert fair["verdict"] == "fair" and "some background noise" in fair["notes"][0] and not fair["problems"]
+    own = c.post("/api/sound/voices/check", json={"audio": good, "text": "My own words.", "words": False}).json()
+    assert own["sentence"] is None and own["heard"] is None and own["match"] is None and own["verdict"] == "good"
+    assert c.post("/api/sound/voices/check", json={"audio": str(tmp / "nope.wav")}).status_code == 400
+    # what was tried and not kept is removed, and only from the app's own folder for recordings
+    outside = speechlike(tmp / "mine-elsewhere.wav")
+    assert c.post("/api/sound/voices/discard", json={"paths": [p.as_posix() for p in uploads.glob("says-*")] + [str(outside)]}).json()["removed"] >= 7
+    assert not list(uploads.glob("says-*")) and outside.exists()
+
+    # the voice: whose it is has to be said; too little speech is not a voice; nothing is lost when it is refused
+    takes = [{"sentence": s, "audio": record(s)} for s in ("plain", "question", "joy", "list", "calm", "emphasis", "soft")]
+    takes[1]["check"] = c.post("/api/sound/voices/check", json=takes[1]).json()
+    r = c.post("/api/sound/voices", json={"name": "Labatt", "takes": takes, "consent": {"whose": "mine"}})
+    assert r.status_code == 400 and "Confirm" in r.json()["error"] and all(Path(t["audio"]).exists() for t in takes)
+    lone = record("question", seconds=2.0)
+    r = c.post("/api/sound/voices", json={"name": "Labatt", "takes": [{"sentence": "question", "audio": lone}],
+                                          "consent": {"whose": "mine", "confirmed": True}})
+    assert r.status_code == 400 and "too little speech" in r.json()["error"] and Path(lone).exists()
+    assert c.post("/api/sound/voices/discard", json={"paths": [lone]}).json() == {"removed": 1}      # the window, on closing
+    assert c.post("/api/sound/voices", json={"name": "Heart", "takes": takes, "consent": {"whose": "mine", "confirmed": True}}).status_code == 400
+    voice = c.post("/api/sound/voices", json={"name": "Labatt", "note": "recorded at home", "takes": takes,
+                                              "consent": {"whose": "mine", "confirmed": True}}).json()
+    vid = voice["id"].removeprefix("voice:")
+    path = f"/api/sound/voices/{voice['id']}"
+    assert voice["kind"] == "recording" and voice["ready"] and voice["whose"] == "mine" and voice["note"] == "recorded at home"
+    assert voice["statement"] == "I confirm this is my own voice." and voice["missing"] == ["sounds"] and voice["sample"] is None
+    assert [t["sentence"] for t in voice["takes"]] == ["plain", "question", "joy", "list", "calm", "emphasis", "soft"]
+    assert all(t["exists"] and Path(t["path"]).parent == voices_dir / vid and t["steady"] == 1.0 for t in voice["takes"])
+    assert voice["takes"][1]["verdict"] == "good" and voice["takes"][1]["heard"].startswith("did you know")
+    assert not any(Path(t["audio"]).exists() for t in takes)               # the uploads went into the voice
+    # the voice model hears about one second: the voice is taken from the clearest second of one take, an even
+    # way of speaking unless the user chooses another
+    assert voice["heard"] == 1.04 and not voice["old"] and voice["lead"] == voice["takes"][0]["id"]
+    assert [t["lead"] for t in voice["takes"]] == [True] + [False] * 6
+    assert Path(voice["reference"]) == voices_dir / f"{vid}.wav" and begins_with(voice["reference"], voice["takes"][0])
+    assert c.get("/api/sound/peaks", params={"path": voice["reference"]}).json()["seconds"] > 5
+    listed = next(v for v in c.get("/api/sound").json()["voices"] if v["id"] == voice["id"])
+    assert listed["ready"] and listed["name"] == "Labatt" and listed["kind"] == "recording"
+
+    # it speaks like any other voice, asked for by its name
+    spoken = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "speak", "text": "This is me.", "voice": "Labatt"}).json())
+    assert spoken["state"] == "done" and spoken["result"]["model_name"] == "Labatt", spoken
+    seg = sound_jobs(tmp, "speak")[-1]["segments"][0]
+    assert seg["ref_audio"] == voice["reference"] and seg["ref_text"] == texts["plain"]
+    # hearing it: a sentence spoken by the voice, kept with the voice and not in the library
+    before = len(c.get("/api/sound/library").json()["items"])
+    task = task_of(c, c.post(f"{path}/sample", json={}).json()["job_id"])
+    assert task["status"] == "done" and task["kind"] == "sound" and task["title"].startswith("Hear the voice Labatt")
+    assert task["detail"]["stages"] == ["Prepare the voice", "Speak", "Save"] and "1.04 seconds" in task["detail"]["voice"]["what_the_model_hears"]
+    heard = c.get(path).json()
+    assert heard["sample"]["text"] == SAMPLE and Path(heard["sample"]["path"]).parent == voices_dir / vid and heard["sample"]["seconds"] > 1
+    assert heard["takes"][0]["try"] == heard["sample"] and not any(t["try"] for t in heard["takes"][1:]) and not heard["sampling"]
+    assert len(c.get("/api/sound/library").json()["items"]) == before
+    # choosing by ear: the voice says the same sentence taken from every take in turn
+    task_of(c, c.post(f"{path}/sample", json={"which": "all", "text": "Which of these sounds like me?"}).json()["job_id"])
+    every = c.get(path).json()
+    assert all(t["try"] and t["try"]["text"] == "Which of these sounds like me?" and Path(t["try"]["path"]).exists() for t in every["takes"])
+    assert len({t["try"]["path"] for t in every["takes"]}) == 7 and not Path(heard["sample"]["path"]).exists()
+    asked = sound_jobs(tmp, "speak")[-1]
+    assert len(asked["segments"]) == 7 and len({s["ref_audio"] for s in asked["segments"]}) == 7       # one second of each take
+    # … and the one that sounds most like its owner becomes what the voice is taken from
+    chosen = c.put(path, json={"name": "Labatt, calm", "note": "evening voice", "lead": every["takes"][4]["id"]}).json()
+    assert chosen["name"] == "Labatt, calm" and chosen["note"] == "evening voice" and chosen["lead"] == every["takes"][4]["id"]
+    assert [t["lead"] for t in chosen["takes"]] == [False] * 4 + [True] + [False] * 2 and chosen["sample"] == every["takes"][4]["try"]
+    assert begins_with(chosen["reference"], chosen["takes"][4])
+    assert c.put(path, json={"name": "My voice"}).status_code == 400       # taken
+    assert c.put(path, json={"lead": "nope"}).status_code == 404
+    wait_sound(c, c.post("/api/sound/jobs", json={"kind": "speak", "text": "Still me.", "voice": "Labatt, calm"}).json())
+    assert sound_jobs(tmp, "speak")[-1]["segments"][0]["ref_text"] == texts["calm"]
+    # a sentence recorded again replaces its take (the voice follows when it was taken from it); a missing one is added
+    old = chosen["takes"][4]
+    again = c.post(f"{path}/takes", json={"sentence": "calm", "audio": record("calm", loud=0.2)}).json()
+    new = next(t for t in again["takes"] if t["sentence"] == "calm")
+    assert new["id"] != old["id"] and new["lead"] and again["lead"] == new["id"] and len(again["takes"]) == 7
+    assert not Path(old["path"]).exists() and not Path(old["try"]["path"]).exists() and new["try"] is None and again["sample"] is None
+    more = c.post(f"{path}/takes", json={"sentence": "sounds", "audio": record("sounds")}).json()
+    assert len(more["takes"]) == 8 and more["missing"] == [] and more["lead"] == new["id"] and not list(uploads.glob("says-*"))
+    assert c.post(f"{path}/takes", json={"sentence": "joy", "audio": record("joy", loud=0.0, noise=0.0003)}).status_code == 400
+    # a take is removed; when it is the one the voice was taken from, the voice is taken from another
+    less = c.delete(f"{path}/takes/{more['takes'][7]['id']}").json()
+    assert len(less["takes"]) == 7 and not Path(more["takes"][7]["path"]).exists() and less["lead"] == new["id"]
+    moved = c.delete(f"{path}/takes/{new['id']}").json()
+    assert len(moved["takes"]) == 6 and moved["lead"] == moved["takes"][0]["id"] and begins_with(moved["reference"], moved["takes"][0])
+    assert c.delete(f"{path}/takes/nope").status_code == 404
+
+    # a voice from one recording you have: it is taken from that recording's clearest second, not its first
+    late = tmp / "late.wav"
+    speechlike(late, seconds=9.0)
+    data = np.frombuffer(late.read_bytes()[44:], dtype="<i2").copy()
+    data[: 24000 * 2] //= 200                                # two seconds of murmur before the speech proper
+    late.write_bytes(late.read_bytes()[:44] + data.tobytes())
+    up = c.post("/api/sound/upload", files={"file": ("my-old-recording.wav", late.read_bytes(), "audio/wav")}).json()
+    file_voice = c.post("/api/sound/voices", json={"name": "From a file", "audio": up["path"], "transcript": "what I said",
+                                                   "consent": {"whose": "mine", "confirmed": True}}).json()
+    fpath = f"/api/sound/voices/{file_voice['id']}"
+    assert len(file_voice["takes"]) == 1 and file_voice["takes"][0]["whole"] and file_voice["takes"][0]["lead"] and not file_voice["old"]
+    assert file_voice["takes"][0]["best"] >= 2.0 and begins_with(file_voice["reference"], file_voice["takes"][0])
+    assert len(file_voice["missing"]) == 8 and not Path(up["path"]).exists()
+    grown = c.post(f"{fpath}/takes", json={"sentence": "plain", "audio": record("plain")}).json()
+    assert [t["sentence"] for t in grown["takes"]] == ["plain", None] and grown["lead"] == file_voice["lead"] and len(grown["missing"]) == 7
+    # a voice made before this release has no takes: it is shown with its recording, speaks from it as it was
+    # given, and is taken from its clearest second once the user says so
+    fid = file_voice["id"].removeprefix("voice:")
+    db = sqlite3.connect(str(tmp / "data" / "kimilm.sqlite3"))
+    db.execute("UPDATE voices SET detail_json='{}' WHERE id=?", (fid,))
+    db.commit()
+    db.close()
+    before = c.get(fpath).json()
+    assert before["old"] and before["lead"] == "whole" and [t["id"] for t in before["takes"]] == ["whole"] and before["sample"] is None
+    task_of(c, c.post(f"{fpath}/sample", json={"text": "As I was."}).json()["job_id"])
+    assert sound_jobs(tmp, "speak")[-1]["segments"][0]["ref_audio"] == before["reference"]
+    assert c.get(fpath).json()["sample"]["text"] == "As I was."
+    renewed = c.put(fpath, json={"lead": "whole"}).json()
+    assert not renewed["old"] and len(renewed["takes"]) == 1 and renewed["takes"][0]["whole"] and renewed["takes"][0]["lead"]
+    assert renewed["sample"] is None and begins_with(renewed["reference"], renewed["takes"][0])
+    mine = {v["name"]: v for v in c.get("/api/sound/voices/mine").json()["voices"]}
+    assert {"Labatt, calm", "From a file"} <= set(mine) and mine["Labatt, calm"]["updated"] >= mine["Labatt, calm"]["created"]
+
+    # deleting a voice takes everything recorded for it; a default that pointed at it is cleared
+    assert c.put("/api/sound/settings", json={"voice": voice["id"]}).json()["default_voice"] == voice["id"]
+    assert c.get(path).json()["default"]
+    c.delete(path)
+    c.delete(fpath)
+    assert not (voices_dir / vid).exists() and not (voices_dir / f"{vid}.wav").exists() and not (voices_dir / fid).exists()
+    assert c.get(path).status_code == 404
+    assert c.get("/api/sound").json()["default_voice"] != voice["id"]
+    assert "Labatt, calm" not in {v["name"] for v in c.get("/api/sound").json()["voices"]}
+    # agents use voices; none of their tools makes, changes or deletes one
+    from dva.tools import builtin_tools
+    assert [t.name for t in builtin_tools() if "voice" in t.name] == ["list_voices"]
+
+
+def test_a_take_is_measured_and_judged_and_its_best_second_found():
+    """2.18.0. What is said about a take comes from its sound: how much speech, how loud, how clear of the room,
+    and where its fullest second of speech is: the second the voice model is given."""
+    import numpy as np
+    from dva.voices import SECOND, cut, judge, measure
+    rate = 24000
+    t = np.arange(5 * rate) / rate
+    # short words with gaps, then from 2.6 s a stretch of unbroken speech
+    on = (((t % 0.47) < 0.3) & (t > 0.5) & (t < 2.4)) | ((t > 2.6) & (t < 4.2))
+    x = (0.1 * np.sin(2 * np.pi * 200 * t) * on + np.random.default_rng(1).normal(0, 0.0005, len(t))).astype("float32")
+    facts = measure(x)
+    assert facts["seconds"] == 5.0 and 2.5 < facts["speech_seconds"] < 3.1 and abs(facts["level_db"] + 23) < 1.5
+    assert facts["noise_db"] < -60 and 0.45 <= facts["start"] <= 0.55 and 4.1 <= facts["end"] <= 4.25 and facts["clipped"] == 0
+    assert facts["steady"] == 1.0 and 2.58 <= facts["best"] <= 3.2           # inside the unbroken stretch
+    assert judge(facts, "one two three four five six seven")["verdict"] == "good"
+    assert judge(facts, "one two three", heard="one two three")["match"] == 1.0
+    assert judge(facts, "one two three four", heard="one two three for")["verdict"] == "fair"
+    assert "Other words" in judge(facts, "one two three four", heard="")["problems"][0]
+    assert "long silences" in judge({**facts, "seconds": 30.0}, "one two three")["notes"][0]
+    assert "one breath" in judge({**facts, "steady": 0.5})["notes"][0]
+    part = cut(x, facts)                                     # only the speech, at the common loudness, never overdriven
+    assert 3.8 < len(part) / rate < 4.1 and abs(measure(part)["level_db"] + 23) < 0.6 and float(np.abs(part).max()) <= 0.95
+    lead = cut(x, facts, lead=True)                          # from the best second on: what the model hears comes first
+    assert abs(len(lead) / rate - (facts["end"] + 0.12 - facts["best"])) < 0.05 and measure(lead[:SECOND])["speech_seconds"] > 1.0
+    loud = cut(x * 9, measure(x * 9))
+    assert float(np.abs(loud).max()) <= 0.951
+    choppy = measure((0.1 * np.sin(2 * np.pi * 200 * t) * ((t % 0.4) < 0.2)).astype("float32"))
+    assert choppy["steady"] < 0.6 and judge(choppy)["verdict"] == "fair"
+    assert measure(np.zeros(100, dtype="float32"))["speech_seconds"] == 0.0
+    assert judge(measure(np.zeros(rate, dtype="float32")))["verdict"] == "again"
+
+
+@pytest.mark.skipif(not os.environ.get("DVA_TEST_SOUND_MODELS"), reason="needs real speech models (DVA_TEST_SOUND_MODELS=folder)")
+def test_the_real_voice_model_hears_one_second_of_a_recording(tmp_path):
+    """2.18.0 is built on this, measured with the model KimiLM installs: the voice comes from the first 1.04
+    seconds of the recording it is given, however long the recording is, and another second gives another voice.
+    If a later model or library hears more, this fails, and voices.py should give it more."""
+    import numpy as np
+    from dva.sound import read_pcm
+    from dva.voices import SECOND
+    folder = Path(os.environ["DVA_TEST_SOUND_MODELS"]) / "sherpa-onnx-pocket-tts-int8-2026-01-26"
+    voice = read_pcm(folder / "test_wavs" / "bria.wav", 24000, 1)
+
+    def says(name, samples):
+        ref = tmp_path / f"{name}.wav"
+        with wave_file(ref) as f:
+            f.writeframes((np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes())
+        spec = tmp_path / "job.json"
+        spec.write_text(json.dumps({"kind": "speak", "out": str(tmp_path / f"{name}-out.wav"),
+                                    "models": {"p": {"family": "pocket", "dir": str(folder)}},
+                                    "segments": [{"model": "p", "text": "This voice comes from a short recording.", "ref_audio": str(ref)}]}))
+        out = subprocess.run([sys.executable, "-c", "import sys, sherpa_onnx as so, dva.sound_worker as w\n"
+                              "make = so.GenerationConfig\n"
+                              "def seeded():\n    c = make(); c.extra = {'seed': '1'}; return c\n"
+                              "so.GenerationConfig = seeded\n"                      # the same throw of the dice each time
+                              "sys.exit(w.main([sys.argv[1]]))", str(spec)], cwd=str(ENGINE), capture_output=True, text=True)
+        assert json.loads(out.stdout.strip().splitlines()[-1]).get("done"), out.stderr[-600:]
+        return read_pcm(tmp_path / f"{name}-out.wav", 24000, 1).reshape(-1)
+    same = lambda a, b: len(a) == len(b) and bool(np.allclose(a, b, atol=1e-3))      # noqa: E731
+    one, three, ten = says("one", voice[:SECOND]), says("three", voice[: 3 * 24000]), says("ten", voice[: 10 * 24000])
+    assert same(one, three) and same(three, ten)                 # what follows the first 1.04 seconds changes nothing
+    assert not same(ten, says("later", voice[5 * 24000: 15 * 24000]))       # another second of the same speaker: another voice
+    assert not same(one, says("less", voice[: SECOND // 2]))     # … and less than that second is not the same either
+
+
+def wave_file(path, rate=24000):
+    import wave
+    f = wave.open(str(path), "wb")
+    f.setnchannels(1)
+    f.setsampwidth(2)
+    f.setframerate(rate)
+    return f

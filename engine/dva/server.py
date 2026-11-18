@@ -482,15 +482,58 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         A().sound.remove(model_id)
         return {"ok": True}
 
+    # Voices from recordings (2.18.0, voices.py): the sentences to read, a check of each take, the voices with
+    # their takes, and hearing a voice. Only the user makes, changes and deletes voices: there are no tools for it.
+    @api.get("/api/sound/voices/script")
+    async def sound_voice_script():
+        return A().voices.script()
+
+    @api.get("/api/sound/voices/mine")
+    async def sound_voices_mine():
+        return {"voices": await asyncio.to_thread(A().voices.mine)}
+
+    @api.post("/api/sound/voices/check")
+    async def sound_voice_check(request: Request):
+        data = await body(request)
+        return await A().voices.check(data.get("audio"), data.get("sentence"), data.get("text"), data.get("words", True))
+
+    @api.post("/api/sound/voices/discard")
+    async def sound_voice_discard(request: Request):
+        return {"removed": A().voices.discard((await body(request)).get("paths") or [])}
+
     @api.post("/api/sound/voices")
     async def sound_voice_add(request: Request):
         data = await body(request)
-        return await A().sound.create_voice(data.get("name"), data.get("audio"), data.get("transcript") or "",
-                                            data.get("consent"))
+        return await A().voices.create(data.get("name"), data.get("consent"), audio=data.get("audio"),
+                                       takes=data.get("takes") or None, transcript=data.get("transcript") or "",
+                                       note=data.get("note") or "")
+
+    @api.get("/api/sound/voices/{voice_id}")
+    async def sound_voice_get(voice_id: str):
+        return await asyncio.to_thread(A().voices.get, voice_id)
+
+    @api.put("/api/sound/voices/{voice_id}")
+    async def sound_voice_update(voice_id: str, request: Request):
+        return await A().voices.update(voice_id, await body(request))
+
+    @api.post("/api/sound/voices/{voice_id}/takes")
+    async def sound_voice_take(voice_id: str, request: Request):
+        data = await body(request)
+        return await A().voices.add_take(voice_id, data.get("audio"), data.get("sentence"), data.get("text"),
+                                         data.get("check"))
+
+    @api.delete("/api/sound/voices/{voice_id}/takes/{take_id}")
+    async def sound_voice_take_remove(voice_id: str, take_id: str):
+        return await A().voices.remove_take(voice_id, take_id)
+
+    @api.post("/api/sound/voices/{voice_id}/sample")
+    async def sound_voice_sample(voice_id: str, request: Request):
+        data = await body(request)          # which: "lead" (the voice as it is) or "all" (taken from each take in turn)
+        return A().voices.sample(voice_id, data.get("text") or "", "all" if data.get("which") == "all" else "lead")
 
     @api.delete("/api/sound/voices/{voice_id}")
     async def sound_voice_remove(voice_id: str):
-        A().sound.delete_voice(voice_id)
+        A().voices.delete(voice_id)
         return {"ok": True}
 
     @api.post("/api/sound/jobs")

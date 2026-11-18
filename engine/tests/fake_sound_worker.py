@@ -3,7 +3,8 @@ in the same way, writes real WAV files (a tone per spoken part, its pitch by the
 to the file named by DVA_SOUND_LOG so the tests can read what the engine asked for.
 
 Marks: a text containing "unpronounceable" fails the way a voice does that cannot read a text; a recording whose
-name contains "silence" has no speech in it."""
+name contains "silence" has no speech in it; a recording whose name starts with "says-" holds the words of its
+name ("says-good-morning-1a2b3c.webm" is heard as "good morning": the last part is the upload's own number)."""
 import json
 import os
 import sys
@@ -57,6 +58,10 @@ def main(argv):
         say(progress=0.5, text="Transcribing: 1 of 2 seconds")
         if "silence" in audio.name:
             say(done=True, text="", segments=[], seconds=2.0)
+            return 0
+        if audio.name.startswith("says-"):
+            words = " ".join(audio.stem.split("-")[1:-1])
+            say(done=True, text=words, segments=[{"start": 0.0, "end": 2.0, "text": words}], seconds=2.0)
             return 0
         lang = job["model"].get("language") or "auto"
         segments = [{"start": 0.0, "end": 1.2, "text": f"These are the words of {audio.stem[:12]}."},
