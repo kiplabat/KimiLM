@@ -68,6 +68,10 @@ CREATE TABLE IF NOT EXISTS media (
   id TEXT PRIMARY KEY, kind TEXT, path TEXT, chat_id TEXT, prompt TEXT DEFAULT '', model TEXT, model_name TEXT,
   source TEXT, params_json TEXT DEFAULT '{}', created TEXT);
 CREATE INDEX IF NOT EXISTS media_chat ON media(chat_id);
+CREATE TABLE IF NOT EXISTS media_work (
+  id TEXT PRIMARY KEY, kind TEXT, what TEXT, title TEXT, state TEXT, text TEXT DEFAULT '', error TEXT,
+  request_json TEXT DEFAULT '{}', result_json TEXT DEFAULT '{}', job_id TEXT, created TEXT, updated TEXT);
+CREATE INDEX IF NOT EXISTS media_work_kind ON media_work(kind, created);
 CREATE TABLE IF NOT EXISTS sound_models (
   id TEXT PRIMARY KEY, kind TEXT, role TEXT, family TEXT DEFAULT '', name TEXT, provider TEXT DEFAULT '',
   remote_id TEXT DEFAULT '', path TEXT DEFAULT '', settings_json TEXT DEFAULT '{}', size INTEGER DEFAULT 0,

@@ -3,7 +3,7 @@ import { Activity as ActivityIcon, Ban, CheckCircle2, ChevronDown, ChevronRight,
 import { api, fmtTime } from "../api";
 import { go, useEvent } from "../store";
 import { Badge, Button, Empty, PageHeader, Spinner, Tabs } from "../components/ui";
-import { ACTIVE, KIND_NAME, Pulse, STATUS_ICON, WorkDetail, span, useTick } from "../components/Work";
+import { ACTIVE, KIND_NAME, PauseButton, PausedMark, Pulse, STATUS_ICON, WorkDetail, span, useTick } from "../components/Work";
 
 const kTokens = (n: number) => !n ? "0" : n >= 10000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 const dur = (s: number) => s < 90 ? `${Math.max(0, Math.round(s))} s` : s < 5400 ? `${Math.round(s / 60)} min` : `${(s / 3600).toFixed(1)} h`;
@@ -128,7 +128,8 @@ function TaskRow({ j, live, onOpen }: { j: any; live: any; onOpen: () => void })
       <div className="grow">
         <div className="row gap-s"><b className="ellipsis">{j.title}</b><Badge>{KIND_NAME[j.kind] || j.kind}</Badge>
           {j.status === "waiting" && <Badge kind="warn">needs your approval</Badge>}
-          {j.status === "running" && <Pulse seenAt={live?.seenAt ?? (j.quiet == null ? null : j.loaded - j.quiet * 1000)} running now={now} pace={live && "pace" in live ? live.pace : j.pace} />}</div>
+          {j.status === "running" && j.paused && <PausedMark />}
+          {j.status === "running" && !j.paused && <Pulse seenAt={live?.seenAt ?? (j.quiet == null ? null : j.loaded - j.quiet * 1000)} running now={now} pace={live && "pace" in live ? live.pace : j.pace} />}</div>
         {running && now ? <div className="small job-now">{now}</div> : null}
         {running && fraction != null ? <div className="run-bar"><span style={{ width: `${Math.max(2, Math.round(fraction * 100))}%` }} /></div> : null}
         <div className="small muted">{fmtTime(j.created)}{took >= 1 ? ` · ${running ? "running for" : "took"} ${span(took)}` : ""}{j.harness ? ` · ${j.harness}` : ""}{j.model ? ` · ${j.model}` : ""}
@@ -137,6 +138,7 @@ function TaskRow({ j, live, onOpen }: { j: any; live: any; onOpen: () => void })
       <div className="row gap-s" onClick={(e) => e.stopPropagation()}>
         <Button small icon={<Eye size={13} />} onClick={onOpen}>Details</Button>
         {j.chat_id && <Button small onClick={() => go("chat", j.chat_id)}>Open chat</Button>}
+        <PauseButton job={j} small />
         {running && <Button small kind="danger" onClick={() => api.post(`/jobs/${j.id}/cancel`)}>Stop</Button>}
       </div>
     </div>

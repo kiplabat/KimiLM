@@ -8,26 +8,26 @@ import { api, desktop, fileUrl, fmtBytes, fmtTime } from "../api";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, ConfirmButton, Empty, Field, PageHeader, Progress, Spinner, Tabs, Toggle } from "../components/ui";
 import { VideoClip } from "../components/Audio";
-import { WorkLine } from "../components/Work";
+import { WorkButtons, WorkLine, WorkNote } from "../components/Work";
 
 function external(url: string) { return (e: React.MouseEvent) => { if (desktop) { e.preventDefault(); desktop.openExternal(url); } }; }
 const mmss = (s: number) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`;
 const SHAPE_NAME: any = { landscape: "Landscape (16:9)", portrait: "Portrait (9:16, for phones)", square: "Square" };
 const emptyScene = () => ({ narration: "", picture: "", image: "", caption: "" });
 
-function Jobs({ jobs, kinds, render }: any) {
+function Jobs({ jobs, kinds, render, pauseStop, onForget }: any) {
   const mine = jobs.filter((j: any) => kinds.includes(j.what));
   if (!mine.length) return <div className="card muted">What you make appears here, and stays in the Library.</div>;
   return <>{[...mine].reverse().map((j: any) => (
     <div key={j.id} className="card stack-s">
       <div className="row between gap-s">
         <div className="ellipsis" title={j.title}><b>{j.title}</b></div>
-        {j.state === "running" ? <Button small icon={<Square size={12} />} onClick={() => api.del(`/video/jobs/${j.id}`)}>Stop</Button>
-          : <Badge kind={j.state === "done" ? "ok" : j.state === "failed" ? "bad" : "neutral"}>{j.state}</Badge>}
+        <WorkButtons base="/video" job={j} onForget={() => onForget && onForget(j.id)} />
       </div>
-      {j.state === "running" && <div className="note"><Spinner size={14} /> {j.text}</div>}
+      <WorkNote job={j} pauseStop={pauseStop} />
       {j.error && <div className="small bad">{j.error}</div>}
-      <WorkLine jobId={j.job_id} running={j.state === "running"} />
+      {j.what === "make" && !["done", "stopped"].includes(j.state) && j.made?.length > 0 && <div className="small muted">The pictures of {j.made.length} scene{j.made.length === 1 ? "" : "s"} are finished and kept.</div>}
+      <WorkLine jobId={j.job_id} running={j.state === "running" || j.state === "paused"} paused={j.state === "paused"} />
       {j.result && render(j.result)}
     </div>
   ))}</>;
@@ -38,7 +38,7 @@ function Ready({ ok, children }: any) {
 }
 
 // Make: an idea or a document becomes scenes (a text model writes them, or you do); the scenes become a video.
-function Make({ state, jobs, voices }: any) {
+function Make({ state, jobs, voices, forget }: any) {
   const { toast } = useApp();
   const [idea, setIdea] = useState("");
   const [docs, setDocs] = useState<any[]>([]);
@@ -133,13 +133,13 @@ function Make({ state, jobs, voices }: any) {
           <div><Button kind="primary" icon={<Clapperboard size={14} />} disabled={!filled.length} onClick={make}>Make the video</Button></div>
         </div>
       </div>
-      <div className="stack-s"><Jobs jobs={jobs} kinds={["make"]} render={(r: any) => <VideoClip item={r} large />} /></div>
+      <div className="stack-s"><Jobs jobs={jobs} kinds={["make"]} pauseStop={state.pause_stop_minutes} onForget={forget} render={(r: any) => <VideoClip item={r} large />} /></div>
     </div>
   );
 }
 
 // Change: a part of a video, several joined, another sound, subtitles.
-function Change({ state, jobs, library }: any) {
+function Change({ state, jobs, library, forget }: any) {
   const { toast } = useApp();
   const [clips, setClips] = useState<any[]>([]);
   const [mute, setMute] = useState(false);
@@ -202,13 +202,13 @@ function Change({ state, jobs, library }: any) {
         <Field label="Shape"><select className="input narrow-auto" value={shape} onChange={(e) => setShape(e.target.value)}><option value="">As the video is</option>{Object.keys(state.shapes).map((k) => <option key={k} value={k}>{SHAPE_NAME[k] || k}</option>)}</select></Field>
         <div><Button kind="primary" icon={<Scissors size={14} />} disabled={!clips.length} onClick={run}>{clips.length > 1 ? `Join ${clips.length} videos` : "Make the new video"}{total ? ` (${mmss(total)})` : ""}</Button></div>
       </div>
-      <div className="stack-s"><Jobs jobs={jobs} kinds={["edit"]} render={(r: any) => <VideoClip item={r} large />} /></div>
+      <div className="stack-s"><Jobs jobs={jobs} kinds={["edit"]} pauseStop={state.pause_stop_minutes} onForget={forget} render={(r: any) => <VideoClip item={r} large />} /></div>
     </div>
   );
 }
 
 // Clip: a few seconds made by a video model from a description.
-function Clip({ state, jobs, toModels }: any) {
+function Clip({ state, jobs, toModels, forget }: any) {
   const { toast } = useApp();
   const [prompt, setPrompt] = useState("");
   const [shape, setShape] = useState("landscape");
@@ -239,7 +239,7 @@ function Clip({ state, jobs, toModels }: any) {
           : "Made on this computer: minutes on a graphics card, an hour or more a clip on the processor alone. “What is it doing?” shows the engine’s own lines while it works."}</div>
         <div><Button kind="primary" icon={<Wand2 size={14} />} disabled={!prompt.trim()} onClick={start}>Make the clip</Button></div>
       </div>
-      <div className="stack-s"><Jobs jobs={jobs} kinds={["clip"]} render={(r: any) => <VideoClip item={r} large />} /></div>
+      <div className="stack-s"><Jobs jobs={jobs} kinds={["clip"]} pauseStop={state.pause_stop_minutes} onForget={forget} render={(r: any) => <VideoClip item={r} large />} /></div>
     </div>
   );
 }
@@ -385,15 +385,16 @@ export default function Video({ tab: first }: { tab?: string }) {
     if (e.kind === "video_job") setJobs((list) => list.some((j) => j.id === e.id) ? list.map((j) => j.id === e.id ? e : j) : [...list, e]);
     if (["video_changed", "images_changed", "sound_changed", "image_download"].includes(e.kind) || (e.kind === "video_job" && e.state !== "running")) load();
   });
+  const forget = (id: string) => setJobs((list) => list.filter((j) => j.id !== id));
   if (!state) return <div className="page"><Spinner /></div>;
   return (
     <div className="page">
       <PageHeader title="Video" subtitle="Make videos from pictures, a voice and music on this computer, change the ones you have, record the camera or the screen, or ask a video model for a short clip." />
       <Tabs value={tab} onChange={setTab} tabs={[{ id: "make", label: "Make" }, { id: "change", label: "Change" }, { id: "clip", label: "Clip" }, { id: "record", label: "Record" },
         { id: "library", label: `Library${library.length ? ` (${library.length})` : ""}` }, { id: "models", label: "Models" }]} />
-      {tab === "make" && <Make state={state} jobs={jobs} voices={voices} />}
-      {tab === "change" && <Change state={state} jobs={jobs} library={library.filter((v) => v.exists)} />}
-      {tab === "clip" && <Clip state={state} jobs={jobs} toModels={() => setTab("models")} />}
+      {tab === "make" && <Make state={state} jobs={jobs} voices={voices} forget={forget} />}
+      {tab === "change" && <Change state={state} jobs={jobs} library={library.filter((v) => v.exists)} forget={forget} />}
+      {tab === "clip" && <Clip state={state} jobs={jobs} toModels={() => setTab("models")} forget={forget} />}
       {tab === "record" && <Record onSaved={load} />}
       {tab === "library" && <Library items={library} reload={load} />}
       {tab === "models" && <Models state={state} reload={load} />}

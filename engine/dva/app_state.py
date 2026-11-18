@@ -66,6 +66,9 @@ DEFAULT_SETTINGS = {
     # a clip made by a model on this computer is stopped after this long
     "video_online": False, "video_online_model": "gemini-omni-1.1-flash", "video_clip_cost": 1.0,
     "video_timeout_minutes": 240,
+    # 2.17.0: pictures and video can be paused. pause_stop_minutes: a paused one is stopped after this long, so
+    # that the memory its engine holds is free again (what was finished is kept and it can be continued); 0: never
+    "pause_stop_minutes": 20,
     # 2.15.0: failure recovery. recovery_attempts: after this many different recoveries in a row have failed too,
     # a long-running task pauses and says what was tried; retry_wait_seconds: the first wait before a step that
     # met a passing fault (a dropped connection, a busy service) is given again (the next wait is three times it)

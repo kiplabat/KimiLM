@@ -3,9 +3,9 @@
 // its time, and what a program printed), a plan (what it will do, with what, and what is known so far) and a sign of
 // life, so that "busy with a long step" and "stuck" can be told apart by looking.
 import React, { useEffect, useRef, useState } from "react";
-import { AlertTriangle, CheckCircle2, Circle, Clock, Eye, Loader2, ShieldCheck, Square, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Circle, Clock, Eye, Loader2, Pause, Play, RotateCw, ShieldCheck, Square, X, XCircle } from "lucide-react";
 import { api, fileUrl } from "../api";
-import { go, useEvent } from "../store";
+import { go, useApp, useEvent } from "../store";
 import { Badge, Button, Modal, Spinner } from "./ui";
 import { MediaStrip } from "./Audio";
 
@@ -55,6 +55,57 @@ export function Pulse({ seenAt, running, long, now, pace }: { seenAt?: number | 
       <AlertTriangle size={13} />no sign of life for {span(quiet)}{long ? ": it may be stuck" : ""}
     </span>
   );
+}
+
+// A paused task (2.17.0): its engine is frozen where it is and goes on from there. It says nothing because it was
+// asked to: no pulse, no "stuck".
+export function PausedMark() {
+  return <span className="pulse pulse-quiet" title="Its engine is frozen where it is and keeps its place. Resume lets it go on from there."><Pause size={12} />paused</span>;
+}
+
+// Pause and resume for a task that is one piece of media work on this computer.
+export function PauseButton({ job, small }: { job: any; small?: boolean }) {
+  const { toast } = useApp();
+  if (!job?.can_pause || !ACTIVE.includes(job.status)) return null;
+  const act = (what: string) => api.post(`/jobs/${job.id}/${what}`).catch((e: any) => toast(e.message, "error"));
+  return job.paused
+    ? <Button small={small} kind="primary" icon={<Play size={12} />} onClick={() => act("resume")} title="Go on from where it was">Resume</Button>
+    : <Button small={small} icon={<Pause size={12} />} onClick={() => act("pause")} title="Freeze it where it is: the computer is free for something else, and it goes on from the same place">Pause</Button>;
+}
+
+// The state of a request in the Images or the Video window, in words.
+export const WORK_STATE: any = { running: "running", paused: "paused", done: "done", stopped: "stopped", interrupted: "cut off", failed: "failed" };
+
+// What can be done with a request of the Images or the Video window (2.17.0): pause it where it is and resume it,
+// stop it (what is finished is kept), continue one that was stopped, cut off by closing the app, or failed (only
+// what is missing is made), and take a finished one off the list.
+export function WorkButtons({ base, job, onForget }: { base: string; job: any; onForget?: () => void }) {
+  const { toast } = useApp();
+  const act = (what: string) => api.post(`${base}/jobs/${job.id}/${what}`).catch((e: any) => toast(e.message, "error"));
+  const live = job.state === "running" || job.state === "paused";
+  return (
+    <div className="row gap-s">
+      {job.state === "running" && job.can_pause && <Button small icon={<Pause size={12} />} onClick={() => act("pause")} title="Freeze it where it is: the computer is free for something else, and it goes on from the same place">Pause</Button>}
+      {job.state === "paused" && <Button small kind="primary" icon={<Play size={12} />} onClick={() => act("resume")} title="Go on from where it was">Resume</Button>}
+      {live && <Button small icon={<Square size={12} />} onClick={() => api.del(`${base}/jobs/${job.id}`)} title="End it. What is finished is kept, and it can be continued later">Stop</Button>}
+      {!live && <Badge kind={job.state === "done" ? "ok" : job.state === "failed" ? "bad" : "neutral"}>{WORK_STATE[job.state] || job.state}</Badge>}
+      {!live && job.can_continue && <Button small kind="primary" icon={<RotateCw size={12} />} onClick={() => act("continue")} title="Go on with it: what was finished is kept, only what is missing is made">Continue</Button>}
+      {!live && <button className="icon-btn" title="Take it off this list (what it made stays in the Library)" onClick={() => act("forget").then(() => onForget && onForget())}><X size={13} /></button>}
+    </div>
+  );
+}
+
+// What a request says under its title: the step it is on, that it is paused, or how it ended.
+export function WorkNote({ job, pauseStop }: { job: any; pauseStop?: number }) {
+  if (job.state === "running") return <div className="note"><Spinner size={14} /> {job.text}</div>;
+  if (job.state === "paused") return (
+    <div className="stack-s">
+      <div className="note"><Pause size={14} /> <span>Paused at: {job.text}</span></div>
+      <div className="small muted">Its engine is frozen where it is and keeps its memory. Resume lets it go on from the same place{pauseStop ? `; after ${pauseStop} minutes of pause it is stopped to free that memory, and can be continued later` : ""}.</div>
+    </div>
+  );
+  if ((job.state === "stopped" || job.state === "interrupted") && job.text) return <div className="small muted">{job.text}</div>;
+  return null;
 }
 
 // One task, kept live: the row, its trail, its plan, its last sign of life.
@@ -206,18 +257,19 @@ export function WorkDetail({ id, onClose }: { id: string; onClose: () => void })
   return (
     <Modal wide title={job.title} onClose={onClose} footer={<>
       {job.chat_id && <Button onClick={() => { onClose(); go("chat", job.chat_id); }}>Open the chat</Button>}
+      <PauseButton job={job} />
       {running && <Button kind="danger" onClick={() => api.post(`/jobs/${job.id}/cancel`)}>Stop</Button>}
       <Button kind="primary" onClick={onClose}>Close</Button>
     </>}>
       <div className="work">
         <div className="row gap-s wrap">
-          {STATUS_ICON[job.status] || STATUS_ICON.queued}<b>{STATUS_NAME[job.status] || job.status}</b>
+          {job.paused ? <Pause size={15} className="muted" /> : STATUS_ICON[job.status] || STATUS_ICON.queued}<b>{job.paused ? "paused" : STATUS_NAME[job.status] || job.status}</b>
           <Badge>{KIND_NAME[job.kind] || job.kind}</Badge>
           {job.harness && <Badge>{job.harness}</Badge>}
           <span className="small muted">{began ? `started ${stamp(began)}` : ""}{took >= 1 ? ` · ${running ? "running for" : "took"} ${span(took)}` : ""}{job.model ? ` · ${job.model}` : ""}</span>
-          <Pulse seenAt={seenAt} running={job.status === "running"} long now={now} pace={pace} />
+          <Pulse seenAt={seenAt} running={job.status === "running" && !job.paused} long now={now} pace={pace} />
         </div>
-        {running && now && <div className="work-now"><Loader2 size={14} className="spin accent" /><span>{now}</span></div>}
+        {running && now && <div className="work-now">{job.paused ? <Pause size={14} className="muted" /> : <Loader2 size={14} className="spin accent" />}<span>{job.paused ? `Paused at: ${now}` : now}</span></div>}
         {running && fraction != null && <div className="run-bar"><span style={{ width: `${Math.max(2, Math.round(fraction * 100))}%` }} /></div>}
         {job.status === "waiting" && <div className="work-now"><ShieldCheck size={14} className="warn" /><span>It waits for your approval{job.chat_id ? ": open the chat to answer." : "."}</span></div>}
         {job.error && <div className="bad small">{job.error}</div>}
@@ -243,7 +295,7 @@ export function WorkDetail({ id, onClose }: { id: string; onClose: () => void })
 
 // Inside a job card (Images, Sound, Video): how long it has been on this step, whether it still reports, and a way
 // to open the whole task.
-export function WorkLine({ jobId, running, since }: { jobId?: string; running: boolean; since?: number }) {
+export function WorkLine({ jobId, running, since, paused }: { jobId?: string; running: boolean; since?: number; paused?: boolean }) {
   const [open, setOpen] = useState(false);
   const [seenAt, setSeenAt] = useState<number | null>(since || Date.now());
   const [stepAt, setStepAt] = useState<number>(Date.now());
@@ -258,8 +310,8 @@ export function WorkLine({ jobId, running, since }: { jobId?: string; running: b
   if (!jobId) return null;
   return (
     <span className="work-line">
-      {running && <span className="small muted">{span((Date.now() - stepAt) / 1000)} on this step</span>}
-      <Pulse seenAt={seenAt} running={running} pace={pace} />
+      {running && !paused && <span className="small muted">{span((Date.now() - stepAt) / 1000)} on this step</span>}
+      {paused ? <PausedMark /> : <Pulse seenAt={seenAt} running={running} pace={pace} />}
       <button className="link" onClick={() => setOpen(true)}><Eye size={13} /> {running ? "What is it doing?" : "What it did"}</button>
       {open && <WorkDetail id={jobId} onClose={() => setOpen(false)} />}
     </span>

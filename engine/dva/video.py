@@ -34,6 +34,7 @@ from .images import step_line, step_time
 from .jobs import turn
 from .providers import cloud_id, month_key
 from .sound import SoundError, read_pcm, slug, srt
+from .work import OPEN, Works, watch
 
 RATE = 44100
 FPS = 24
@@ -271,8 +272,9 @@ def sample(path, start, end, fps, size, fit=contain):
             n += 1
 
 
-def write_video(dest, frames, fps, size, audio=None, total=0, progress=None, stop=None):
-    """Encode frames (PIL pictures) and sound (float32 samples (n, 2) at 44.1 kHz, or None) into an .mp4."""
+def write_video(dest, frames, fps, size, audio=None, total=0, progress=None, stop=None, hold=None):
+    """Encode frames (PIL pictures) and sound (float32 samples (n, 2) at 44.1 kHz, or None) into an .mp4.
+    `hold()` returns when the work may go on: it is how a pause reaches the encoder, between two frames."""
     import av
     import numpy as np
     w, h = size
@@ -313,6 +315,8 @@ def write_video(dest, frames, fps, size, audio=None, total=0, progress=None, sto
                     box.mux(packet)
         n = 0
         for img in frames:
+            if hold:
+                hold()
             if stop and stop():
                 raise Stopped()
             frame = av.VideoFrame.from_image(img if img.size == (w, h) else img.resize((w, h)))
@@ -373,8 +377,9 @@ class Video:
     def __init__(self, app):
         self.app = app
         self.db = app.db
-        self.jobs = {}       # the Video window's own view of its requests (the tasks themselves are in app.jobs)
-        self.tasks = {}
+        # the Video window's requests, kept so that they outlive the app and can be continued (2.17.0); the
+        # tasks themselves are in app.jobs
+        self.work = Works(app, "video", "video_job")
         self.downloads = {}
 
     # ------------------------------------------------------------------ what there is
@@ -418,7 +423,8 @@ class Video:
 
     def status(self):
         return {"can": self.can(), "online": self.online(), "models": self.models(), "recipes": self.recipes(),
-                "engine": bool(self.app.images.engines()), "jobs": list(self.jobs.values())[-8:],
+                "engine": bool(self.app.images.engines()), "jobs": self.work.list(8),
+                "pause_stop_minutes": self.db.setting("pause_stop_minutes", 20),
                 "shapes": {k: list(v) for k, v in SHAPES.items()},
                 "timeout_minutes": self.db.setting("video_timeout_minutes", 240),
                 "notes": {"openai": "OpenAI's video service (Sora) ended in September 2026: it is not offered.",
@@ -590,15 +596,19 @@ class Video:
 
     # ------------------------------------------------------------------ 1. the assembled video
     async def make(self, scenes, *, out_dir, title="", shape="landscape", voice=None, music=None, captions=True,
-                   motion=True, chat_id=None, job_id=None, on_status=None):
+                   motion=True, chat_id=None, job_id=None, on_status=None, keep=None, on_picture=None, made=()):
         """Build a video from scenes: [{"narration", "picture" (a description: the image model makes it), "image" (a
         picture file, used as it is), "caption", "seconds" (for a scene without narration)}]. `music` is a
-        recording's path, a description (the music model makes it), or None. Returns the video's record."""
+        recording's path, a description (the music model makes it), or None. Returns the video's record.
+
+        A video that is stopped or fails half-way can be continued (2.17.0): `on_picture(i, record)` hears of
+        each scene's picture when it is made (the caller puts it into the scene, so it is not made again);
+        `keep` is a folder that outlives this call, where the narration of each scene and the music made for the
+        video stay until the video is done; `made` names the pictures made in earlier attempts."""
         import numpy as np
         status, track = self.app.jobs.reporter(on_status, job_id)
-        scenes = [dict(s) for s in scenes or [] if isinstance(s, dict)
-                  and (str(s.get("narration") or "").strip() or s.get("image") or str(s.get("picture") or "").strip()
-                       or str(s.get("caption") or "").strip())][:40]
+        ctl = self.app.jobs.control(job_id)
+        scenes = [dict(s) for s in real_scenes(scenes)]
         if not scenes:
             raise VideoError("A video needs at least one scene: a narration, a picture, or both.")
         size = SHAPES.get(shape) or SHAPES["landscape"]
@@ -627,10 +637,23 @@ class Video:
             track.note("Note: " + note + ".")
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        work = self.app.paths.data / "tmp" / new_id("vid_")
-        work.mkdir(parents=True)
+        work = Path(keep) if keep else self.app.paths.data / "tmp" / new_id("vid_")
+        work.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
-        made_pictures = []
+        made_pictures = list(made)
+
+        def kept(name, **same):
+            """What an earlier attempt left in the work folder for this part, if it was made from the same."""
+            try:
+                old = json.loads((work / name).read_text(encoding="utf-8")) if keep else None
+            except (OSError, ValueError):
+                return None
+            return old if old and all(old.get(k) == v for k, v in same.items()) and Path(str(old.get("path"))).is_file() else None
+
+        def remember(name, **facts):
+            if keep:
+                (work / name).write_text(json.dumps(facts, ensure_ascii=False, default=str), encoding="utf-8")
+            return facts
         try:
             # pictures
             if draw:
@@ -643,6 +666,7 @@ class Video:
                     continue
                 wanted = str(s.get("picture") or "").strip()
                 if wanted and draw:
+                    await ctl.wait()                         # paused: the next picture waits
                     status(f"Picture {i + 1} of {len(scenes)}: {wanted[:70]}")
                     try:
                         records = await self.app.images.generate(wanted, out_dir=out_dir / "scenes", width=even(size[0] * 0.8) // 16 * 16,
@@ -650,6 +674,8 @@ class Video:
                                                                  job_id=job_id, on_status=on_status)
                         s["image"] = records[0]["path"]
                         made_pictures.append(records[0]["name"])
+                        if on_picture:
+                            on_picture(i, records[0])
                     except Exception as exc:                 # one picture that fails does not lose the video
                         track.note(f"Scene {i + 1}: the picture could not be made ({str(exc)[:200]}); a title card is used.")
             if made_pictures:                                # the plan keeps the sum, not the last picture's details
@@ -665,13 +691,21 @@ class Video:
                 length = float(s.get("seconds") or 0)
                 s["_start"], s["_captions"] = at, []
                 if said and speak:
-                    status(f"Narration {i + 1} of {len(scenes)}…")
-                    rec = await self.app.sound.speak(said, out_dir=work, voice=voice, fmt="wav", name=f"scene-{i + 1}",
-                                                     chat_id=None, job_id=job_id, on_status=on_status)
+                    await ctl.wait()
+                    rec = kept(f"scene-{i + 1}.json", said=said, voice=voice or None)
+                    if rec:
+                        status(f"Narration {i + 1} of {len(scenes)}: recorded before, used as it is")
+                    else:
+                        status(f"Narration {i + 1} of {len(scenes)}…")
+                        new = await self.app.sound.speak(said, out_dir=work, voice=voice, fmt="wav", name=f"scene-{i + 1}",
+                                                         chat_id=None, job_id=job_id, on_status=on_status)
+                        rec = remember(f"scene-{i + 1}.json", said=said, voice=voice or None, path=new["path"],
+                                       params=new["params"], model_name=new.get("model_name"))
+                        # the scene's voice lives on in the video (and, until that is done, in the work folder)
+                        self.app.sound.forget(new["id"], delete_file=False)
                     samples = await asyncio.to_thread(read_pcm, rec["path"], RATE, 2)
                     cast = rec["params"].get("voices") or []
                     voices = voices or [str(v) for v in (cast.values() if isinstance(cast, dict) else cast)] or [rec.get("model_name") or ""]
-                    self.app.sound.forget(rec["id"], delete_file=True)       # the scene's voice lives on in the video
                     lead = 0.3
                     audio = place(audio, samples, at + lead)
                     spoken = len(samples) / RATE
@@ -702,12 +736,19 @@ class Video:
                 tune_path = Path(str(music))
                 if not tune_path.is_file():
                     track.at("Make the music")
-                    status("Making the music…")
+                    await ctl.wait()
+                    length = min(60, max(15, int(total)))
                     try:
-                        rec = await self.app.sound.music(str(music), out_dir=work, seconds=min(60, max(15, int(total))),
-                                                         instrumental=True, chat_id=None, job_id=job_id, on_status=on_status)
+                        rec = kept("music.json", asked=str(music), seconds=length)
+                        if rec:
+                            status("The music was made before: used as it is")
+                        else:
+                            status("Making the music…")
+                            new = await self.app.sound.music(str(music), out_dir=work, seconds=length,
+                                                             instrumental=True, chat_id=None, job_id=job_id, on_status=on_status)
+                            rec = remember("music.json", asked=str(music), seconds=length, path=new["path"])
+                            self.app.db.delete("media", new["id"])
                         tune_path, music_name = Path(rec["path"]), "made for this video"
-                        self.app.db.delete("media", rec["id"])
                     except Exception as exc:
                         tune_path = None
                         track.note(f"The music could not be made ({str(exc)[:200]}); the video has none.")
@@ -727,6 +768,7 @@ class Video:
                 need = int(total * RATE)
                 audio = audio[:need] if len(audio) >= need else np.concatenate([audio, np.zeros((need - len(audio), 2), dtype="float32")])
             # together
+            await ctl.wait()
             track.at("Put it together")
             dest = out_dir / f"{slug(title)[:40]}-{time.strftime('%Y%m%d-%H%M%S')}.mp4"
             frames_total = sum(max(1, round(s["seconds"] * FPS)) for s in scenes)
@@ -742,7 +784,8 @@ class Video:
             if all_captions:
                 dest.with_suffix(".srt").write_text(srt(all_captions), encoding="utf-8")
         finally:
-            shutil.rmtree(work, ignore_errors=True)
+            if not keep:                                     # a kept folder is cleared by whoever keeps it
+                shutil.rmtree(work, ignore_errors=True)
         params = {"mode": "assembled", "title": title, "seconds": round(total, 2), "width": size[0], "height": size[1],
                   "scenes": [{"narration": str(s.get("narration") or ""), "picture": str(s.get("picture") or ""),
                               "image": s.get("image"), "caption": str(s.get("caption") or ""), "seconds": s["seconds"]} for s in scenes],
@@ -757,6 +800,7 @@ class Video:
         loop = asyncio.get_running_loop()
         stop = {"now": False}
         last = [0.0]
+        ctl = self.app.jobs.control(job_id)
 
         def progress(n, of):
             if time.monotonic() - last[0] > 0.5 or n >= of:
@@ -767,7 +811,8 @@ class Video:
 
         def work():
             try:
-                write_video(dest, frames(), fps, size, audio, total, progress, lambda: stop["now"])
+                write_video(dest, frames(), fps, size, audio, total, progress, lambda: stop["now"],
+                            lambda: ctl.hold(lambda: stop["now"]))
             except Stopped:
                 Path(dest).unlink(missing_ok=True)       # a stopped video leaves no half file
         try:
@@ -933,7 +978,8 @@ class Video:
         track.stages(["Get ready", "Load the model", "Make the frames", "Save"])
         track.plan(clip={"prompt": prompt[:600], "model": row["name"], "where": "on this computer",
                          "engine": f"stable-diffusion.cpp ({backend})", "size": f"{width} × {height}", "frames": frames,
-                         "frames_a_second": fps, "steps": steps, "seed": seed, "limit": f"{minutes:g} minutes",
+                         "frames_a_second": fps, "steps": steps, "seed": seed,
+                         "limit": f"{minutes:g} minutes of work (pauses do not count)",
                          "files": {slot: Path(p).name for slot, p in (row.get("files") or {}).items()}})
         track.at("Get ready")
         need = int(sum(Path(p).stat().st_size for p in (row.get("files") or {}).values()) * 1.1) + int(2 * 2**30)
@@ -953,6 +999,7 @@ class Video:
         proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(exe.parent), env=env, stdout=asyncio.subprocess.PIPE,
                                                     stderr=asyncio.subprocess.STDOUT, creationflags=NO_WINDOW)
         tail, drawing = [], [False]
+        ctl = self.app.jobs.control(job_id)
 
         async def pump():
             buffer = b""
@@ -983,8 +1030,7 @@ class Video:
                             # a step of a clip takes minutes on a processor: that silence is normal
                             self.app.jobs.expect(job_id, per if n < total else max(300.0, per * 2))
         try:
-            await asyncio.wait_for(pump(), minutes * 60)
-            code = await proc.wait()
+            code = await watch(proc, pump(), minutes * 60, ctl)       # pauses do not count against the limit
             made = raw if raw.exists() else next(iter(sorted(work.glob("clip*.avi")) + sorted(work.glob("clip*.webm"))), None)
             if code != 0 or not made:
                 self.app.log(f"video engine ({backend}) exit {code}: " + " | ".join(tail[-12:]))
@@ -998,7 +1044,6 @@ class Video:
             await self._encode(dest, lambda: sample(made, 0.0, facts["seconds"] or frames / fps, rate, size), rate, size, None,
                                int((facts["seconds"] or frames / fps) * rate), status, job_id)
         except asyncio.TimeoutError:
-            proc.kill()
             raise VideoError(f"{row['name']} worked for longer than the limit of {minutes:g} minutes and was stopped. "
                              "Raise the limit in Video → Models, or make the video from pictures, voice and music instead.")
         except asyncio.CancelledError:
@@ -1067,26 +1112,41 @@ class Video:
         return dest, {"cost": online["cost"], "from_picture": str(image) if image else None}
 
     # ------------------------------------------------------------------ requests from the Video window
-    def start_job(self, kind, data):
-        """Runs in the background as a task; the window follows it through event `video_job`."""
+    def start_job(self, kind, data, job=None):
+        """Runs in the background as a task; the window follows it through event `video_job`. With `job`, a
+        request that was stopped, cut off or failed is continued: a video from scenes keeps the pictures, the
+        narration and the music it had made and goes on with what is missing; a clip is made again from its
+        first step with the same seed (the engine cannot start in the middle); a change to a video and a
+        storyboard are done again."""
         titles = {"storyboard": "Write the scenes: ", "make": "Video: ", "edit": "Change a video: ", "clip": "Clip: "}
-        what = str(data.get("title") or data.get("idea") or data.get("prompt") or Path(str(data.get("source") or (
-            (data.get("clips") or [{}])[0].get("path") if isinstance((data.get("clips") or [{}])[0], dict) else (data.get("clips") or [""])[0])
-            or "")).name or ", ".join(Path(str(s)).name for s in data.get("sources") or []) or "video")
-        job = {"id": new_id("vid_"), "what": kind, "state": "running", "text": "Starting…", "result": None, "error": None,
-               "title": what[:120], "started": now()}
-        self.jobs[job["id"]] = job
-        for old in list(self.jobs)[:-16]:
-            if self.jobs[old]["state"] != "running":
-                self.jobs.pop(old)
-        publish = lambda: self.app.bus.publish("video_job", **job)        # noqa: E731
+        if job is None:
+            data = dict(data)
+            if kind == "make":
+                data["scenes"] = [dict(s) for s in real_scenes(data.get("scenes"))]
+            if kind == "clip" and data.get("seed") in (None, "", -1):     # kept, so that continuing makes the same clip
+                data["seed"] = random.randint(1, 2**31 - 1)
+            what = str(data.get("title") or data.get("idea") or data.get("prompt") or Path(str(data.get("source") or (
+                (data.get("clips") or [{}])[0].get("path") if isinstance((data.get("clips") or [{}])[0], dict) else (data.get("clips") or [""])[0])
+                or "")).name or ", ".join(Path(str(s)).name for s in data.get("sources") or []) or "video")
+            job = self.work.new(kind, what[:120], data, result=None, made=[])
+        else:
+            kind, data = job["what"], job["request"]
+            job.update(state="running", text="Continuing…", error=None)
+        works = self.work
 
         def status(text):
-            job["text"] = text
-            publish()
+            works.tell(job, text)
+
+        def picture(i, record):
+            """A scene's picture is made: it goes into the scene, so that continuing does not make it again."""
+            if i < len(data.get("scenes") or []):
+                data["scenes"][i]["image"] = record["path"]
+            job["made"] = [*(job.get("made") or []), record["name"]]
+            works.save(job)
 
         async def run(jid):
-            job["job_id"] = jid
+            works.bind(job, jid)
+            works.save(job, job_id=jid)
             out = self.folder()
             try:
                 if kind == "storyboard":
@@ -1095,10 +1155,15 @@ class Video:
                                                           style=data.get("style") or "", model=data.get("model"),
                                                           job_id=jid, on_status=status)
                 elif kind == "make":
+                    if job.get("made"):
+                        n = len(job["made"])
+                        self.app.jobs.trail(jid, f"Continuing: the pictures of {n} scene{'s' if n != 1 else ''} exist already "
+                                                 "and are kept", "note")
                     job["result"] = await self.make(data.get("scenes") or [], out_dir=out, title=data.get("title") or "",
                                                     shape=data.get("shape") or "landscape", voice=data.get("voice") or None,
                                                     music=data.get("music") or None, captions=data.get("captions", True),
-                                                    motion=data.get("motion", True), job_id=jid, on_status=status)
+                                                    motion=data.get("motion", True), job_id=jid, on_status=status,
+                                                    keep=works.folder(job["id"]), on_picture=picture, made=job.get("made") or [])
                 elif kind == "edit":
                     job["result"] = await self.edit(data.get("source") or None, clips=data.get("clips") or None, out_dir=out,
                                                     start=data.get("start"), end=data.get("end"), mute=bool(data.get("mute")),
@@ -1111,26 +1176,37 @@ class Video:
                                                     seed=data.get("seed"), job_id=jid, on_status=status)
                 else:
                     raise VideoError(f"Unknown kind of video job: {kind}")
-                job.update(state="done", text="Done")
+                works.ended(job, "done", text="Done")
             except asyncio.CancelledError:
-                job.update(state="stopped", text="Stopped")
+                kept = len(job.get("made") or [])
+                works.ended(job, "stopped", text=self.app.jobs.why(jid) or (
+                    "Stopped" + (f": the pictures of {kept} scene{'s' if kept != 1 else ''} are kept" if kept else "")))
                 raise
             except Exception as exc:
-                job.update(state="failed", text="", error=str(exc)[:500])
+                works.ended(job, "failed", text="", error=str(exc)[:500])
                 raise
-            finally:
-                self.tasks.pop(job["id"], None)
-                publish()
             r = job["result"] or {}
             return {"media": [r]} if r.get("path") else {"text": json.dumps(r, ensure_ascii=False)[:1500]}
-        row = self.app.jobs.create("video", titles.get(kind, "Video: ") + job["title"], lambda r: run(r["id"]), payload={"what": kind})
+        row = self.app.jobs.create("video", titles.get(kind, "Video: ") + job["title"], lambda r: run(r["id"]),
+                                   payload={"what": kind, "work": job["id"]})
         job["job_id"] = row["id"]
-        self.tasks[job["id"]] = row["id"]
-        return job
+        return works.view(job)
+
+    def continue_job(self, job_id):
+        job = self.work.get(job_id)
+        if job["state"] not in OPEN:
+            raise ValueError("Only a request that was stopped, cut off or failed can be continued")
+        return self.start_job(job["what"], None, job)
 
     def stop_job(self, job_id):
-        if job_id in self.tasks:
-            self.app.jobs.cancel(self.tasks[job_id])
+        self.work.stop(job_id)
+
+
+def real_scenes(scenes):
+    """The scenes that say anything (a narration, a picture, a caption), at most 40."""
+    return [s for s in scenes or [] if isinstance(s, dict)
+            and (str(s.get("narration") or "").strip() or s.get("image") or str(s.get("picture") or "").strip()
+                 or str(s.get("caption") or "").strip())][:40]
 
 
 def read_srt(path):

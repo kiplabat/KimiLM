@@ -39,6 +39,7 @@ from .jobs import turn
 from .download import DownloadStalled, download, fetch_json
 from .forecast import pretty_seconds
 from .providers import cloud_id, month_key
+from .work import OPEN, Control, Works, watch
 
 HF = "https://huggingface.co"
 EXE = "sd-cli.exe" if os.name == "nt" else "sd-cli"
@@ -209,8 +210,8 @@ class Images:
         self.lock = asyncio.Lock()            # one picture job at a time: they are heavy
         self.installing = {}                  # backend -> state
         self.downloads = {}                   # recipe key -> state
-        self.jobs = {}                        # requests from the Images window: id -> state
-        self.tasks = {}                       # id -> the asyncio task (to stop it)
+        # requests from the Images window, kept so that they outlive the app and can be continued (2.17.0)
+        self.work = Works(app, "images", "image_job")
         versions = json.loads(Path(__file__).with_name("versions.json").read_text(encoding="utf-8"))
         self.tag, self.repo = versions["sd_cpp_tag"], versions["sd_cpp_repo"]
 
@@ -541,8 +542,9 @@ class Images:
                 "models": self.models(), "recipes": self.recipes(),
                 "online": [{"id": p, "name": s["name"], "ready": self.app.providers.ready(p)} for p, s in ONLINE.items()],
                 "default": (self.default_model() or {}).get("id"),
-                "jobs": list(self.jobs.values())[-6:],
+                "jobs": self.work.list(8),
                 "timeout_minutes": self.db.setting("image_timeout_minutes", 60),
+                "pause_stop_minutes": self.db.setting("pause_stop_minutes", 20),
                 "claude": "Claude reads pictures but does not make them. A chat that runs on Claude can still ask "
                           "for pictures: they are made by the image model chosen here."}
 
@@ -576,9 +578,14 @@ class Images:
 
     async def generate(self, prompt, *, model=None, out_dir, negative="", width=None, height=None, steps=None,
                        cfg=None, seed=None, count=1, image=None, mask=None, strength=None, chat_id=None,
-                       job_id=None, on_status=None, effect=None, redraw=False):
+                       job_id=None, on_status=None, effect=None, redraw=False, skip=0, on_picture=None):
         """Make `count` pictures from a prompt; with `image`, change that picture instead (optionally only where
         `mask` is white). Returns the records of the saved pictures.
+
+        Each picture is saved and recorded when it is finished, and `on_picture(record)` hears of it then: work
+        that is stopped or fails keeps what it made. `skip` continues such work: that many pictures of the
+        `count` exist already, so only the others are made, with the seeds they would have had (picture i of a
+        request is drawn with seed + i).
 
         A change that is an image operation (a glow on the outline, black and white, another size: effects.py)
         is done in code, with no model: `effect` names one, and an instruction that asks for nothing else is
@@ -592,7 +599,10 @@ class Images:
             if asked and asked[0] not in effects.NAMES:
                 raise ImageError(f"There is no effect called {asked[0]!r}. There are: {', '.join(effects.NAMES)}.")
             if asked:
-                return await self._effect(image, prompt, asked[0], asked[1], Path(out_dir), chat_id, job_id, on_status)
+                done = await self._effect(image, prompt, asked[0], asked[1], Path(out_dir), chat_id, job_id, on_status)
+                for record in done if on_picture else []:
+                    on_picture(record)
+                return done
         row = self.get(model) if model else self.default_model()
         if not row and model:      # by name, as an agent would say it
             row = next((m for m in self.models() if model.lower() in (m["name"].lower(), m["remote_id"].lower())), None)
@@ -607,6 +617,7 @@ class Images:
                 "the image engine is not installed (Images → Engine)" if row["kind"] == "local" else
                 "its provider has no key (Models → Online)"))
         count = max(1, min(4, int(count or 1)))
+        skip = max(0, min(count - 1, int(skip or 0)))
         s = row.get("settings") or {}
         swapped = None
         if image and not mask and not redraw and row["kind"] == "local" and s.get("edit") != "reference" \
@@ -639,21 +650,42 @@ class Images:
         track.plan(picture={"prompt": prompt[:600], "model": row["name"],
                             "where": "on this computer" if row["kind"] == "local" else f"online ({row.get('provider')})",
                             "size": f"{width} × {height}", "count": count,
+                            "already_made": skip or None,
                             "from_picture": Path(image).name if image else None, "mask": Path(mask).name if mask else None})
-        if row["kind"] == "online":
-            track.at("Ask the model")
-            paths, params = await self._online(row, prompt, out_dir, width, height, count, image, mask, status, chat_id, job_id)
-        else:
-            async with turn(self.lock, status, "Waiting for another picture on this computer to finish…"):
-                paths, params = await self._local(row, prompt, out_dir, negative, width, height, steps, cfg, seed, count,
-                                                  image, mask, strength, status, track)
-        params["seconds"] = round(time.monotonic() - started, 1)
+        records = []
+
+        def keep(path, params, index):
+            """A finished picture: in the library at once, whatever happens to the ones after it."""
+            record = self._record(path, row, prompt, {**params, "index": index}, chat_id, row["kind"])
+            records.append(record)
+            self.app.bus.publish("images_changed")
+            if on_picture:
+                on_picture(record)
+
+        # only work on this computer can be paused: what an online model is doing cannot be held up from here
+        ctl = self.app.jobs.control(job_id) if row["kind"] == "local" else Control()
+        await ctl.wait()
+        try:
+            if row["kind"] == "online":
+                track.at("Ask the model")
+                paths, params = await self._online(row, prompt, out_dir, width, height, count - skip, image, mask, status,
+                                                   chat_id, job_id)
+                params["seconds"] = round(time.monotonic() - started, 1)
+                for i, path in enumerate(paths):
+                    keep(path, params, skip + i)
+            else:
+                async with turn(self.lock, status, "Waiting for another picture on this computer to finish…"):
+                    await self._local(row, prompt, out_dir, negative, width, height, steps, cfg, seed, count, image, mask,
+                                      strength, status, track, skip=skip, keep=keep, ctl=ctl)
+        except ImageError as exc:
+            if records:               # say what exists: whoever reads the failure can go on from there
+                raise ImageError(f"{exc} Before that, {len(records)} of the {count - skip} pictures asked for were "
+                                 "finished and are kept: " + ", ".join(r["path"] for r in records)) from exc
+            raise
         track.at("Save")
-        track.note(f"Saved {len(paths)} picture{'s' if len(paths) != 1 else ''} after {params['seconds']:g} seconds: "
-                   + ", ".join(Path(p).name for p in paths))
+        track.note(f"Saved {len(records)} picture{'s' if len(records) != 1 else ''} after "
+                   f"{time.monotonic() - started:.1f} seconds: " + ", ".join(r["name"] for r in records))
         self.db.update("image_models", row["id"], {"last_used": now()})
-        records = [self._record(p, row, prompt, {**params, "index": i}, chat_id, row["kind"]) for i, p in enumerate(paths)]
-        self.app.bus.publish("images_changed")
         return records
 
     async def _effect(self, image, prompt, name, settings, out_dir, chat_id, job_id, on_status):
@@ -697,53 +729,69 @@ class Images:
         row = self.default_model()
         return bool(row and row["kind"] == "local")
 
-    def start_job(self, data):
-        """A request from the Images window: runs in the background, reports through event `image_job`."""
-        job = {"id": new_id("img_"), "state": "running", "text": "Starting…", "prompt": str(data.get("prompt") or ""),
-               "model": data.get("model"), "images": [], "error": None, "started": now()}
-        self.jobs[job["id"]] = job
-        for old in list(self.jobs)[:-12]:
-            if self.jobs[old]["state"] != "running":
-                self.jobs.pop(old)
-        publish = lambda: self.app.bus.publish("image_job", **job)        # noqa: E731
+    def start_job(self, data, job=None):
+        """A request from the Images window: runs in the background, reports through event `image_job`. With
+        `job`, a request that was stopped, cut off or failed is continued: the pictures it made are kept and only
+        the others are made."""
+        if job is None:
+            data = dict(data)
+            if data.get("seed") in (None, "", -1):        # chosen now and kept, so that continuing draws the same pictures
+                data["seed"] = random.randint(1, 2**31 - 1)
+            job = self.work.new("edit" if data.get("image") else "picture", str(data.get("prompt") or ""), data,
+                                prompt=str(data.get("prompt") or ""), model=data.get("model"), images=[],
+                                count=max(1, min(4, int(data.get("count") or 1))))
+        else:
+            data = job["request"]
+            job["images"] = [r for r in job.get("images") or [] if Path(r["path"]).is_file()]
+            job.update(state="running", text="Continuing…", error=None)
+        works, have = self.work, len(job["images"])
 
         def status(text):
-            job["text"] = text
-            publish()
+            works.tell(job, text)
+
+        def made(record):
+            job["images"].append(record)
+            works.save(job)
 
         async def run(jid):
-            job["job_id"] = jid
+            works.bind(job, jid)
+            works.save(job, job_id=jid)
             try:
                 image = data.get("image") or None
                 if image and not Path(image).is_file():
                     raise ImageError(f"There is no picture at {image}")
-                job["images"] = await self.generate(
+                if have:
+                    self.app.jobs.trail(jid, f"Continuing: {have} of {job['count']} pictures exist already and are kept", "note")
+                await self.generate(
                     job["prompt"], model=data.get("model") or None, out_dir=self.app.paths.data / "images",
                     negative=str(data.get("negative") or ""), width=data.get("width"), height=data.get("height"),
                     steps=data.get("steps"), cfg=data.get("cfg"), seed=data.get("seed"), count=data.get("count") or 1,
                     image=image, mask=data.get("mask") or None, strength=data.get("strength"), on_status=status, job_id=jid,
-                    effect=data.get("effect") or None, redraw=bool(data.get("redraw")))
-                job.update(state="done", text="Done")
+                    effect=data.get("effect") or None, redraw=bool(data.get("redraw")), skip=have, on_picture=made)
+                works.ended(job, "done", text="Done")
             except asyncio.CancelledError:
-                job.update(state="stopped", text="Stopped")
+                kept = len(job["images"])
+                works.ended(job, "stopped", text=self.app.jobs.why(jid) or (
+                    "Stopped" + (f": {kept} of {job['count']} pictures are kept" if kept and job["count"] > 1 else "")))
                 raise
             except Exception as exc:
-                job.update(state="failed", text="", error=str(exc)[:500])
+                works.ended(job, "failed", text="", error=str(exc)[:500])
                 raise
-            finally:
-                self.tasks.pop(job["id"], None)
-                publish()
             return {"media": job["images"]}
         # a task of its own, so that Activity lists it and its trail can be read (2.14.0)
         row = self.app.jobs.create("images", ("Change a picture: " if data.get("image") else "Picture: ") + job["prompt"][:150],
-                                   lambda r: run(r["id"]), payload={"what": "edit" if data.get("image") else "picture"})
+                                   lambda r: run(r["id"]), payload={"what": job["what"], "work": job["id"]})
         job["job_id"] = row["id"]
-        self.tasks[job["id"]] = row["id"]
-        return job
+        return works.view(job)
+
+    def continue_job(self, job_id):
+        job = self.work.get(job_id)
+        if job["state"] not in OPEN:
+            raise ValueError("Only a request that was stopped, cut off or failed can be continued")
+        return self.start_job(None, job)
 
     def stop_job(self, job_id):
-        if job_id in self.tasks:
-            self.app.jobs.cancel(self.tasks[job_id])
+        self.work.stop(job_id)
 
     def forget(self, media_id, delete_file=False):
         row = self.db.get("media", media_id)
@@ -755,8 +803,14 @@ class Images:
         self.app.bus.publish("images_changed")
 
     async def _local(self, row, prompt, out_dir, negative, width, height, steps, cfg, seed, count, image, mask,
-                     strength, status, track=None):
+                     strength, status, track=None, skip=0, keep=None, ctl=None):
+        """Draw pictures skip+1 … count on this computer, one run of the image engine for each, so that a
+        finished picture is a file at once and nothing that is stopped, paused for too long or fails later can
+        take it away. (The engine saves a batch only when all of it is drawn; each run loads the model again,
+        which costs about as long as one more step.) Picture i is drawn with seed + i, as the engine does in a
+        batch. `keep(path, params, index)` hears of each picture."""
         track = track or self.app.jobs.track(None)
+        ctl = ctl or Control()
         backend, exe = self.choose_engine()
         if not exe:
             raise ImageError("The image engine is not installed. Open Images → Engine and install it.")
@@ -767,30 +821,28 @@ class Images:
         width, height = max(64, width // 16 * 16), max(64, height // 16 * 16)      # the models work in blocks of 16
         stamp = time.strftime("%Y%m%d-%H%M%S")
         name = f"{slug(prompt)[:32]}-{stamp}"
-        out = out_dir / (f"{name}-%02d.png" if count > 1 else f"{name}.png")
-        cmd = [str(exe)]
+        base = [str(exe)]
         for slot, path in (row.get("files") or {}).items():
-            cmd += [SLOT_FLAGS[slot], path]
-        cmd += ["-p", prompt, "-W", str(width), "-H", str(height), "--steps", str(steps), "--cfg-scale", f"{cfg:g}",
-                "-s", str(seed), "-b", str(count), "-o", str(out)]
+            base += [SLOT_FLAGS[slot], path]
+        base += ["-p", prompt, "-W", str(width), "-H", str(height), "--steps", str(steps), "--cfg-scale", f"{cfg:g}"]
         if negative:
-            cmd += ["-n", negative]
+            base += ["-n", negative]
         mode = "new"
         if image:
             if s.get("edit") == "reference" and not mask:      # a model that follows an instruction about a picture
-                cmd += ["-r", str(image)]
+                base += ["-r", str(image)]
                 mode = "edit"
             else:                                              # redraw the picture (or only its masked part)
-                cmd += ["-i", str(image), "--strength", f"{float(strength if strength not in (None, '') else 0.6):g}"]
+                base += ["-i", str(image), "--strength", f"{float(strength if strength not in (None, '') else 0.6):g}"]
                 mode = "redraw"
                 if mask:
-                    cmd += ["--mask", str(mask)]
+                    base += ["--mask", str(mask)]
                     mode = "inpaint"
         if width * height > 1024 * 1024:
-            cmd.append("--vae-tiling")                         # decode large pictures in tiles: far less memory
+            base.append("--vae-tiling")                        # decode large pictures in tiles: far less memory
         if self.db.setting("image_compute", "auto") == "cpu" and backend not in ("cpu", "custom"):
-            cmd += ["--backend", "cpu"]                        # a graphics-card build told to use the processor
-        cmd += shlex.split(str(s.get("args") or ""), posix=os.name != "nt")
+            base += ["--backend", "cpu"]                       # a graphics-card build told to use the processor
+        extra = shlex.split(str(s.get("args") or ""), posix=os.name != "nt")
         need = int(sum(Path(p).stat().st_size for p in (row.get("files") or {}).values()) * 1.1) + int(1.5 * 2**30)
         # how long a step took the last time this model drew here (seconds a step for a million pixels): the
         # estimate shown before the work starts, and how long a silence is normal while it draws
@@ -799,14 +851,16 @@ class Images:
         known = float((self.db.setting(speed_key, None) or {}).get("per_megapixel") or 0)
         guess = known * megapixels
         doing = steps if mode in ("new", "edit") else int(steps * float(strength if strength not in (None, "") else 0.6)) + 1
-        expected = (f"about {pretty_seconds(count * (doing + 1) * guess + 90)} for {count} picture"
-                    f"{'s' if count != 1 else ''} (a step took about {step_time(guess)} the last time)" if guess
+        todo = count - skip
+        expected = (f"about {pretty_seconds(todo * ((doing + 1) * guess + 90))} for {todo} picture"
+                    f"{'s' if todo != 1 else ''} (a step took about {step_time(guess)} the last time)" if guess
                     else "not known yet: this is the first picture this model makes here")
+        limit = float(self.db.setting("image_timeout_minutes", 60))
         track.plan(picture_run={"engine": f"stable-diffusion.cpp ({backend})", "mode": mode, "steps": steps, "guidance": cfg,
                                 "seed": seed, "size": f"{width} × {height}", "memory_needed": f"about {need / 2**30:.1f} GB",
                                 "files": {slot: Path(p).name for slot, p in (row.get("files") or {}).items()},
-                                "expected": expected,
-                                "limit": f"{self.db.setting('image_timeout_minutes', 60)} minutes"})
+                                "expected": expected, "limit": f"{limit:g} minutes of work (pauses do not count)",
+                                "pictures": f"{skip} of {count} exist already; making the other {todo}" if skip else None})
         track.at("Get ready")
         status("Making room in memory for the image model…")
         try:
@@ -819,84 +873,90 @@ class Images:
         env.pop("DVA_TOKEN", None)
         if os.name != "nt":
             env["LD_LIBRARY_PATH"] = f"{exe.parent}{os.pathsep}{env.get('LD_LIBRARY_PATH', '')}"
-        track.at("Load the model")
-        status(f"Loading {row['name']}…")
-        track.note("Started: " + " ".join(Path(c).name if (i == 0 or Path(c).is_absolute()) else c for i, c in enumerate(cmd)))
-        proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(exe.parent), env=env, stdout=asyncio.subprocess.PIPE,
-                                                    stderr=asyncio.subprocess.STDOUT, creationflags=NO_WINDOW)
-        tail = []
-        drawing, picture, paces = [False], [1], []
         beat = getattr(status, "beat", status)
-        which = lambda: f" picture {picture[0]} of {count}" if count > 1 else ""        # noqa: E731
+        paces, paths, worked = [], [], 0.0
+        for index in range(skip, count):
+            await ctl.wait()                                  # paused between two pictures: the next one waits
+            which = f" picture {index + 1} of {count}" if count > 1 else ""
+            out = out_dir / (f"{name}-{index + 1:02d}.png" if count > 1 else f"{name}.png")
+            cmd = base + ["-s", str(seed + index), "-b", "1", "-o", str(out)] + extra
+            track.at("Load the model")
+            status(f"Loading {row['name']}" + (f" for{which}" if which else "") + "…")
+            track.note("Started: " + " ".join(Path(c).name if (i == 0 or Path(c).is_absolute()) else c for i, c in enumerate(cmd)))
+            began = time.monotonic()
+            proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(exe.parent), env=env, stdout=asyncio.subprocess.PIPE,
+                                                        stderr=asyncio.subprocess.STDOUT, creationflags=NO_WINDOW)
+            tail, drawing = [], [False]
 
-        def draws():
-            """The engine has started to draw: the plan moves on, and a long silence is now normal."""
-            if not drawing[0]:
-                drawing[0] = True
-                track.at("Draw")
-            status(f"{row['name']}: drawing{which()}" + ("" if guess else
-                   " (how long a step takes on this computer shows after the first one)"))
-            # the first step also prepares the model: it took about twice as long as the others in a real run
-            track.expect(guess * 2.5 if guess else (600 if backend == "cpu" else 180))
+            def draws(which=which, drawing=drawing):
+                """The engine has started to draw: the plan moves on, and a long silence is now normal."""
+                if not drawing[0]:
+                    drawing[0] = True
+                    track.at("Draw")
+                status(f"{row['name']}: drawing{which}" + ("" if guess or paces else
+                       " (how long a step takes on this computer shows after the first one)"))
+                # the first step also prepares the model: it took about twice as long as the others in a real run
+                usual = guess or (sorted(paces)[len(paces) // 2] if paces else 0)
+                track.expect(usual * 2.5 if usual else (600 if backend == "cpu" else 180))
 
-        async def pump():
-            buffer = b""
-            while True:
-                chunk = await proc.stdout.read(512)
-                if not chunk:
-                    break
-                buffer += chunk
-                *lines, buffer = re.split(rb"[\r\n]", buffer)          # progress bars rewrite one line
-                for raw in lines:
-                    line = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw.decode("utf-8", "replace")).strip()
-                    if not line:
-                        continue
-                    tail.append(line)
-                    del tail[:-60]
-                    track.output(line)
-                    new_picture = PICTURE_LINE.search(line)
-                    if new_picture:
-                        picture[0] = int(new_picture.group(1))
-                        draws()
-                        continue
-                    step = step_line(line)
-                    if not step:
-                        continue
-                    n, total, per = step
-                    if not drawing[0]:
-                        draws()
-                    if per > 0:
-                        paces.append(per)
-                    # each step is a sign of life and moves the bar; the program's own lines keep every step
-                    text = (f"{row['name']}:{which()}{',' if count > 1 else ''} step {n} of {total}"
-                            + (f" · about {step_time(per)} a step" if per >= 5 else ""))
-                    beat(text)
-                    if track.id:
-                        self.app.jobs.progress(track.id, text, fraction=(picture[0] - 1 + n / total) / max(1, count))
-                    if n >= total:               # after the last step the picture is turned into pixels: silent too
-                        beat(f"{row['name']}: finishing{which()} (turning what was drawn into a picture file)…")
-                        track.expect(max(180.0, per * 2))
-                    else:
-                        track.expect(per)
-        try:
-            await asyncio.wait_for(pump(), float(self.db.setting("image_timeout_minutes", 60)) * 60)
-            code = await proc.wait()
-        except asyncio.TimeoutError:
-            proc.kill()
-            raise ImageError(f"{row['name']} worked for longer than the limit of "
-                             f"{self.db.setting('image_timeout_minutes', 60)} minutes and was stopped. Try a smaller "
-                             "picture or fewer steps, or raise the limit in Images.")
-        except asyncio.CancelledError:
-            proc.kill()
-            raise
-        track.expect(None)
+            async def pump(proc=proc, tail=tail, drawing=drawing, draws=draws, which=which, index=index):
+                buffer = b""
+                while True:
+                    chunk = await proc.stdout.read(512)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    *lines, buffer = re.split(rb"[\r\n]", buffer)          # progress bars rewrite one line
+                    for raw in lines:
+                        line = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw.decode("utf-8", "replace")).strip()
+                        if not line:
+                            continue
+                        tail.append(line)
+                        del tail[:-60]
+                        track.output(line)
+                        if PICTURE_LINE.search(line):
+                            draws()
+                            continue
+                        step = step_line(line)
+                        if not step:
+                            continue
+                        n, total, per = step
+                        if not drawing[0]:
+                            draws()
+                        if per > 0:
+                            paces.append(per)
+                        # each step is a sign of life and moves the bar; the program's own lines keep every step
+                        text = (f"{row['name']}:{which}{',' if count > 1 else ''} step {n} of {total}"
+                                + (f" · about {step_time(per)} a step" if per >= 5 else ""))
+                        beat(text)
+                        if track.id:
+                            self.app.jobs.progress(track.id, text, fraction=(index + n / total) / max(1, count))
+                        if n >= total:               # after the last step the picture is turned into pixels: silent too
+                            beat(f"{row['name']}: finishing{which} (turning what was drawn into a picture file)…")
+                            track.expect(max(180.0, per * 2))
+                        else:
+                            track.expect(per)
+            idle = ctl.paused_for()
+            try:
+                code = await watch(proc, pump(), max(1.0, limit * 60 - worked), ctl)
+            except asyncio.TimeoutError:
+                raise ImageError(f"{row['name']} worked for longer than the limit of {limit:g} minutes and was stopped. "
+                                 "Try a smaller picture or fewer steps, or raise the limit in Images.")
+            took = time.monotonic() - began - (ctl.paused_for() - idle)
+            worked += took
+            track.expect(None)
+            made = sorted(p for p in out_dir.glob(f"{out.stem}*") if p.suffix.lower() in IMAGE_EXT)
+            if code != 0 or not made:
+                self.app.log(f"image engine ({backend}) exit {code}: " + " | ".join(tail[-12:]))
+                raise ImageError(self._explain(tail, code, row))
+            paths.append(made[0])
+            if keep:
+                keep(made[0], {"mode": mode, "engine": backend, "width": width, "height": height, "steps": steps, "cfg": cfg,
+                               "seed": seed + index, "negative": negative, "source_image": str(image) if image else None,
+                               "seconds": round(took, 1)}, index)
         if len(paces) > 1 or (paces and not known):       # remember this computer's speed with this model
             usual = sorted(paces[1:] or paces)[len(paces[1:] or paces) // 2]
             self.db.set_setting(speed_key, {"per_megapixel": round(usual / megapixels, 2), "at": now()})
-        paths = sorted(p for p in out_dir.glob(f"{name}*") if p.suffix.lower() in IMAGE_EXT)
-        if code != 0 or not paths:
-            self.app.log(f"image engine ({backend}) exit {code}: " + " | ".join(tail[-12:]))
-            raise ImageError(self._explain(tail, code, row))
         return paths, {"mode": mode, "engine": backend, "width": width, "height": height, "steps": steps, "cfg": cfg,
                        "seed": seed, "negative": negative, "source_image": str(image) if image else None}
 
