@@ -244,8 +244,9 @@ def speak(job):
     segments = [s for s in job["segments"] if str(s.get("text") or "").strip()]
     if not segments:
         raise ValueError("There is nothing to say")
+    words = sum(len(s["text"].split()) for s in segments) or 1
+    spoken = 0
     for i, seg in enumerate(segments):
-        say(progress=i / len(segments), text=f"Speaking part {i + 1} of {len(segments)}")
         key = seg["model"]
         if key not in loaded:
             say(progress=i / len(segments), text="Loading the voice…")
@@ -254,8 +255,16 @@ def speak(job):
                 model["extra"] = extra_lexicon(model["dir"], [s["text"] for s in segments if s["model"] == key])
                 extras.append(model["extra"])
             loaded[key] = load_tts(model)
+        say(progress=spoken / words, text=f"Speaking part {i + 1} of {len(segments)}")
         tts = loaded[key]
         family = job["models"][key]["family"]
+        here = len(seg["text"].split())
+
+        def heard(samples, progress, i=i, spoken=spoken, here=here):
+            # the voice works through the text sentence by sentence: a sign of life (2.14.0), not a new step
+            say(beat=True, progress=(spoken + here * float(progress)) / words,
+                text=f"Speaking part {i + 1} of {len(segments)}: {round(100 * float(progress))}%")
+            return 1
         speed = float(seg.get("speed") or 1.0)
         if family == "pocket":
             ref = seg.get("ref_audio")
@@ -270,7 +279,11 @@ def speak(job):
             config.speed = speed
             audio = tts.generate(seg["text"], config)
         else:
-            audio = tts.generate(seg["text"], sid=int(seg.get("sid") or 0), speed=speed)
+            try:
+                audio = tts.generate(seg["text"], sid=int(seg.get("sid") or 0), speed=speed, callback=heard)
+            except TypeError:                     # a library version whose voices do not report as they go
+                audio = tts.generate(seg["text"], sid=int(seg.get("sid") or 0), speed=speed)
+        spoken += here
         samples = np.asarray(audio.samples, dtype="float32")
         if len(samples) == 0:
             raise ValueError(f"The voice gave no sound for: {seg['text'][:80]}")

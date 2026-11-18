@@ -41,6 +41,7 @@ import httpx
 from .db import new_id, now
 from .download import download, fetch_json
 from .images import HF, fetch, pick_file
+from .jobs import turn
 from .providers import cloud_id, month_key
 
 RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
@@ -425,7 +426,9 @@ class Sound:
             return state
         state = self.downloads[key] = {"key": key, "name": entry["name"], "state": "starting", "done": 0,
                                        "total": entry["mb"] * 2**20, "error": None, "cancel": False}
-        self.app.spawn(self._download(entry, state))
+        self.app.jobs.follow("download", "Download: " + entry["name"] + " (" + {"tts": "voice", "clone": "voice", "stt": "transcription", "music": "music"}.get(entry.get("role"), "sound") + " model)",
+                             self._download(entry, state), lambda: state, stop=lambda: state.update(cancel=True),
+                             payload={"what": "sound model", "key": key})
         return state
 
     def cancel_download(self, key):
@@ -626,7 +629,7 @@ class Sound:
         self.app.bus.publish("sound_changed")
 
     # ------------------------------------------------------------------ the worker process
-    async def _worker(self, job, status):
+    async def _worker(self, job, status, track=None):
         """Run one job in its own process and return its last message."""
         folder = self.app.paths.data / "tmp"
         folder.mkdir(exist_ok=True)
@@ -646,6 +649,8 @@ class Sound:
             async for raw in proc.stderr:
                 errors.append(raw.decode("utf-8", "replace").strip())
                 del errors[:-30]
+                if track and errors[-1] and "deprecated" not in errors[-1]:
+                    track.output(errors[-1])
         reader = asyncio.ensure_future(notes())
         try:
             async for raw in proc.stdout:
@@ -654,7 +659,10 @@ class Sound:
                 except ValueError:
                     continue
                 if last.get("text") and "done" not in last:
-                    status(last["text"])
+                    if last.get("beat"):          # the voice is at work: a sign of life, not a new step
+                        getattr(status, "beat", status)(last["text"])
+                    else:
+                        status(last["text"])
             await proc.wait()
             await reader
         except asyncio.CancelledError:
@@ -780,7 +788,7 @@ class Sound:
                     job_id=None, on_status=None):
         """Say `lines` ([{"text", "speaker", "voice", "style"}] or one text) and save one recording.
         `voices` maps speaker names to voices; a line's own "voice" wins; `voice` is used for the rest."""
-        status = on_status or (lambda text: None)
+        status, track = self.app.jobs.reporter(on_status, job_id)
         if isinstance(lines, str):
             lines = self.parse_script(lines)
         lines = [dict(ln) for ln in lines if str(ln.get("text") or "").strip()]
@@ -806,6 +814,12 @@ class Sound:
             cast[who or "Voice"] = v["name"]
             ln["_voice"] = v
         models = {m["id"]: m for m in self.models()}
+        track.stages(["Prepare the voices", "Speak", "Join and save"])
+        track.plan(speech={"voices": cast, "lines": len(lines), "words": sum(len(ln["text"].split()) for ln in lines),
+                           "models": sorted({models[ln["_voice"]["model"]]["name"] for ln in lines}),
+                           "where": "on this computer" if all(models[ln["_voice"]["model"]]["kind"] == "local" for ln in lines)
+                           else "online (in part)"})
+        track.at("Speak")
         # consecutive lines of the same kind are made together
         runs = []
         for ln in lines:
@@ -842,8 +856,8 @@ class Sound:
                             entry = next(c for c in CATALOG if c["key"] == m["id"])
                             seg["sid"] = next(x["sid"] for x in entry["voices"] if x["speaker"] == v["id"].split(":", 1)[1])
                         job["segments"].append(seg)
-                    async with self.lock:
-                        done = await self._worker(job, status)
+                    async with turn(self.lock, status, "Waiting for another sound job on this computer to finish…"):
+                        done = await self._worker(job, status, track)
                     marks.append(done.get("segments") or [])
                 else:
                     m = run["model"]
@@ -858,6 +872,7 @@ class Sound:
                     marks.append([{"start": 0.0, "end": length, "text": " ".join(x["text"] for x in run["lines"]),
                                    "speaker": run["lines"][0].get("speaker") or ""}])
                 files.append(part)
+            track.at("Join and save")
             status("Putting the recording together…")
             out_dir = Path(out_dir)
             stem = slug(name or lines[0]["text"])[:40] + "-" + time.strftime("%Y%m%d-%H%M%S")
@@ -889,7 +904,7 @@ class Sound:
     # ------------------------------------------------------------------ listening
     async def transcribe(self, audio, *, model=None, language="", out_dir=None, chat_id=None, job_id=None, on_status=None):
         """The words of a recording (or of a video's sound), with times. Returns {"text", "segments", "seconds"…}."""
-        status = on_status or (lambda text: None)
+        status, track = self.app.jobs.reporter(on_status, job_id)
         audio = Path(audio)
         if not audio.is_file():
             raise SoundError(f"There is no file at {audio}")
@@ -898,6 +913,9 @@ class Sound:
             raise SoundError("No transcription model is set up. Open Sound → Models and download Whisper for this "
                              "computer, or switch on an online one.")
         started = time.monotonic()
+        track.stages(["Read the recording", "Write down what is said", "Save the text"])
+        track.plan(transcription={"recording": audio.name, "model": row["name"], "language": language or "found by the model",
+                                  "where": "on this computer" if row["kind"] == "local" else "online"})
         if row["kind"] == "local":
             vad = self.folder() / "silero_vad.onnx"
             if not vad.exists():
@@ -905,11 +923,13 @@ class Sound:
                 await download(VAD_URL, vad)
             job = {"kind": "transcribe", "audio": str(audio), "vad": str(vad),
                    "model": {"family": row["family"], "dir": row["path"], "language": language or ""}}
-            async with self.lock:
-                done = await self._worker(job, status)
+            track.at("Write down what is said")
+            async with turn(self.lock, status, "Waiting for another sound job on this computer to finish…"):
+                done = await self._worker(job, status, track)
             result = {"text": done["text"], "segments": done["segments"], "seconds": done["seconds"]}
         else:
             conf = self._online_ok(row)
+            track.at("Write down what is said")
             status(f"Sending the recording to {row['name']}…")
             small = self.app.paths.data / "tmp" / f"{new_id('up_')}.mp3"       # small enough to send
             small = await asyncio.to_thread(lambda: write_audio(small, read_pcm(audio, 16000, 1), 16000))
@@ -940,6 +960,8 @@ class Sound:
                         "transcription")
             result = {"text": text, "segments": [], "seconds": length}
         result.update(model=row["name"], source=row["kind"], took=round(time.monotonic() - started, 1))
+        track.at("Save the text")
+        track.plan(transcript={"words": len(result["text"].split()), "seconds": result["seconds"], "text": result["text"][:1500]})
         if out_dir:
             folder = Path(out_dir)
             folder.mkdir(parents=True, exist_ok=True)
@@ -981,7 +1003,8 @@ class Sound:
         if getattr(self, "engine_installing", None):
             return
         src = self.engine_source()
-        state = self.engine_installing = {"state": "downloading", "done": 0, "total": 0, "cancel": False}
+        state = self.engine_installing = self.engine_last = {"state": "downloading", "done": 0, "total": 0, "cancel": False,
+                                                             "file": ACE_ASSET}
         publish = lambda **kw: self.app.bus.publish("music_engine", **kw)        # noqa: E731
         target = self.app.paths.data / "runtimes" / "acestep"
         archive = target.with_name(ACE_ASSET)
@@ -1001,6 +1024,7 @@ class Sound:
             tmp = target.with_name("acestep.tmp")
             shutil.rmtree(tmp, ignore_errors=True)
             tmp.mkdir(parents=True)
+            state.update(state="extracting")
             if archive.suffix == ".zip":
                 from .runtime import Runtime
                 await asyncio.to_thread(Runtime._extract, archive, tmp)
@@ -1018,9 +1042,11 @@ class Sound:
                 for name in (ACE_LM, ACE_SYNTH):
                     (target / name).chmod(0o755)
             self.db.set_setting("music_engine_tag", src["tag"])
+            state.update(state="done")
             publish(action="installed")
         except Exception as exc:
             self.app.log(f"music engine: {type(exc).__name__}: {exc}")
+            state.update(state="cancelled" if state["cancel"] else "failed", error=str(exc)[:500])
             publish(action="failed", error=str(exc)[:500])
         finally:
             self.engine_installing = None
@@ -1035,12 +1061,15 @@ class Sound:
         row = self.default("music")
         return bool(row and row["kind"] == "local")
 
-    async def _program(self, cmd, cwd, status, label, minutes):
+    async def _program(self, cmd, cwd, status, label, minutes, track=None):
         """Run one of the music programs to its end; returns its last lines. Stops it when the job is stopped."""
         env = {**os.environ}
         env.pop("DVA_TOKEN", None)
         if os.name != "nt":
             env["LD_LIBRARY_PATH"] = f"{cwd}{os.pathsep}{env.get('LD_LIBRARY_PATH', '')}"
+        status(f"{label}…")
+        if track:
+            track.note("Started: " + " ".join(Path(c).name if i == 0 else c for i, c in enumerate(cmd)))
         proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(cwd), env=env, stdout=asyncio.subprocess.PIPE,
                                                     stderr=asyncio.subprocess.STDOUT,
                                                     creationflags=0x08000000 if os.name == "nt" else 0)
@@ -1059,9 +1088,12 @@ class Sound:
                     if line:
                         tail.append(line)
                         del tail[:-40]
+                        if track:
+                            track.output(line)
                         m = re.match(r"\[([\w-]+)\]\s*(Step \d+)?", line)
                         if m:
-                            status(f"{label} ({int(time.monotonic() - began)} s{', ' + m.group(2).lower() if m.group(2) else ''})")
+                            getattr(status, "beat", status)(
+                                f"{label} ({int(time.monotonic() - began)} s{', ' + m.group(2).lower() if m.group(2) else ''})")
         try:
             await asyncio.wait_for(pump(), minutes * 60)
             code = await proc.wait()
@@ -1074,7 +1106,7 @@ class Sound:
             raise
         return code, tail
 
-    async def _music_local(self, row, prompt, seconds, instrumental, lyrics, language, seed, status):
+    async def _music_local(self, row, prompt, seconds, instrumental, lyrics, language, seed, status, track=None):
         engine = self.music_engine()
         if not engine:
             raise SoundError("The music engine is not installed (Sound → Voices & models → Music on this computer).")
@@ -1088,6 +1120,11 @@ class Sound:
         if language:
             request["vocal_language"] = language
         (work / "request.json").write_text(json.dumps(request), encoding="utf-8")
+        track = track or self.app.jobs.track(None)
+        track.stages(["Plan the piece", "Render the sound", "Save"])
+        track.plan(music={"model": row["name"], "where": "on this computer", "engine": engine["dir"],
+                          "programs": ["ace-lm plans the piece (structure, words, audio codes)", "ace-synth renders the sound"],
+                          "request": request})
         folder = Path(row["path"])
         need = int(sum(p.stat().st_size for p in folder.glob("*.gguf")) * 1.1) + 2**30
         minutes = float(self.db.setting("music_timeout_minutes", 90))
@@ -1098,13 +1135,15 @@ class Sound:
             except Exception:
                 pass
             exe = Path(engine["dir"])
+            track.at("Plan the piece")
             code, tail = await self._program([str(exe / ACE_LM), "--models", str(folder), "--request", str(work / "request.json")],
-                                             exe, status, "Planning the piece", minutes)
+                                             exe, status, "Planning the piece", minutes, track)
             planned = work / "request0.json"
             if code != 0 or not planned.exists():
                 raise SoundError(self._music_error(tail, code, "planning"))
+            track.at("Render the sound")
             code, tail = await self._program([str(exe / ACE_SYNTH), "--models", str(folder), "--request", str(planned)],
-                                             exe, status, "Rendering the sound", minutes)
+                                             exe, status, "Rendering the sound", minutes, track)
             made = next(iter(sorted(work.glob("request0*.mp3")) + sorted(work.glob("request0*.wav"))), None)
             if code != 0 or not made:
                 raise SoundError(self._music_error(tail, code, "rendering"))
@@ -1112,8 +1151,10 @@ class Sound:
                 plan = json.loads(planned.read_text(encoding="utf-8"))
             except ValueError:
                 plan = {}
+            track.plan(music_plan={k: plan[k] for k in ("bpm", "keyscale", "timesignature", "vocal_language", "lyrics") if plan.get(k)})
             keep = work.with_suffix(made.suffix)
             shutil.move(str(made), str(keep))
+            track.at("Save")
             words = plan.get("lyrics") or ""
             facts = {k: plan[k] for k in ("bpm", "keyscale", "timesignature", "vocal_language") if plan.get(k)}
             return keep, ("" if words.strip() == "[Instrumental]" else words), facts
@@ -1132,7 +1173,7 @@ class Sound:
     # ------------------------------------------------------------------ music
     async def music(self, prompt, *, out_dir, model=None, seconds=None, instrumental=False, lyrics="", chat_id=None,
                     job_id=None, on_status=None, language="", seed=None):
-        status = on_status or (lambda text: None)
+        status, track = self.app.jobs.reporter(on_status, job_id)
         prompt = (prompt or "").strip()
         if not prompt:
             raise SoundError("Describe the music: the style, the instruments, the mood, the tempo")
@@ -1142,8 +1183,8 @@ class Sound:
                              "download ACE-Step for this computer, or add an online music model (Google's Lyria).")
         if row["kind"] == "local":
             started = time.monotonic()
-            async with self.lock:
-                made, words, facts = await self._music_local(row, prompt, seconds, instrumental, lyrics, language, seed, status)
+            async with turn(self.lock, status, "Waiting for another sound job on this computer to finish…"):
+                made, words, facts = await self._music_local(row, prompt, seconds, instrumental, lyrics, language, seed, status, track)
             dest = Path(out_dir) / f"{slug(prompt)[:40]}-{time.strftime('%Y%m%d-%H%M%S')}{made.suffix}"
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(made), str(dest))
@@ -1179,13 +1220,17 @@ class Sound:
         return self._record(dest, prompt, row["name"], params, chat_id, "online")
 
     # ------------------------------------------------------------------ mixing
-    async def mix(self, tracks, *, out_dir, name="mix", fmt="mp3", length="first", fade=2.0, chat_id=None, keep=True):
+    async def mix(self, tracks, *, out_dir, name="mix", fmt="mp3", length="first", fade=2.0, chat_id=None, keep=True, job_id=None):
         """Lay recordings over each other: [{"path", "volume" (1 = as it is), "start" (seconds), "from" / "to" (the
         part of the recording to use), "fade_in", "fade_out", "mute"}]. `length` is "first" (as long as the first
         track, e.g. the voice, plus the fade) or "longest". `keep=False` makes a preview that is not put in the library."""
         tracks = [t for t in tracks or [] if not t.get("mute")]
         if not tracks:
             raise SoundError("Give the recordings to mix")
+        status, track = self.app.jobs.reporter(None, job_id)
+        track.plan(mix={"tracks": [{"file": Path(t["path"]).name, **{k: t[k] for k in ("start", "from", "to", "volume", "fade_in", "fade_out") if t.get(k)}}
+                                   for t in tracks], "length": length})
+        status(f"Mixing {len(tracks)} recording{'s' if len(tracks) != 1 else ''}…")
 
         def work():
             import numpy as np
@@ -1284,29 +1329,30 @@ class Sound:
             publish()
         out = self.app.paths.data / "sound"
 
-        async def run():
+        async def run(jid):
+            job["job_id"] = jid
             try:
                 if kind == "speak":
                     job["result"] = await self.speak(data.get("lines") or str(data.get("text") or ""), out_dir=out,
                                                      voice=data.get("voice"), voices=data.get("voices"),
                                                      speed=data.get("speed") or 1.0, fmt=data.get("format") or "mp3",
-                                                     name=data.get("name"), on_status=status)
+                                                     name=data.get("name"), on_status=status, job_id=jid)
                 elif kind == "transcribe":
                     job["result"] = await self.transcribe(data.get("audio"), model=data.get("model"),
                                                           language=data.get("language") or "", out_dir=out / "transcripts",
-                                                          on_status=status)
+                                                          on_status=status, job_id=jid)
                 elif kind == "music":
                     job["result"] = await self.music(data.get("prompt"), out_dir=out, model=data.get("model"),
                                                      seconds=data.get("seconds"), instrumental=bool(data.get("instrumental")),
                                                      lyrics=data.get("lyrics") or "", language=data.get("language") or "",
-                                                     seed=data.get("seed"), on_status=status)
+                                                     seed=data.get("seed"), on_status=status, job_id=jid)
                 elif kind == "podcast":
                     from . import podcast
                     job["result"] = await podcast.make(self.app, sources=data.get("sources") or [], text=data.get("text") or "",
                                                        minutes=data.get("minutes") or 5, style=data.get("style") or "conversation",
                                                        hosts=data.get("hosts"), voices=data.get("voices"),
                                                        focus=data.get("focus") or "", model=data.get("model"),
-                                                       music=bool(data.get("music")), out_dir=out, on_status=status)
+                                                       music=bool(data.get("music")), out_dir=out, on_status=status, job_id=jid)
                 elif kind == "mix":
                     preview = bool(data.get("preview"))                      # heard once, not kept in the library
                     if preview:
@@ -1315,27 +1361,33 @@ class Sound:
                     job["result"] = await self.mix(data.get("tracks") or [], name=data.get("name") or "mix",
                                                    out_dir=out / "previews" if preview else out,
                                                    fmt="wav" if preview else data.get("format") or "mp3",
-                                                   length=data.get("length") or "first", keep=not preview,
+                                                   length=data.get("length") or "first", keep=not preview, job_id=jid,
                                                    fade=float(2.0 if data.get("fade") is None else data["fade"]))
                 else:
                     raise SoundError(f"Unknown kind of sound job: {kind}")
                 job.update(state="done", text="Done")
             except asyncio.CancelledError:
                 job.update(state="stopped", text="Stopped")
+                raise
             except Exception as exc:
                 job.update(state="failed", text="", error=str(exc)[:500])
-                if not isinstance(exc, (SoundError, ValueError)):
-                    self.app.log(f"sound job: {type(exc).__name__}: {exc}")
+                raise
             finally:
                 self.tasks.pop(job["id"], None)
                 publish()
-        self.tasks[job["id"]] = self.app.spawn(run())
+            r = job["result"] or {}
+            return {"media": [r]} if r.get("path") else {"text": r.get("text", ""), "files": [r.get(k) for k in ("file", "subtitles") if r.get(k)]}
+        # a task of its own, so that Activity lists it and its trail can be read (2.14.0)
+        names = {"speak": "Speak", "transcribe": "Transcribe", "music": "Music", "mix": "Mix", "podcast": "Podcast"}
+        title = job["title"] if kind == "podcast" else f"{names.get(kind, kind)}: {job['title']}"
+        row = self.app.jobs.create("sound", title, lambda r: run(r["id"]), payload={"what": kind})
+        job["job_id"] = row["id"]
+        self.tasks[job["id"]] = row["id"]
         return job
 
     def stop_job(self, job_id):
-        task = self.tasks.get(job_id)
-        if task:
-            task.cancel()
+        if job_id in self.tasks:
+            self.app.jobs.cancel(self.tasks[job_id])
 
     def forget(self, media_id, delete_file=False):
         row = self.db.get("media", media_id)

@@ -1,0 +1,22 @@
+{
+  "name": "Video producer",
+  "description": "Makes videos: writes the scenes, has the pictures made and the narration spoken, adds captions and music, and puts it together on this computer. Also cuts, joins and subtitles existing videos. Works best with an image model (Images) and a voice (Sound); needs no video model.",
+  "type": "loop",
+  "mode": "agent",
+  "tools": [
+    "files",
+    "web",
+    "video",
+    "sound",
+    "images",
+    "vision",
+    "memory"
+  ],
+  "connectors": false,
+  "max_steps": 12,
+  "max_reply_tokens": 4096,
+  "temperature": 0.6,
+  "memory": true,
+  "learn": true,
+  "icon": "pen"
+}

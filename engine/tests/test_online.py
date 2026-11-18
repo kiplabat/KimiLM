@@ -377,6 +377,49 @@ def test_online_voices_transcription_and_music_with_openai_and_google(env):
 
 
 # ------------------------------------------------------------------------------------------- adapters, offline
+def test_a_clip_from_googles_video_model_asks_first_and_is_counted(env):
+    """2.14.0. OpenAI's video service ended in September 2026 and Google's Veo previews in October: the one online
+    video model is Google's gemini-omni on the interactions API."""
+    from test_engine import task_of, wait_video
+    c = env["c"]
+    state = c.get("/api/video").json()
+    assert state["online"]["key"] and not state["online"]["on"] and not state["can"]["clip_online"]
+    off = wait_video(c, c.post("/api/video/jobs", json={"kind": "clip", "prompt": "a kite"}).json())
+    assert off["state"] == "failed" and "No video model is set up" in off["error"]
+    state = c.post("/api/video/settings", json={"online": True, "cost": 0.5}).json()
+    assert state["can"]["clip_online"] and state["online"]["cost"] == 0.5
+    spent = c.get("/api/online/usage").json()["spent"]
+    job = c.post("/api/video/jobs", json={"kind": "clip", "prompt": "a kite over a green hill", "shape": "portrait"}).json()
+    made = wait_video(c, job)
+    assert made["state"] == "done", made
+    clip = made["result"]
+    assert clip["source"] == "online" and clip["path"].endswith(".mp4") and clip["params"]["cost"] == 0.5
+    assert clip["params"]["width"] == 320 and clip["params"]["seconds"] > 0.5 and "gemini-omni-1.1-flash" in clip["model_name"]
+    sent = cloud_requests(env, "gemini-video")[-1]
+    assert sent["body"]["model"] == "gemini-omni-1.1-flash" and sent["body"]["input"] == "a kite over a green hill"
+    assert sent["body"]["response_format"] == {"type": "video", "aspect_ratio": "9:16", "resolution": "720p"}
+    assert sent["headers"]["x-goog-api-key"] == "gm-test"
+    assert abs(c.get("/api/online/usage").json()["spent"] - spent - 0.5) < 1e-3
+    task = task_of(c, job["job_id"])
+    assert task["detail"]["stages"] == ["Ask the model", "Save"] and task["detail"]["clip"]["where"] == "online (Google)"
+    assert "not Google's price" in task["detail"]["clip"]["counted_as"]
+    no = wait_video(c, c.post("/api/video/jobs", json={"kind": "clip", "prompt": "a declined clip"}).json())
+    assert no["state"] == "failed" and "answered without a video" in no["error"] and "I cannot make that" in no["error"]
+    # an agent asks before a description goes online; declined, nothing is sent
+    count = len(cloud_requests(env, "gemini-video"))
+    chat = chat_with(c, env["local"])
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "film a clip of a red kite"}).json()
+    assert wait_job(c, job["job_id"], approve="deny")["status"] == "done"
+    step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
+    assert step["name"] == "generate_video_clip" and step["declined"] and len(cloud_requests(env, "gemini-video")) == count
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "film a clip of a red kite"}).json()
+    assert wait_job(c, job["job_id"], approve="allow")["status"] == "done"
+    step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
+    assert step["ok"] and step["media"][0]["kind"] == "video" and step["media"][0]["source"] == "online"
+    assert any("Asking Google" in t["text"] for t in step["trail"])
+    c.post("/api/video/settings", json={"online": False})
+
+
 def _server(api, provider="x", quirks=None, caps=None):
     sys.path.insert(0, str(ENGINE))
     from dva import cloud

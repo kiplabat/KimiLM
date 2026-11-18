@@ -25,11 +25,7 @@ async def _allow(ctx, model, sends):
 
 
 def _status(ctx):
-    def status(text):
-        ctx.emit("status", text=text)
-        if ctx.job_id:
-            ctx.app.jobs.progress(ctx.job_id, text)
-    return status
+    return ctx.reporter()
 
 
 def _show(ctx, record):

@@ -1,7 +1,7 @@
 // KimiLM — desktop shell.
 // Starts the local engine (Python) with a random token, opens the window on it, keeps running in the tray so
 // chats, long tasks and schedules continue when the window is closed, and can start with Windows.
-const { app, BrowserWindow, Tray, Menu, ipcMain, dialog, shell, Notification, nativeImage, session, powerSaveBlocker } = require("electron");
+const { app, BrowserWindow, Tray, Menu, ipcMain, dialog, shell, Notification, nativeImage, session, powerSaveBlocker, desktopCapturer } = require("electron");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -272,6 +272,14 @@ if (!app.requestSingleInstanceLock()) {
           "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self'; script-src 'self'"] } });
       });
     }
+    // Recording the screen in the Video window (2.14.0): the first screen, with the computer's own sound on Windows
+    // (the only system where the shell can offer it). Without this, a window cannot be given the screen at all.
+    session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
+      desktopCapturer.getSources({ types: ["screen"] }).then((sources) => {
+        if (!sources.length) return callback({});
+        callback(request.audioRequested && process.platform === "win32" ? { video: sources[0], audio: "loopback" } : { video: sources[0] });
+      }).catch((err) => { log(`screen recording: ${err.message}`); callback({}); });
+    });
     createTray();
     watchWork();
     const hidden = process.argv.includes("--hidden") || prefs().startHidden;

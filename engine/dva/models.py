@@ -434,7 +434,13 @@ class Models:
         self._save_download(dl_id, spec)
         cancel = asyncio.Event()
         self._cancel[dl_id] = cancel
-        self._spawn(self._download(dl_id, spec, cancel))
+        jobs = getattr(self, "jobs", None)
+        if jobs:        # a task of its own: Activity lists it, and its trail says what it did and when (2.14.0)
+            jobs.follow("download", f"Download: {state['name']}", self._download(dl_id, spec, cancel),
+                        lambda: self.downloads.get(dl_id) or {"state": "removed"}, stop=cancel.set,
+                        payload={"what": "text model", "repo": repo, "file": state["file"]})
+        else:
+            self._spawn(self._download(dl_id, spec, cancel))
         self.bus.publish("download", **state)
         return dl_id
 

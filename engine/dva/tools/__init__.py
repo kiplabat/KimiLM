@@ -2,6 +2,7 @@
 tools are added per chat. Every tool says whether it changes anything; changes ask the user first unless the
 chat or scheduled task was set to approve automatically."""
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -56,6 +57,33 @@ class ToolContext:
     loaded_skills: set = field(default_factory=set)
     notes: dict = field(default_factory=dict)
 
+    def progress(self, text, beat=False):
+        """A tool says what it is doing. Shown live inside the chat's step for this tool call and kept with the
+        step, so the work can be read afterwards. A beat is a counter that moves: shown, not kept."""
+        text = str(text or "")[:400]
+        if not text:
+            return
+        if not beat:
+            log = self.notes.setdefault("log", [])
+            if not log or log[-1]["text"] != text:
+                log.append({"t": time.strftime("%Y-%m-%dT%H:%M:%S"), "text": text})
+                del log[:-200]
+        self.emit("tool_progress", call_id=self.notes.get("call_id"), text=text, beat=bool(beat))
+        if self.job_id:
+            self.app.jobs.progress(self.job_id, text)
+
+    def reporter(self):
+        """The status function a tool hands to long work (pictures, sound, video)."""
+        def status(text):
+            self.emit("status", text=text)
+            self.progress(text)
+
+        def beat(text):
+            self.emit("status", text=text)
+            self.progress(text, beat=True)
+        status.beat = beat
+        return status
+
     @property
     def roots(self):
         return [Path(f).resolve() for f in self.folders] + [self.workspace.resolve()]
@@ -80,9 +108,9 @@ class ToolContext:
 
 
 def builtin_tools():
-    from . import browser, files, images, meta, python_exec, sound, vision, web
+    from . import browser, files, images, meta, python_exec, sound, video, vision, web
     return (files.TOOLS + web.TOOLS + browser.TOOLS + python_exec.TOOLS + meta.TOOLS + vision.TOOLS + images.TOOLS
-            + sound.TOOLS)
+            + sound.TOOLS + video.TOOLS)
 
 
 GROUPS = {
@@ -96,5 +124,6 @@ GROUPS = {
     "vision": "Look at images and videos (vision models only)",
     "images": "Make new pictures and change existing ones (needs an image model, see Images)",
     "sound": "Speak texts and scripts, transcribe recordings, make music and mix sound (needs models, see Sound)",
+    "video": "Build videos from pictures, narration and music, change video files, and make short clips with a video model (see Video)",
     "agents": "Hand parts of a task to other agents that work in parallel",
 }

@@ -78,6 +78,23 @@ async def openai_models(request: Request):
                      {"id": "gpt-image-test"}, {"id": "gpt-test-tts"}, {"id": "gpt-test-transcribe"}]}
 
 
+def clip(seconds=1.0, fps=12, size=(320, 180)):
+    """A small real .mp4, as a video model would answer with."""
+    import io
+    import av
+    from PIL import Image
+    buf = io.BytesIO()
+    with av.open(buf, "w", format="mp4") as box:
+        stream = box.add_stream("libx264", rate=fps)
+        stream.width, stream.height, stream.pix_fmt = size[0], size[1], "yuv420p"
+        for n in range(int(seconds * fps)):
+            for packet in stream.encode(av.VideoFrame.from_image(Image.new("RGB", size, (20 * n % 256, 90, 160)))):
+                box.mux(packet)
+        for packet in stream.encode(None):
+            box.mux(packet)
+    return buf.getvalue()
+
+
 def tone(seconds=1.0, pitch=440, rate=24000):
     import io
     import math
@@ -278,6 +295,13 @@ async def gemini_interactions(request: Request):
     REQUESTS.append({"provider": "gemini-sound", "body": body, "headers": dict(request.headers)})
     if request.headers.get("x-goog-api-key") != "gm-test":
         return JSONResponse({"error": {"message": "API key not valid"}}, 400)
+    if (body.get("response_format") or {}).get("type") == "video":        # gemini-omni: a clip (2.14.0)
+        REQUESTS[-1]["provider"] = "gemini-video"
+        text = body["input"] if isinstance(body["input"], str) else " ".join(p.get("text", "") for p in body["input"])
+        if "declined" in text:
+            return {"steps": [{"type": "model_output", "content": [{"type": "text", "text": "I cannot make that."}]}]}
+        return {"id": "int_1", "status": "completed", "steps": [{"type": "model_output", "content": [
+            {"type": "video", "mime_type": "video/mp4", "data": base64.b64encode(clip()).decode()}]}]}
     content = [{"type": "audio", "data": base64.b64encode(tone(2.0, 330)).decode()}]
     if body["model"].startswith("lyria"):
         content.insert(0, {"type": "text", "text": "[Intro] soft piano [Verse] strings join"})
