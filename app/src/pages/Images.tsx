@@ -6,6 +6,7 @@ import { api, desktop, fileUrl, fmtBytes, fmtTime } from "../api";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, ConfirmButton, Empty, Field, Modal, PageHeader, Progress, Spinner, Tabs } from "../components/ui";
 import { EDIT_KEY, PictureGrid } from "../components/Pictures";
+import { WorkLine } from "../components/Work";
 
 const SHAPES: Record<string, [string, number]> = {
   square: ["Square", 1], landscape: ["Landscape (3:2)", 1.5], portrait: ["Portrait (2:3)", 2 / 3],
@@ -45,6 +46,7 @@ function Create({ state, toModels }: any) {
   const [steps, setSteps] = useState("");
   const [strength, setStrength] = useState(0.6);
   const [source, setSource] = useState<any>(null);
+  const [redraw, setRedraw] = useState(false);
   const [jobs, setJobs] = useState<any[]>(state.jobs || []);
   const file = useRef<HTMLInputElement>(null);
   useEffect(() => {      // "Change this picture" from a chat or the library
@@ -60,7 +62,7 @@ function Create({ state, toModels }: any) {
   const start = async () => {
     const [width, height] = sizeFor(chosen, shape);
     const body: any = { prompt, model: chosen?.id, count, negative, seed: seed === "" ? undefined : Number(seed), steps: steps === "" ? undefined : Number(steps) };
-    if (source) Object.assign(body, { image: source.path, strength });
+    if (source) Object.assign(body, { image: source.path, strength, redraw });
     if (!source || shape !== "square") Object.assign(body, { width, height });      // a change keeps the picture's shape
     try { const job = await api.post("/images/generate", body); setJobs((l) => [...l.filter((j) => j.id !== job.id), job]); }
     catch (e: any) { toast(e.message, "error"); }
@@ -93,6 +95,13 @@ function Create({ state, toModels }: any) {
         ) : (
           <div><Button small icon={<Upload size={13} />} onClick={() => file.current?.click()}>Change a picture you have…</Button>
             <input ref={file} type="file" accept="image/*" hidden onChange={(e) => { pick(e.target.files?.[0]); e.target.value = ""; }} /></div>
+        )}
+        {source && !online && chosen?.settings?.edit !== "reference" && (
+          <div className="small muted stack-s">
+            <span>A simple change needs no model and is done in a second, at full size: a glow on the outline, a blur, black and white, brighter or darker, another size or file format, a rotation, a border. Ask for just that.</span>
+            <span>For anything else, {chosen?.name} redraws the picture from a description: it cannot follow an instruction such as “remove the car”.</span>
+            <label className="row gap-s"><input type="checkbox" checked={redraw} onChange={(e) => setRedraw(e.target.checked)} /> My text describes the finished picture: redraw it</label>
+          </div>
         )}
         <div className="row gap-m wrap">
           <Field label="Made by">
@@ -138,6 +147,7 @@ function Create({ state, toModels }: any) {
             </div>
             {j.state === "running" && <div className="note"><Spinner size={14} /> {j.text}</div>}
             {j.error && <div className="small bad">{j.error}</div>}
+            <WorkLine jobId={j.job_id} running={j.state === "running"} />
             <PictureGrid large items={j.images} onChange={(p: any) => setSource({ path: p.path, name: p.name })} />
           </div>
         ))}

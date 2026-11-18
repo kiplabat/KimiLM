@@ -1,14 +1,9 @@
 import React, { useEffect, useState } from "react";
-import { Activity as ActivityIcon, Ban, CheckCircle2, ChevronDown, ChevronRight, Clock, Loader2, Play, ShieldCheck, Square, Workflow, XCircle } from "lucide-react";
+import { Activity as ActivityIcon, Ban, CheckCircle2, ChevronDown, ChevronRight, Clock, Eye, Loader2, Play, Workflow, XCircle } from "lucide-react";
 import { api, fmtTime } from "../api";
 import { go, useEvent } from "../store";
-import { Badge, Button, Empty, Modal, PageHeader, Spinner, Tabs } from "../components/ui";
-
-const ICON: any = {
-  running: <Loader2 size={15} className="spin accent" />, queued: <Clock size={15} className="muted" />,
-  waiting: <ShieldCheck size={15} className="warn" />, done: <CheckCircle2 size={15} className="ok" />,
-  failed: <XCircle size={15} className="bad" />, cancelled: <Square size={13} className="muted" />, interrupted: <XCircle size={15} className="muted" />,
-};
+import { Badge, Button, Empty, PageHeader, Spinner, Tabs } from "../components/ui";
+import { ACTIVE, KIND_NAME, Pulse, STATUS_ICON, WorkDetail, span, useTick } from "../components/Work";
 
 const kTokens = (n: number) => !n ? "0" : n >= 10000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 const dur = (s: number) => s < 90 ? `${Math.max(0, Math.round(s))} s` : s < 5400 ? `${Math.round(s / 60)} min` : `${(s / 3600).toFixed(1)} h`;
@@ -109,44 +104,85 @@ function Records() {
   );
 }
 
+// Which tasks a chip shows. Everything that works in the background is a task: nothing runs out of sight.
+const GROUPS: { id: string; label: string; kinds?: string[] }[] = [
+  { id: "all", label: "Everything" },
+  { id: "chat", label: "Chats and agents" },             // everything that is none of the kinds below
+  { id: "schedule", label: "Scheduled", kinds: ["schedule"] },
+  { id: "images", label: "Pictures", kinds: ["images"] },
+  { id: "sound", label: "Sound", kinds: ["sound"] },
+  { id: "video", label: "Video", kinds: ["video"] },
+  { id: "setup", label: "Downloads and installs", kinds: ["download", "install"] },
+];
+
+function TaskRow({ j, live, onOpen }: { j: any; live: any; onOpen: () => void }) {
+  const running = ACTIVE.includes(j.status);
+  useTick(running);
+  const began = j.started || j.created;
+  const took = began ? (running ? (Date.now() - +new Date(began)) / 1000 : j.finished ? (+new Date(j.finished) - +new Date(began)) / 1000 : 0) : 0;
+  const now = live?.text || j.progress;
+  const fraction = live && "fraction" in live ? live.fraction : j.fraction;
+  return (
+    <div className={`job-row job-open${running ? " job-live" : ""}`} onClick={onOpen} title="Open: the plan, every step with its time, and what the program printed">
+      {STATUS_ICON[j.status] || STATUS_ICON.queued}
+      <div className="grow">
+        <div className="row gap-s"><b className="ellipsis">{j.title}</b><Badge>{KIND_NAME[j.kind] || j.kind}</Badge>
+          {j.status === "waiting" && <Badge kind="warn">needs your approval</Badge>}
+          {j.status === "running" && <Pulse seenAt={live?.seenAt ?? (j.quiet == null ? null : j.loaded - j.quiet * 1000)} running now={now} pace={live && "pace" in live ? live.pace : j.pace} />}</div>
+        {running && now ? <div className="small job-now">{now}</div> : null}
+        {running && fraction != null ? <div className="run-bar"><span style={{ width: `${Math.max(2, Math.round(fraction * 100))}%` }} /></div> : null}
+        <div className="small muted">{fmtTime(j.created)}{took >= 1 ? ` · ${running ? "running for" : "took"} ${span(took)}` : ""}{j.harness ? ` · ${j.harness}` : ""}{j.model ? ` · ${j.model}` : ""}
+          {j.error ? <span className="bad"> · {j.error}</span> : null}</div>
+      </div>
+      <div className="row gap-s" onClick={(e) => e.stopPropagation()}>
+        <Button small icon={<Eye size={13} />} onClick={onOpen}>Details</Button>
+        {j.chat_id && <Button small onClick={() => go("chat", j.chat_id)}>Open chat</Button>}
+        {running && <Button small kind="danger" onClick={() => api.post(`/jobs/${j.id}/cancel`)}>Stop</Button>}
+      </div>
+    </div>
+  );
+}
+
 export default function Activity() {
   const [tab, setTab] = useState("tasks");
+  const [group, setGroup] = useState("all");
   const [jobs, setJobs] = useState<any[] | null>(null);
-  const [progress, setProgress] = useState<Record<string, string>>({});
-  const [log, setLog] = useState<any>(null);
-  const load = () => api.get("/jobs").then((r) => setJobs(r.jobs));
+  const [live, setLive] = useState<Record<string, any>>({});
+  const [open, setOpen] = useState<string | null>(null);
+  const load = () => api.get("/jobs").then((r) => setJobs(r.jobs.map((j: any) => ({ ...j, loaded: Date.now() }))));
   useEffect(() => { load(); }, []);
   useEvent((e) => {
     if (e.kind === "job") load();
-    if (e.kind === "job_progress") setProgress((p) => ({ ...p, [e.id]: e.text }));
+    if (e.kind === "job_progress") setLive((p) => ({ ...p, [e.id]: { ...p[e.id], text: e.text || p[e.id]?.text, fraction: e.fraction ?? p[e.id]?.fraction, pace: e.pace ?? null, seenAt: Date.now() } }));
+    if (e.kind === "job_trail") setLive((p) => ({ ...p, [e.id]: { ...p[e.id], ...(e.entry.kind === "step" ? { text: e.entry.text, fraction: null, pace: null } : {}), seenAt: Date.now() } }));
+    if (e.kind === "job_detail") setLive((p) => ({ ...p, [e.id]: { ...p[e.id], seenAt: Date.now() } }));
   });
   if (!jobs) return <div className="page"><Spinner /></div>;
+  const named = GROUPS.flatMap((g) => g.kinds || []);
+  const inGroup = (j: any, g: any) => g.id === "all" || (g.kinds ? g.kinds.includes(j.kind) : !named.includes(j.kind));
+  const shown = jobs.filter((j) => inGroup(j, GROUPS.find((g) => g.id === group)));
+  const running = shown.filter((j) => ACTIVE.includes(j.status)), earlier = shown.filter((j) => !ACTIVE.includes(j.status));
+  const count = (g: any) => jobs.filter((j) => ACTIVE.includes(j.status) && inGroup(j, g)).length;
   return (
     <div className="page">
-      <PageHeader title="Activity" subtitle="Everything the agent is doing or has done: chat replies, pipelines, scheduled runs and plugin actions. Tasks keep going when the window is closed." />
+      <PageHeader title="Activity" subtitle="Everything that is working or has worked: chat replies, scheduled and long tasks, pictures, sound, video, downloads and installs. Open any of them to see its plan, every step with its time, and what the program itself printed. Tasks keep going when the window is closed." />
       <Tabs value={tab} onChange={setTab} tabs={[{ id: "tasks", label: "Tasks" }, { id: "runs", label: "Planned runs" }, { id: "records", label: "Models' record" }]} />
       {tab === "runs" && <Runs />}
       {tab === "records" && <Records />}
-      {tab === "tasks" && jobs.length === 0 && <Empty icon={<ActivityIcon size={32} />} title="Nothing yet">Start a chat or a scheduled task.</Empty>}
-      {tab === "tasks" && <div className="card">
-        {jobs.map((j) => (
-          <div key={j.id} className="job-row">
-            {ICON[j.status] || ICON.queued}
-            <div className="grow">
-              <div className="row gap-s"><b className="ellipsis">{j.title}</b><Badge>{j.kind}</Badge>{j.status === "waiting" && <Badge kind="warn">needs your approval</Badge>}</div>
-              <div className="small muted">{fmtTime(j.created)}{j.harness ? ` · ${j.harness}` : ""}{j.model ? ` · ${j.model}` : ""}
-                {["running", "waiting"].includes(j.status) && (progress[j.id] || j.progress) ? ` · ${progress[j.id] || j.progress}` : ""}
-                {j.error ? <span className="bad"> · {j.error}</span> : null}</div>
-            </div>
-            <div className="row gap-s">
-              {j.chat_id && <Button small onClick={() => go("chat", j.chat_id)}>Open</Button>}
-              {!j.chat_id && <Button small onClick={async () => setLog(await api.get(`/jobs/${j.id}`))}>Log</Button>}
-              {["running", "waiting", "queued"].includes(j.status) && <Button small kind="danger" onClick={() => api.post(`/jobs/${j.id}/cancel`)}>Stop</Button>}
-            </div>
-          </div>
-        ))}
-      </div>}
-      {log && <Modal wide title={log.title} onClose={() => setLog(null)}><pre className="log">{log.log || JSON.stringify(log.result, null, 2)}</pre></Modal>}
+      {tab === "tasks" && <>
+        <div className="chips">
+          {GROUPS.map((g) => <button key={g.id} className={`chip${group === g.id ? " chip-on" : ""}`} onClick={() => setGroup(g.id)}>{g.label}{count(g) ? <span className="chip-n">{count(g)}</span> : null}</button>)}
+        </div>
+        <div className="work-h">Working now{running.length ? ` (${running.length})` : ""}</div>
+        {running.length === 0
+          ? <div className="card small muted">Nothing is working right now.</div>
+          : <div className="card">{running.map((j) => <TaskRow key={j.id} j={j} live={live[j.id]} onOpen={() => setOpen(j.id)} />)}</div>}
+        <div className="work-h" style={{ marginTop: 18 }}>Earlier</div>
+        {earlier.length === 0
+          ? <Empty icon={<ActivityIcon size={32} />} title="Nothing yet">Start a chat, make a picture or a recording, or plan a scheduled task.</Empty>
+          : <div className="card">{earlier.map((j) => <TaskRow key={j.id} j={j} live={null} onOpen={() => setOpen(j.id)} />)}</div>}
+      </>}
+      {open && <WorkDetail id={open} onClose={() => setOpen(null)} />}
     </div>
   );
 }

@@ -18,7 +18,11 @@ steps done, which the prompt states: three steps Survey → Draft → Polish, th
 change the script: "hits a blocker" (the first agent reports one, the planner changes the plan), "needs my
 answer" (the planner asks after the first step), "planner breaks" (the second move fails with a server error),
 "note-step" (the first step writes a file), "slow-steps". An agent whose brief asks for a handoff ends its reply
-with one. A set-up request (schema with team + limits) answers with values out of range, to be repaired."""
+with one. A set-up request (schema with team + limits) answers with values out of range, to be repaired.
+
+Failure recovery (2.15.0): "stubborn planner" gives a step that fails, then the same step again (which the app
+refuses), and only then another way; "hopeless task" gives a different failing step every time, until the app
+pauses the task."""
 import argparse
 import json
 import re
@@ -116,12 +120,22 @@ def decide(body):
                                ("read resource ", "read_connector_resource", "uri"),
                                ("paint a picture of ", "generate_image", "prompt"),
                                ("say aloud: ", "speak", "text"), ("write down what is said in ", "transcribe_audio", "path"),
-                               ("compose music: ", "generate_music", "prompt"), ("podcast of ", "make_podcast", "source")):
+                               ("compose music: ", "generate_music", "prompt"), ("podcast of ", "make_podcast", "source"),
+                               ("film a clip of ", "generate_video_clip", "prompt")):
         if trigger in text and tool in tools and not after_tool:
             args = {key: text.split(trigger, 1)[1].strip()}
             if tool == "update_project_notes":
                 args["section"] = "Decisions"
             return {"tool": (tool, args)}
+    if "film about " in text and "make_video" in tools and not after_tool:        # video (2.14.0)
+        subject = text.split("film about ", 1)[1].strip()
+        return {"tool": ("make_video", {"title": f"About {subject}", "scenes": [
+            {"narration": f"This is {subject}.", "picture": f"a photo of {subject}"},
+            {"narration": "And that is all there is to say.", "picture": f"{subject} at sunset"}]})}
+    if "cut the video " in text and "edit_video" in tools and not after_tool:     # "cut the video <path> to <a>-<b>"
+        path, _, part = text.split("cut the video ", 1)[1].partition(" to ")
+        a, _, b = part.partition("-")
+        return {"tool": ("edit_video", {"source": path.strip(), "start": float(a), "end": float(b)})}
     if "podcast from the attached" in text and "make_podcast" in tools and not after_tool:
         return {"tool": ("make_podcast", {"minutes": 3})}
     if "repaint " in text and "edit_image" in tools and not after_tool:      # "repaint <path> so that <what>"
@@ -188,6 +202,9 @@ def mission_move(body, users):
             "reason": f"after {n} steps", "decision": "continue", "steps": [],
             "outline": ["Survey", "Draft", "Polish"]}
     step = lambda name, goal, **kw: {"name": name, "goal": goal, "done_when": "a greeting", **kw}  # noqa: E731
+    if "Connected services the agents have tools for" in last:       # what the planner was told about connectors
+        told = last.split("Connected services the agents have tools for (what each promises):\n", 1)[1].split("\n")[0]
+        move["understanding"] += " The planner was told of these services: " + told[:200]
     if "hits a blocker" in users:
         if n == 0:
             move["steps"] = [step("Fetch", "say hello and report a blocker")]
@@ -206,6 +223,23 @@ def mission_move(body, users):
         elif n == 1:
             colour = last.split("My latest message to you:", 1)[1].split("\n")[0].strip()
             move["steps"] = [step(f"Paint {colour}"[:40], f"say hello in {colour}")]
+        else:
+            move["decision"] = "finish"
+        return move
+    if "stubborn planner" in users:
+        if n == 0 or (n == 1 and "Not run, because it repeats a failure" not in last):
+            move["steps"] = [step("Fetch", "say hello then explode at the site")]     # the second time: the same again
+        elif n == 1:
+            move.update(reason="the site fails every time, so read the mirror", changed=True,
+                        steps=[step("Mirror", "say hello from the mirror instead", agent="Archivist", harness="agent")])
+        else:
+            move["decision"] = "finish"
+        return move
+    if "hopeless task" in users:
+        ways = ["explode while reading the archive", "phone the owner and explode there", "use a cached copy then explode",
+                "explode after asking a colleague", "explode in a completely new manner tomorrow"]
+        if n < 4 and "My latest message to you" not in last:
+            move["steps"] = [step(f"Try {n + 1}", f"say hello, {ways[n]}")]
         else:
             move["decision"] = "finish"
         return move
@@ -296,6 +330,13 @@ def structured(schema, body):
     props = schema.get("properties", {})
     users = " ".join(text_of(m.get("content")) for m in body["messages"] if m["role"] == "user").lower()
     raw = " ".join(text_of(m.get("content")) for m in body["messages"] if m["role"] == "user")
+    if "scenes" in props and "title" in props:        # video (2.14.0): the scenes of a short video
+        n = int(re.search(r"as (\d+) scenes", raw).group(1))
+        subject = "solar pumps" if "MATERIAL:" in raw else (re.search(r"about: (.+?)\.", raw) or [None, "the subject"])[1]
+        return {"title": f"A short film about {subject}",
+                "scenes": [{"narration": f"Scene {i + 1} tells one thing about {subject}. It is said in a plain way.",
+                            "picture": f"A wide photo of {subject}, part {i + 1}, soft morning light",
+                            "caption": f"Part {i + 1}"} for i in range(min(n, 3))]}
     if "points" in props and "PART:" in raw:          # podcast (2.13.0): notes of one part of a document
         part = raw.split("PART:", 1)[1].split("JSON only")[0].strip()
         return {"points": [s.strip() + "." for s in part.replace("\n", " ").split(".")[:2] if s.strip()]}

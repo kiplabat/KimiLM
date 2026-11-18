@@ -180,14 +180,19 @@ class Scheduler:
             raise ValueError("This task is already running")
         chat_id = s.get("chat_id") if s["chat_mode"] == "same" and s.get("chat_id") and \
             self.db.get("chats", s["chat_id"]) else None
+        # a schedule with no connectors chosen may use every connector that is switched on and can connect with
+        # nobody there (2.15.0): what is installed is what a scheduled task can use
+        connectors = s.get("connectors") or self.app.connectors.usable()
         if not chat_id:
             title = f"{s['name']} · {datetime.now().strftime('%d %b %H:%M')}"
             chat = self.app.create_chat(project_id=s.get("project_id"), title=title, model=s.get("model") or None,
-                                        harness=s.get("harness") or None, connectors=s.get("connectors") or [],
+                                        harness=s.get("harness") or None, connectors=connectors,
                                         origin="schedule", schedule_id=sid)
             chat_id = chat["id"]
             if s["chat_mode"] == "same":
                 self.db.update("schedules", sid, {"chat_id": chat_id})
+        elif not (self.db.get("chats", chat_id) or {}).get("connectors"):
+            self.db.update("chats", chat_id, {"connectors": connectors})    # (a choice made in the chat itself stays)
         prompt = s.get("prompt") or "Run."
         setup = s.get("setup") or {}
         policy = {"allow": setup["allow"]} if setup.get("allow") else None
