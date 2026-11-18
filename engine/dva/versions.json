@@ -3,7 +3,7 @@
   "llama_cpp_repo": "ggml-org/llama.cpp",
   "acestep_repo": "ace-step/acestep.cpp",
   "acestep_commit": "ed53caf164e4492a5620b2e3f2264629cf66da24",
-  "music_engine_repo": "kiplabat/KimiLM",
+  "music_engine_repo": "kiplabat/kimilm-engines",
   "music_engine_tag": "music-engine-ed53caf",
   "sd_cpp_tag": "master-1106-532d2c1",
   "sd_cpp_repo": "leejet/stable-diffusion.cpp",

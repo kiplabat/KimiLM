@@ -58,7 +58,7 @@ function Editor({ s, onClose, onDone }: any) {
       <div className="row gap-m wrap">
         <Field label="Harness"><HarnessPicker value={f.harness} onChange={(v: string) => setF({ ...f, harness: v })} /></Field>
         <Field label="Model"><ModelPicker value={f.model} onChange={(v: string) => setF({ ...f, model: v })} /></Field>
-        <Field label="Connectors"><ConnectorPicker value={f.connectors || []} onChange={(v: string[]) => setF({ ...f, connectors: v })} /></Field>
+        <Field label="Connectors" help="None chosen: it may use every connector that is switched on"><ConnectorPicker value={f.connectors || []} onChange={(v: string[]) => setF({ ...f, connectors: v })} /></Field>
         <Field label="Project">
           <select className="input" value={f.project_id || ""} onChange={(e) => setF({ ...f, project_id: e.target.value || null })}>
             <option value="">— none —</option>{projects.map((p: any) => <option key={p.id} value={p.id}>{p.name}</option>)}

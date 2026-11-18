@@ -7,9 +7,10 @@ and connectors, planned runs, scheduled tasks, long-running tasks, pictures and 
 - The app (Electron + React): [app/README.md](app/README.md) — how to run it in development and build the installer.
 - The engine (Python): [engine/README.md](engine/README.md) — how it works, release by release.
 
-KimiLM started as "Datavera Agent" and this repository was called `datavera-agent` until November 2026. The
-Datavera dataset publisher below is now one optional plugin of KimiLM; its command-line version lives in the
-repository root and keeps working on its own.
+KimiLM started as "Datavera Agent" and this repository was called `datavera-agent` until November 2026. Since
+2.15.0 KimiLM ships no Datavera plugin: Datavera is connected like any other service, as an MCP connector
+(Plugins & connectors → Add connector). The command-line Datavera agent below still lives in the repository
+root and works on its own.
 
 ---
 

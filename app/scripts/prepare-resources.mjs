@@ -1,5 +1,5 @@
 // Gathers everything the installer ships besides the Electron app itself, into app/resources/:
-//   engine/  the Python engine + built-in harnesses/skills/plugins (+ the Datavera pipeline code)
+//   engine/  the Python engine + built-in harnesses and skills (no plugin is built in since 2.15.0)
 //   python/  an embedded Python 3.12 for Windows with the engine's packages pre-installed
 //   llama/cpu/  the llama.cpp CPU build (GPU builds are downloaded from inside the app when wanted)
 // Usage: node scripts/prepare-resources.mjs [--platform win] [--skip-python] [--skip-llama]
@@ -19,10 +19,6 @@ const platform = args.includes("--platform") ? args[args.indexOf("--platform") +
 const versions = JSON.parse(fs.readFileSync(path.join(engineSrc, "dva", "versions.json"), "utf8"));
 const cache = path.join(app, ".cache");
 fs.mkdirSync(cache, { recursive: true });
-
-const PIPELINE_FILES = ["agent.py", "connection.py", "doctor.py", "dv_acquire.py", "dv_analysis.py", "dv_browser.py",
-  "dv_config.py", "dv_discovery.py", "dv_llm.py", "dv_progress.py", "dv_publisher.py", "inventory_relevance.py",
-  "inventory_store.py", "setup_account.py", "INVENTORY_RULES.md", "agent_config.default.json", "LICENSE"];
 
 function step(msg) { console.log(`\n== ${msg}`); }
 
@@ -67,13 +63,7 @@ async function engine() {
   copyDir(path.join(engineSrc, "dva"), path.join(dest, "dva"), skip);
   copyDir(path.join(engineSrc, "builtin"), path.join(dest, "builtin"), skip);
   fs.copyFileSync(path.join(engineSrc, "requirements.txt"), path.join(dest, "requirements.txt"));
-  const pipe = path.join(dest, "builtin", "plugins", "datavera", "pipeline");
-  fs.mkdirSync(pipe, { recursive: true });
-  for (const f of PIPELINE_FILES) {
-    if (fs.existsSync(path.join(repo, f))) fs.copyFileSync(path.join(repo, f), path.join(pipe, f));
-    else console.warn(`   (missing pipeline file ${f})`);
-  }
-  console.log(`   engine + Datavera pipeline copied to ${dest}`);
+  console.log(`   engine copied to ${dest}`);
 }
 
 async function python() {

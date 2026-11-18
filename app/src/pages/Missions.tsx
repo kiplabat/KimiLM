@@ -12,7 +12,7 @@ const dur = (s: number) => s < 90 ? `${Math.max(0, Math.round(s))} s` : s < 5400
 function statusOf(m: any) {
   if (m.status === "running") return { label: m.now ? `working on “${m.now}”` : "working", kind: "accent", icon: <Loader2 size={15} className="spin accent" /> };
   if (m.status === "paused" && m.pause?.kind === "question") return { label: "waiting for your answer", kind: "warn", icon: <CircleHelp size={15} className="warn" /> };
-  if (m.status === "paused") return { label: m.pause?.kind === "limit" ? "paused at a limit" : "paused", kind: "warn", icon: <Pause size={15} className="warn" /> };
+  if (m.status === "paused") return { label: m.pause?.kind === "limit" ? "paused at a limit" : m.pause?.kind === "recovery" ? "paused: it could not get past a failure" : "paused", kind: "warn", icon: <Pause size={15} className="warn" /> };
   if (m.status === "stopped") return { label: "stopped", kind: "neutral", icon: <Square size={13} className="muted" /> };
   if (m.status === "interrupted") return { label: "cut off (the app was closed)", kind: "neutral", icon: <XCircle size={15} className="muted" /> };
   return { label: "finished", kind: "ok", icon: <CheckCircle2 size={15} className="ok" /> };

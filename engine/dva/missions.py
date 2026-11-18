@@ -35,6 +35,7 @@ import asyncio
 import re
 import time
 
+from . import recovery
 from .db import now
 from .forecast import pretty_seconds, pretty_tokens
 from .orchestrator import SETTLED, Orchestra, _clip, same_objection
@@ -55,7 +56,7 @@ ALLOWABLE = {
 OPEN = ("paused", "stopped", "interrupted")
 NOTHING = re.compile(r"^\W*(nothing|none|no\b|n/?a|not applicable|-+|—+)", re.I)
 HANDOFF = re.compile(r"(?:^|\n)#{0,4}\s*\**handoff\**:?\s*\n(.*)\Z", re.I | re.S)
-FIELD = re.compile(r"^\s*[-*]?\s*\**(done|found|next)\**\s*:\s*\**[ \t]*", re.I | re.M)
+FIELD = re.compile(r"^\s*[-*]?\s*\**(done|found|failed|next)\**\s*:\s*\**[ \t]*", re.I | re.M)
 
 
 # ---------------------------------------------------------------------- the set-up of a task
@@ -155,6 +156,12 @@ async def plan_setup(app, text, scheduled=False, model=None):
     harnesses = loop_harnesses(app)
     options = "; ".join(f"{h['id']}: {(h.get('description') or '')[:70]}" for h in harnesses)
     allow = "; ".join(f"{k}: {v}" for k, v in ALLOWABLE.items())
+    ids = app.connectors.usable()             # what is installed is what the task can use
+    try:
+        await app.connectors.learn(ids)
+    except Exception as exc:
+        app.log(f"a task's set-up: asking the connectors what they offer: {type(exc).__name__}: {exc}")
+    services = app.connectors.digest(ids) if ids else ""
     prompt = (
         "Set up a task that AI agents will do on my computer" + (" on a schedule" if scheduled else "") +
         ", with nobody watching. A planner will run it one step at a time and give each step to one agent of "
@@ -173,6 +180,10 @@ async def plan_setup(app, text, scheduled=False, model=None):
         f"- allow: what it may do without asking me each time, only what the task really needs — {allow}. "
         "Leave out what it does not need.\n"
         "- outline: the phases you expect, in order (it may change as the work goes on).\n"
+        + ("Connected services the agents will have tools for (what each promises):\n" + services + "\nIn "
+           "'goal', name the service to use for what it offers: the web is only for what no service offers. "
+           "If the task needs an action of a service that changes something, put 'connector' in allow.\n"
+           if services else "")
         + ("- when: the schedule in plain words, such as 'every day at 08:30', 'weekdays at 9', 'every 3 "
            "hours', 'every monday at 10:00'.\n" if scheduled else "") + "JSON only.")
     out, note = {}, ""
@@ -246,12 +257,12 @@ def summary(app, row):
 
 # ---------------------------------------------------------------------- handoffs
 def parse_handoff(text):
-    """The handoff block at the end of an agent's reply → {done, found, next}. A reply without the block is
-    its own 'done' (small models forget the block; the work is not thrown away for that)."""
+    """The handoff block at the end of an agent's reply → {done, found, failed, next}. A reply without the block
+    is its own 'done' (small models forget the block; the work is not thrown away for that)."""
     text = (text or "").strip()
     m = HANDOFF.search(text)
     block = m.group(1) if m else ""
-    out = {"done": "", "found": "", "next": ""}
+    out = {"done": "", "found": "", "failed": "", "next": ""}
     marks = list(FIELD.finditer(block))
     for i, mark in enumerate(marks):
         end = marks[i + 1].start() if i + 1 < len(marks) else len(block)
@@ -267,6 +278,7 @@ def move_schema(harness_ids, roles):
         "name": {"type": "string", "maxLength": 40}, "goal": {"type": "string", "maxLength": 1000},
         "done_when": {"type": "string", "maxLength": 240}, "agent": {"type": "string", "maxLength": 30},
         "harness": {"enum": list(harness_ids)}, "role": {"enum": list(roles)}, "loop": {"type": "boolean"},
+        "minutes": {"type": "integer", "minimum": 5, "maximum": 480},
         "expects": {"type": "array", "maxItems": 4, "items": {"type": "string", "maxLength": 80}}}}
     # the understanding and the reason come first, so a small model thinks before it decides
     return {"type": "object", "required": ["understanding", "reason", "decision", "steps"], "properties": {
@@ -306,6 +318,14 @@ class Mission(Orchestra):
         self.planner_failures = 0
         self.last_error = "no answer"
         self.stuck = 0
+        self.refused = []                     # steps the planner proposed that equal a failed attempt (this move)
+        self.failed_from = 0                  # failures before this step no longer pause the task (the user said go on)
+        if not turn.chat.get("connectors"):   # a task that was given no connectors may use what is installed
+            ids = self.app.connectors.usable()
+            if ids:
+                self.db.update("chats", turn.chat["id"], {"connectors": ids})
+                turn.chat["connectors"] = ids
+        self.services = None                  # what the task's connectors offer, as text (None: not looked up yet)
         self.max_tasks = self.max_checks = 10**6      # the task's own limits decide, not a planned run's
         self.time_limit = float("inf")
 
@@ -336,6 +356,31 @@ class Mission(Orchestra):
     def over_limit(self):
         return None                           # a task stops between two steps (advance), never in the middle of one
 
+    def minutes_left(self):
+        """What the task's own limit on hours leaves: a step never gets more time than that."""
+        return (self.limits["hours"] * 3600 - self.spent()["seconds"]) / 60
+
+    def failing(self, since=0):
+        """How many steps in a row have failed since the last one that was accepted (counting only the steps
+        from number `since` on: after the user said 'try once more', earlier failures do not pause the task)."""
+        n = 0
+        for h in reversed(self.handoffs[since:]):
+            if h["status"] not in ("failed", "not run"):
+                break
+            n += 1
+        return n
+
+    def failure_lines(self, last=5):
+        """The failed steps as the planner reads them: one line per step (its last attempt), with what its tools
+        reported and what was changed afterwards."""
+        by_step = {}
+        for r in self.failures:
+            by_step[r.get("step")] = r        # the last attempt at each step
+        failed = {h["id"] for h in self.handoffs if h["status"] in ("failed", "not run")}
+        rows = [r for sid, r in by_step.items() if sid in failed]
+        names = {r.get("model"): self.model_name(r["model"]) for r in rows if r.get("model")}
+        return recovery.ledger_text(rows, last=last, names=names)
+
     async def approve_plan(self):
         """Nothing to approve here: the set-up was confirmed when the task was created, and steps are decided
         one at a time."""
@@ -348,7 +393,8 @@ class Mission(Orchestra):
                 "changes": self.changes, "moves": self.moves}
 
     def extra_state(self):
-        return {"mission": {**self.mission_view(), "auto_resumes": self.auto_resumes}}
+        return {"mission": {**self.mission_view(), "auto_resumes": self.auto_resumes,
+                            "failed_from": self.failed_from}}
 
     def load_extra(self, state):
         m = state.get("mission") or {}
@@ -363,6 +409,7 @@ class Mission(Orchestra):
         self.changes, self.moves = int(m.get("changes") or 0), int(m.get("moves") or 0)
         self.pause = m.get("pause")
         self.auto_resumes = int(m.get("auto_resumes") or 0)
+        self.failed_from = int(m.get("failed_from") or 0)
         used = m.get("spent") or {}
         # steps keep what they used; what the planner itself used in earlier sessions is the rest
         steps = sum(int((t.get("used") or {}).get("tokens") or 0) for t in state.get("tasks") or [])
@@ -377,6 +424,8 @@ class Mission(Orchestra):
         """The task continues after a pause, a stop or a restart."""
         was = self.pause or {}
         self.pause = None
+        if was.get("kind") == "recovery":     # the user said: go on. The count of failures in a row starts again
+            self.failed_from = len(self.handoffs)
         self.overall = self.overall or ""
         latest = (self.turn.last_user_text() or "").strip()
         if latest and not by_button and latest not in self.overall:
@@ -415,15 +464,50 @@ class Mission(Orchestra):
                    for t in list(self.tasks.values())[-4:]):
                 continue
             who = self.member(r)
+            minutes = self.minutes_for(r, goal, who)
+            # a step that equals an attempt that already failed is not run: it would fail the same way
+            why = recovery.refusal({"goal": goal, "harness": who["harness"], "model": self.model_of(who),
+                                    "minutes": minutes}, self.failures)
+            if why:
+                self.refused.append(why)
+                self.logline(f"Not run again: {why}.")
+                continue
             n = len(self.tasks) + len(items) + 1
             items.append({"id": f"s{n}", "name": str(r.get("name") or f"Step {n}")[:40], "goal": goal,
                           "done_when": r.get("done_when") or "", "loop": bool(r.get("loop")),
                           "expects": r.get("expects") or [], "agent": who["name"], "harness": who["harness"],
                           "role": who.get("role"), "model": who.get("model"),
-                          "limits": {"time_limit_minutes": self.limits["step_minutes"]}})
+                          "limits": {"time_limit_minutes": minutes}})
         before = set(self.tasks)
         self.add(items)
         return [tid for tid in self.tasks if tid not in before]
+
+    def model_of(self, who):
+        """The model a step given to this member would run on (as steps are given their models when added)."""
+        probe = {"model": who.get("model"), "role": who.get("role")}
+        self.turn.assign_models([probe])
+        return probe.get("model") or self.turn.model_id
+
+    def minutes_for(self, raw, goal, who):
+        """The time a new step may take: the task's own minutes per step; more when the planner asks for it, or
+        when the same step ran out of time while it was still getting somewhere (then twice as long). Never more
+        than the hours the task has left."""
+        base = float(self.limits["step_minutes"])
+        try:
+            asked = float(raw.get("minutes") or 0)
+        except (TypeError, ValueError):
+            asked = 0.0
+        late = [r for r in self.failures if r.get("class") == "timeout" and r.get("progress")
+                and recovery.same_goal(r.get("goal"), goal) and (r.get("harness") or "agent") == who["harness"]]
+        due = float(late[-1].get("minutes") or base) * 2 if late else 0.0
+        minutes = max(base, asked, due)
+        if minutes > base:
+            minutes = max(base, min(minutes, LIMIT_RANGE["step_minutes"][1], max(5.0, self.minutes_left() - 2)))
+            if minutes > base:
+                self.logline(f"“{str(raw.get('name') or 'The next step')[:40]}” may take {minutes:g} minutes instead "
+                             f"of {base:g}" + (": the same step ran out of time while it was still getting somewhere."
+                                              if due >= asked else ": the planner asked for more time."))
+        return int(minutes)
 
     async def start(self, t, text=None, fresh=False):
         if not t.get("chat_id"):              # every step starts in a fresh chat, also for the same team member:
@@ -442,6 +526,10 @@ class Mission(Orchestra):
         for t in self.tasks.values():
             if t["status"] not in SETTLED or t["id"] in have:
                 continue
+            # what its tools reported as failed is added by code: the record must not depend on the model
+            tools = "; ".join(f"{f['tool']}" + (f" ({f['what']})" if f.get("what") else "")
+                              + (f" ×{f['times']}" if (f.get("times") or 1) > 1 else "") + f": {f['error'][:120]}"
+                              for f in (t.get("failures") or [])[:4])
             if t["status"] == "done":
                 h = parse_handoff(t.get("output"))
                 status = "incomplete" if t.get("partial") else "done"
@@ -450,10 +538,17 @@ class Mission(Orchestra):
                         f"Still open after the check: {t['note']}"
                 self.auto_resumes = 0         # the task moves: a later restart may continue it by itself again
             else:
-                h = {"done": "", "found": t.get("note") or t.get("error") or "it did not finish", "next": ""}
+                said = parse_handoff(t.get("output")) if t.get("output") else {}
+                h = {"done": "", "found": t.get("note") or t.get("error") or "it did not finish", "next": "",
+                     "failed": said.get("failed") or ""}
                 status = "failed" if t["status"] == "failed" else "not run"
+            failed = "" if NOTHING.match(h.get("failed") or "") else (h.get("failed") or "")
+            if tools and status != "done":
+                failed = (failed + " " if failed else "") + f"Its tools reported: {tools}"
+            kind = t.get("kind") if status in ("failed", "incomplete") else None
             self.handoffs.append({"id": t["id"], "name": t["name"], "agent": t.get("agent"), "status": status,
                                   "done": _clip(h["done"], 2400), "found": _clip(h["found"], 700),
+                                  "failed": _clip(failed, 600), "class": kind,
                                   "next": _clip(h["next"], 500), "files": list(t.get("files") or [])[:10],
                                   "result_file": t.get("result_file")})
 
@@ -471,6 +566,7 @@ class Mission(Orchestra):
     def handoff_text(h, budget):
         return (f"### {h['id']} {h['name']} ({h['status']})\nDone: {_clip(h.get('done') or '(nothing)', budget)}"
                 + (f"\nFound: {h['found']}" if h.get("found") else "")
+                + (f"\nFailed: {h['failed']}" if h.get("failed") else "")
                 + (f"\nNext: {h['next']}" if h.get("next") else "")
                 + (f"\nFull text: {h['result_file']}" if h.get("result_file") else "")
                 + (f"\nFiles: {', '.join(h['files'])}" if h.get("files") else ""))
@@ -483,6 +579,11 @@ class Mission(Orchestra):
         parts.append(f"The task as a whole (for context only — do just your step): {_clip(self.overall, 700)}")
         if self.understanding:
             parts.append(f"What is known so far (the planner's notes): {_clip(self.understanding, 1400)}")
+        names = self.app.connectors.names(self.connector_ids())
+        if names:
+            parts.append("Connected services you have tools for: " + ", ".join(names) + ". When one of them offers "
+                         "what your step needs, use its tools: they are made for it. Search or browse the web only "
+                         "for what they do not offer.")
         if self.handoffs and not planned:
             earlier = self.ledger(skip_last=True, last=6)
             if earlier:
@@ -502,11 +603,14 @@ class Mission(Orchestra):
             "is not there, say exactly what is missing: never rebuild it from memory.\n"
             "Work efficiently. If code fails, read the error, fix the cause and run it again; check outputs "
             "before you rely on them.\n"
+            + recovery.AGENT_RULES + "\n"
             "Finish your reply with this block, filled in:\n"
             "## Handoff\n"
             "Done: what you did and the result itself (facts, numbers, sources, file paths)\n"
             "Found: anything that changes what should happen next (a problem, a surprise, a better way), or "
             "'nothing new'\n"
+            "Failed: what you tried that did not work and why (the tool, the source, the error), so that nobody "
+            "tries it again the same way, or 'nothing failed'\n"
             "Next: what the next agent should do, in one or two sentences, or 'nothing: the task is complete'"
             + self.length_hint(t))
         return "\n\n".join(parts)
@@ -531,12 +635,31 @@ class Mission(Orchestra):
                                                       "problem is, what is known, how you will go about it)"))
         if self.outline:
             parts.append("What you expected to come next: " + "; ".join(self.outline))
+        if self.services:
+            parts.append("Connected services the agents have tools for (what each promises):\n" + self.services
+                         + "\nWhen a service offers what a step needs, say in the step's goal which service and "
+                         "tool to use. Send an agent to search or browse the web only for what no service offers.")
         parts.append(f"Steps done so far: {len(self.handoffs)}"
                      + ("\n" + self.ledger(skip_last=True) if len(self.handoffs) > 1 else ""))
         if self.handoffs:
             parts.append("The latest handoff:\n\n" + self.handoff_text(self.handoffs[-1], 2400))
+        failing = self.failing()
+        if failing:
+            last = self.handoffs[-1]
+            kind = last.get("class") or "approach"
+            parts.append(
+                f"Failures since the last accepted step ({failing}):\n" + self.failure_lines()
+                + f"\nThe latest one is of this kind: {recovery.CLASSES.get(kind, {}).get('label', kind)}. "
+                + recovery.CLASSES.get(kind, recovery.CLASSES["approach"])["advice"]
+                + "\nA step that is the same as one that failed (the same goal for the same kind of agent on the "
+                "same model with the same time) will not be run: the app refuses it. Change what caused the failure.")
+        if self.refused:
+            parts.append("Not run, because it repeats a failure:\n" + "\n".join(f"- {x}" for x in self.refused[-3:])
+                         + "\nGive a step that differs in what matters: another approach in the goal, another "
+                         "agent or role, a smaller piece, or more time ('minutes') after a timeout.")
         parts.append(f"Used so far: {used['steps']} of {lim['steps']} steps, {pretty_seconds(used['seconds'])} of "
-                     f"{lim['hours']:g} hours.")
+                     f"{lim['hours']:g} hours. A step may take {lim['step_minutes']:g} minutes unless you give it "
+                     "'minutes'.")
         parts.append(
             f"Your team: {team}. Give a step to one of them by name with 'agent', or name a new agent (with a "
             "harness) when none of them fits.\n"
@@ -552,7 +675,8 @@ class Mission(Orchestra):
             "everything its agent needs to know (it sees only the goal, your understanding and the latest "
             "handoff): paths, sources, formats, what to avoid. done_when: a test the result can be checked "
             f"against. harness: {options}. role: {ROLE_HELP} loop: true for work that takes rounds of try, check "
-            "and fix. expects: files it must save.\n"
+            "and fix. expects: files it must save. minutes: only when a step needs longer than usual (it ran "
+            "out of time while it was still getting somewhere).\n"
             "- outline: the few phases you expect after that; change it when the findings change the plan.\n"
             "Never repeat a step that passed. When a step failed, try another way or a smaller piece, not the "
             "same thing again. JSON only.")
@@ -574,6 +698,18 @@ class Mission(Orchestra):
         why = self.limit_reached()
         if why:
             return self.stop_for("limit", why)
+        # a problem that survived several different recoveries needs a person, not a fifth try
+        tries = max(1, int(self.db.setting("recovery_attempts", 3) or 3))
+        if self.failing(self.failed_from) > tries and not self.said:
+            return self.stop_for("recovery", f"{self.failing()} steps in a row failed, each one a different attempt "
+                                             "to get past the same point")
+        if self.services is None:             # once per session: what the task's connectors promise
+            ids = self.connector_ids()
+            try:
+                await self.app.connectors.learn(ids)
+            except Exception as exc:
+                self.app.log(f"task {self.id}: asking the connectors what they offer: {type(exc).__name__}: {exc}")
+            self.services = self.app.connectors.digest(ids) if ids else ""
         turn = self.turn
         if turn.take_steer(messages):         # something the user said while the last step was running
             self.said = messages[-1]["content"]
@@ -601,6 +737,7 @@ class Mission(Orchestra):
             self.logline("The planner finished the task" + (f": {reason}" if reason else "."))
             self.save()
             return False
+        self.refused = []
         new = self.add_steps(move.get("steps") or [])
         if not new and not self.handoffs:     # nothing to start with: one agent takes the task as it is
             new = self.add_steps([{"name": "First step", "goal": self.overall,
@@ -608,10 +745,14 @@ class Mission(Orchestra):
         if not new:
             self.stuck += 1
             if self.stuck >= 2:
+                if self.refused:
+                    return self.stop_for("recovery", "the planner kept giving a step that already failed the same "
+                                                     "way, and found no other way")
                 return self.stop_for("stuck", "the planner gave no new step twice (it kept proposing work that is "
                                               "already done). Tell it what to do next, or finish the task.")
             return await self.advance(messages)
         self.stuck = 0
+        self.refused = []
         for tid in new:
             await self.forecast(self.tasks[tid])
         names = ", ".join(f"{tid} “{self.tasks[tid]['name']}” → {self.tasks[tid].get('agent')}" for tid in new)
@@ -681,9 +822,15 @@ class Mission(Orchestra):
             h = self.handoffs[-1]
             lines.append(f"**Latest step ({h['id']} {h['name']}, {h['status']}):** {_clip(h.get('done') or h.get('found'), 900)}"
                          + (f"\n\nIt proposed next: {h['next']}" if h.get("next") and not NOTHING.match(h["next"]) else ""))
-        if p.get("kind") == "limit":
+        if p.get("kind") == "recovery":
+            tried = self.failure_lines(last=6)
+            if tried:
+                lines.append("**What was tried and how it failed:**\n" + tried)
+            lines.append("Reply here with what to do differently (another source, another way, what to leave out), "
+                         "or press **Continue** to let the planner try once more; nothing that was done is lost.")
+        elif p.get("kind") == "limit":
             lines.append("Raise the limit and press **Continue** to carry on; nothing that was done is lost.")
-        elif p.get("kind") != "question":
+        elif p.get("kind") not in ("question", "recovery"):
             lines.append("Press **Continue** to try again, or reply here to tell the planner what to do next.")
         lines.append(f"Files are in {self.dir}")
         return "\n\n".join(lines)
