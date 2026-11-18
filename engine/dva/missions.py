@@ -674,7 +674,10 @@ class Mission(Orchestra):
             "- steps: for 'continue', the next step — one, or two when the second is certain to follow. goal: "
             "everything its agent needs to know (it sees only the goal, your understanding and the latest "
             "handoff): paths, sources, formats, what to avoid. done_when: a test the result can be checked "
-            f"against. harness: {options}. role: {ROLE_HELP} loop: true for work that takes rounds of try, check "
+            f"against. harness: {options}" + (" (use 'browser' for a step that has to use a website: clicking "
+                                              "through, forms, a download behind a click)"
+                                              if "browser" in self.harness_ids else "")
+            + f". role: {ROLE_HELP} loop: true for work that takes rounds of try, check "
             "and fix. expects: files it must save. minutes: only when a step needs longer than usual (it ran "
             "out of time while it was still getting somewhere).\n"
             "- outline: the few phases you expect after that; change it when the findings change the plan.\n"

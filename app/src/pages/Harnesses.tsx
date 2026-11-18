@@ -7,6 +7,8 @@ import { startAgentChat } from "./Skills";
 
 const GROUPS = [
   ["files", "Files in the chat's folders"], ["web", "Web search & pages"], ["python", "Run Python"],
+  ["browser", "A real browser: open, look, click, type, download"],
+  ["browsing", "Browsing specialist's extras: how a page is served, forms, tabs, saving files, uploads"],
   ["memory", "Memory"], ["skills", "Skills"], ["automation", "Schedules & harnesses"],
   ["vision", "Look at images & videos (vision models)"], ["agents", "Start helper agents in parallel"],
 ];

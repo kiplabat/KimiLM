@@ -39,7 +39,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from . import media, run_script as launcher
+from . import media, run_script as launcher, toolcheck
 from .cloud import USAGE, CloudError
 from .db import new_id, now
 from .llm import LLMContextFull, LLMError, LLMTimeout, LLMUnreachable, estimate_tokens
@@ -48,7 +48,7 @@ from .orchestrator import Orchestra, RunFit, looks_multistep, team_tools
 from .providers import is_cloud
 from .recovery import signature
 from .runtime import RuntimeError_
-from .tools import GROUPS, Tool, ToolContext, ToolDenied, ToolError, builtin_tools
+from .tools import GROUPS, ON_REQUEST, Tool, ToolContext, ToolDenied, ToolError, builtin_tools
 
 TOOL_RESULT_LIMIT = 6000      # characters of a tool result a model is given (online models, and the default)
 ROLES = ("worker", "strategist", "vision")
@@ -385,7 +385,8 @@ class Turn:
             return True
         if (self.auto_approve and not ignore_auto) or tool.name in self.allowed_always:
             return True
-        if self.policy and not ignore_auto and tool.group in (self.policy.get("allow") or []):
+        group = "browser" if tool.group == "browsing" else tool.group      # a specialist's browser tools too
+        if self.policy and not ignore_auto and group in (self.policy.get("allow") or []):
             return True
         approval_id = new_id("ap_")
         fut = asyncio.get_running_loop().create_future()
@@ -428,10 +429,11 @@ class Turn:
 
     def tool_groups(self):
         groups = self.harness.get("tools")
+        everything = [g for g in GROUPS if g not in ON_REQUEST]    # "all tools" does not mean a specialist's kit
         if groups is None:
-            groups = list(GROUPS) if self.harness.get("mode", "agent") != "chat" else []
+            groups = everything if self.harness.get("mode", "agent") != "chat" else []
         if "*" in groups:
-            groups = list(GROUPS)
+            groups = everything + [g for g in groups if g in ON_REQUEST]
         groups = set(groups)
         if self.limits.get("tools"):
             groups &= set(self.limits["tools"])
@@ -1141,6 +1143,10 @@ class Turn:
         return out
 
     async def run_tool(self, call):
+        # the call is checked against the tool's own parameters first (2.16.0): what is plainly meant is
+        # repaired, what cannot be is not run and the model is told exactly what to change
+        fixed = toolcheck.repair(self.tool_map, call["name"], call["arguments"])
+        call["name"], call["arguments"] = fixed["name"], fixed["args"]
         tool = self.tool_map.get(call["name"])
         step = {"type": "tool", "id": call["id"], "name": call["name"], "arguments": call["arguments"],
                 "label": tool.label if tool else call["name"]}
@@ -1155,10 +1161,8 @@ class Turn:
         if blocked:
             result, ok = blocked, False
             step["blocked"] = True
-        elif not tool:
-            result, ok = f"There is no tool called {call['name']!r}. Available: {', '.join(self.tool_map)}", False
-        elif "_unparsed" in (call["arguments"] or {}):
-            result, ok = "The arguments were not valid JSON; try again with valid JSON arguments.", False
+        elif fixed["error"]:
+            result, ok = fixed["error"], False
         else:
             try:
                 if call["name"] != "use_connector_tool" and not await self.approve(
@@ -1201,6 +1205,9 @@ class Turn:
             except Exception as exc:
                 result, ok = f"Error: {type(exc).__name__}: {str(exc)[:400]}", False
         result = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+        if fixed["notes"] and not fixed["error"]:         # the model sees the right form of its call once
+            result += "\n(Note from the app about your call: " + " ".join(fixed["notes"]) + ")"
+            step["repaired"] = fixed["notes"]
         log = self.ctx.notes.pop("log", None)
         if log:                                           # what the tool said it was doing, kept with the step
             step["trail"] = log

@@ -70,6 +70,10 @@ DEFAULT_SETTINGS = {
     # a long-running task pauses and says what was tried; retry_wait_seconds: the first wait before a step that
     # met a passing fault (a dropped connection, a busy service) is given again (the next wait is three times it)
     "recovery_attempts": 3, "retry_wait_seconds": 15,
+    # 2.16.0: browsing. browser_consent: how a cookie banner is answered without asking: necessary (the choice
+    # that allows least, else accept) | accept | ask (left to the agent); browser_save_mb: the largest file
+    # browser_save fetches through the browser
+    "browser_consent": "necessary", "browser_save_mb": 300,
 }
 CHAT_LIMIT_KEYS = ("max_reply_tokens", "max_steps", "time_limit_minutes", "temperature", "max_searches",
                    "max_tool_calls")

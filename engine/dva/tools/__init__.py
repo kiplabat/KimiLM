@@ -117,6 +117,8 @@ GROUPS = {
     "files": "Read, search and write files in the chat's folders",
     "web": "Search the web and read pages",
     "browser": "Work in a real browser: open pages, click, type, choose, download and take screenshots",
+    "browsing": "A browsing specialist's extra tools: how a page is served and where its data comes from, whole "
+                "forms, waiting, going back, tabs, dialogs, saving files with the page's sign-in, uploads",
     "python": "Run Python code and commands (data analysis, tests, git, build tools)",
     "memory": "Remember and recall facts",
     "skills": "Load skills and create new ones",
@@ -127,3 +129,6 @@ GROUPS = {
     "video": "Build videos from pictures, narration and music, change video files, and make short clips with a video model (see Video)",
     "agents": "Hand parts of a task to other agents that work in parallel",
 }
+# Groups a harness gets only when it lists them: they are a specialist's kit, and every tool in a model's list
+# costs reading time and makes the right choice harder (2.16.0).
+ON_REQUEST = ("browsing",)
