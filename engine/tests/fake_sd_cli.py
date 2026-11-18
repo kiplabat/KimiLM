@@ -3,7 +3,8 @@ read from the program's source at the pinned release), so an option that does no
 it writes real PNG files whose text records what it was asked, for the tests to read.
 
 Marks in the prompt: "out of memory" fails the way the real program does when memory runs out; "slow picture"
-takes long enough to be stopped."""
+takes long enough to be stopped; "long steps" is silent for half a minute a step and says a step takes 223 s, as
+a processor does (for looking at what the windows say meanwhile)."""
 import json
 import sys
 import time
@@ -64,13 +65,27 @@ def main(argv):
         sys.exit(1)
     steps, count = int(a.get("steps", 20)), int(a.get("count", 1))
     width, height = int(a.get("width", 512)), int(a.get("height", 512))
-    pause = 0.5 if "slow picture" in a["prompt"] else 0.01
-    for _ in range(count):
-        for step in range(1, steps + 1):
+    pause = 0.5 if "slow picture" in a["prompt"] else 30 if "long steps" in a["prompt"] else 0.01
+    seed0 = int(a.get("seed", 42))
+    # What the real program prints (copied from a run of the pinned release on Windows, 18 Nov 2026): bars in
+    # MB/s while it loads a model, then for each picture a line "generating image" and one bar line a step.
+    # A redraw does fewer steps than were asked for: 6 steps at strength 0.6 are 4.
+    for done in (16, 66, 106):
+        print(f"|{'#' * (done * 50 // 106):<50}| {done}/106 - {90 + done:.2f}MB/s", flush=True)
+    print("[I] loading tensors completed, taking 0.79s (read: 0.64s, memcpy: 0.00s, convert: 0.04s, "
+          "copy_to_backend: 0.00s) --- model_loader.cpp:1442", flush=True)
+    total = steps if not a.get("init") else int(steps * float(a.get("strength", 0.75))) + 1
+    if a.get("init"):
+        print("[I] IMG2IMG --- image.cpp:201", flush=True)
+        print(f"[I] target t_enc is {total - 1} steps --- image.cpp:245", flush=True)
+    rate = "223.44s/it" if "long steps" in a["prompt"] else "1.20s/it"
+    for n in range(count):
+        if a.get("mode") != "vid_gen":
+            print(f"[I] generating image: {n + 1}/{count} - seed {seed0 + n} --- image.cpp:1005", flush=True)
+        for step in range(1, total + 1):
             time.sleep(pause)
-            end = "\n" if step == steps else ""
-            sys.stdout.write(f"\r  |{'=' * step}>{' ' * (steps - step)}| {step}/{steps} - 1.20s/it\033[K{end}")
-            sys.stdout.flush()
+            bar = ("=" * (step * 50 // total) + ">").ljust(50)[:50]
+            print(f"|{bar}| {step}/{total} - {rate} - ETA 00:0{total - step}", flush=True)
     out = a.get("output", "./output.png")
     seed = int(a.get("seed", 42))
     if a.get("mode") == "vid_gen":           # a clip: the real program writes .avi (or .webm) frames, as here

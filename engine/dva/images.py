@@ -33,9 +33,11 @@ from pathlib import Path
 
 import httpx
 
+from . import effects
 from .db import new_id, now
 from .jobs import turn
 from .download import DownloadStalled, download, fetch_json
+from .forecast import pretty_seconds
 from .providers import cloud_id, month_key
 
 HF = "https://huggingface.co"
@@ -111,6 +113,37 @@ ONLINE = {
                "per_image": 0.04},
 }
 RATIOS = {"1:1": 1.0, "4:3": 4 / 3, "3:4": 3 / 4, "3:2": 1.5, "2:3": 2 / 3, "16:9": 16 / 9, "9:16": 9 / 16}
+
+
+# What the image engine prints while it works (read from a real run of the pinned release, 2.15.0):
+#   [I] generating image: 1/2 - seed 10 --- image.cpp:1005
+#   |============>                                     | 1/4 - 223.44s/it - ETA 11:10
+# The bars it prints while it loads a model look alike but end in MB/s: they are not steps.
+STEP_LINE = re.compile(r"(\d+)\s*/\s*(\d+)\s*-\s*([\d.]+)\s*(s/it|it/s)")
+PICTURE_LINE = re.compile(r"generating image:\s*(\d+)\s*/\s*(\d+)", re.I)
+# An instruction ("make…", "remove…") and not a description of a picture
+INSTRUCTION = re.compile(
+    r"^\W*(please\s+)?((can|could|would) you\s+)?(make|add|remove|delete|erase|change|replace|turn|put|give|convert|"
+    r"swap|fix|clean|extend|crop|move|recolou?r|colou?r|paint|set|increase|decrease|reduce|enhance|improve|apply|"
+    r"insert|deliver|keep|take|cut|let)\b", re.I)
+NO_MODEL = {"id": "kimilm-code", "name": "KimiLM itself (no model)"}
+
+
+def step_time(seconds):
+    """How long a step takes, as the windows say it too: '42 s', '3 min 43 s'."""
+    s = int(round(seconds))
+    return f"{s} s" if s < 60 else f"{s // 60} min {s % 60} s" if s < 3600 else f"{s // 3600} h {s % 3600 // 60} min"
+
+
+def step_line(line):
+    """A drawing step as the image engine prints it: (step, steps, seconds a step), or None. The total is the
+    engine's own: it is not always the number of steps that was asked for (a redraw at strength 0.6 with 6 steps
+    does 4), so the bar follows what the engine says."""
+    m = STEP_LINE.search(line)
+    if not m or int(m.group(2)) < 1 or int(m.group(1)) > int(m.group(2)):
+        return None
+    rate = float(m.group(3) or 0)
+    return int(m.group(1)), int(m.group(2)), (rate if m.group(4) == "s/it" else (1 / rate if rate else 0.0))
 
 
 class ImageError(RuntimeError):
@@ -543,12 +576,23 @@ class Images:
 
     async def generate(self, prompt, *, model=None, out_dir, negative="", width=None, height=None, steps=None,
                        cfg=None, seed=None, count=1, image=None, mask=None, strength=None, chat_id=None,
-                       job_id=None, on_status=None):
+                       job_id=None, on_status=None, effect=None, redraw=False):
         """Make `count` pictures from a prompt; with `image`, change that picture instead (optionally only where
-        `mask` is white). Returns the records of the saved pictures."""
+        `mask` is white). Returns the records of the saved pictures.
+
+        A change that is an image operation (a glow on the outline, black and white, another size: effects.py)
+        is done in code, with no model: `effect` names one, and an instruction that asks for nothing else is
+        recognised by its words. `redraw` says the text describes the finished picture, so that it is redrawn
+        by the model whatever its wording."""
         prompt = (prompt or "").strip()
         if not prompt:
             raise ImageError("Say what the picture should show")
+        if image and not mask and (effect or not redraw):
+            asked = (effect, (effects.find(prompt) or (None, {}))[1]) if effect else effects.find(prompt)
+            if asked and asked[0] not in effects.NAMES:
+                raise ImageError(f"There is no effect called {asked[0]!r}. There are: {', '.join(effects.NAMES)}.")
+            if asked:
+                return await self._effect(image, prompt, asked[0], asked[1], Path(out_dir), chat_id, job_id, on_status)
         row = self.get(model) if model else self.default_model()
         if not row and model:      # by name, as an agent would say it
             row = next((m for m in self.models() if model.lower() in (m["name"].lower(), m["remote_id"].lower())), None)
@@ -564,6 +608,24 @@ class Images:
                 "its provider has no key (Models → Online)"))
         count = max(1, min(4, int(count or 1)))
         s = row.get("settings") or {}
+        swapped = None
+        if image and not mask and not redraw and row["kind"] == "local" and s.get("edit") != "reference" \
+                and INSTRUCTION.match(prompt):
+            # This model redraws a picture towards a description. Given an instruction it makes a new picture
+            # that resembles the old one, after minutes of work: not what was asked. A model on this computer
+            # that follows instructions takes over when nobody chose the model; otherwise say so at once.
+            other = None if model else next((m for m in self.models() if m["ready"] and m["kind"] == "local"
+                                             and (m.get("settings") or {}).get("edit") == "reference"), None)
+            if not other:
+                raise ImageError(
+                    f"{row['name']} redraws a picture from a description of the result; it cannot follow an "
+                    "instruction such as this one, and would spend minutes on a different picture. Three ways on: "
+                    "describe the finished picture and choose to redraw it; add a model that edits by instruction "
+                    "(Images → Models, for example FLUX.2 klein); or use an online model. A simple change (a glow, "
+                    "a blur, black and white, another size or format, a rotation, a border) needs no model: ask "
+                    "for just that.")
+            swapped = f"{other['name']} is used instead of {row['name']}: it follows an instruction about a picture."
+            row, s = other, other.get("settings") or {}
         if image and not (width and height):          # a change keeps the picture's own shape
             width, height = self.shape_of(image, s)
         width, height = int(width or s.get("width") or 512), int(height or s.get("height") or 512)
@@ -572,6 +634,8 @@ class Images:
         status, track = self.app.jobs.reporter(on_status, job_id)
         started = time.monotonic()
         track.stages(["Get ready", "Load the model", "Draw", "Save"] if row["kind"] == "local" else ["Ask the model", "Save"])
+        if swapped:
+            track.note(swapped)
         track.plan(picture={"prompt": prompt[:600], "model": row["name"],
                             "where": "on this computer" if row["kind"] == "local" else f"online ({row.get('provider')})",
                             "size": f"{width} × {height}", "count": count,
@@ -591,6 +655,30 @@ class Images:
         records = [self._record(p, row, prompt, {**params, "index": i}, chat_id, row["kind"]) for i, p in enumerate(paths)]
         self.app.bus.publish("images_changed")
         return records
+
+    async def _effect(self, image, prompt, name, settings, out_dir, chat_id, job_id, on_status):
+        """A change done in code (effects.py): seconds instead of minutes, the same size and file format, and
+        nothing else in the picture changes."""
+        status, track = self.app.jobs.reporter(on_status, job_id)
+        label = effects.LABEL.get(name, name)
+        track.stages(["Change the picture", "Save"])
+        track.plan(picture={"prompt": prompt[:600], "model": "none: this change is an image operation, done by KimiLM "
+                            "itself", "where": "on this computer", "from_picture": Path(image).name, "change": label})
+        track.at("Change the picture")
+        status(f"Changing the picture in code ({label}): no image model is needed for this")
+        try:
+            path, facts = await asyncio.to_thread(effects.apply, image, out_dir, name, settings)
+        except effects.EffectError as exc:
+            raise ImageError(str(exc)) from exc
+        except OSError as exc:
+            raise ImageError(f"The picture could not be read or saved: {exc}") from exc
+        track.at("Save")
+        track.note(f"Saved {path.name} after {facts['seconds']:g} seconds ({facts['width']} × {facts['height']}, "
+                   f"{facts['format']})" + (f". The outline was found from {facts['how']}." if facts.get("how") else "."))
+        record = self._record(path, NO_MODEL, prompt, {"mode": "effect", "engine": "code", **facts,
+                                                       "source_image": str(image), "index": 0}, chat_id, "code")
+        self.app.bus.publish("images_changed")
+        return [record]
 
     async def _free_memory(self, need):
         """One memory budget with the text models: idle ones are unloaded (least recently used first) until the
@@ -633,7 +721,8 @@ class Images:
                     job["prompt"], model=data.get("model") or None, out_dir=self.app.paths.data / "images",
                     negative=str(data.get("negative") or ""), width=data.get("width"), height=data.get("height"),
                     steps=data.get("steps"), cfg=data.get("cfg"), seed=data.get("seed"), count=data.get("count") or 1,
-                    image=image, mask=data.get("mask") or None, strength=data.get("strength"), on_status=status, job_id=jid)
+                    image=image, mask=data.get("mask") or None, strength=data.get("strength"), on_status=status, job_id=jid,
+                    effect=data.get("effect") or None, redraw=bool(data.get("redraw")))
                 job.update(state="done", text="Done")
             except asyncio.CancelledError:
                 job.update(state="stopped", text="Stopped")
@@ -703,9 +792,20 @@ class Images:
             cmd += ["--backend", "cpu"]                        # a graphics-card build told to use the processor
         cmd += shlex.split(str(s.get("args") or ""), posix=os.name != "nt")
         need = int(sum(Path(p).stat().st_size for p in (row.get("files") or {}).values()) * 1.1) + int(1.5 * 2**30)
+        # how long a step took the last time this model drew here (seconds a step for a million pixels): the
+        # estimate shown before the work starts, and how long a silence is normal while it draws
+        megapixels = max(0.05, width * height / 1e6)
+        speed_key = f"image_speed:{row['id']}:{backend}"
+        known = float((self.db.setting(speed_key, None) or {}).get("per_megapixel") or 0)
+        guess = known * megapixels
+        doing = steps if mode in ("new", "edit") else int(steps * float(strength if strength not in (None, "") else 0.6)) + 1
+        expected = (f"about {pretty_seconds(count * (doing + 1) * guess + 90)} for {count} picture"
+                    f"{'s' if count != 1 else ''} (a step took about {step_time(guess)} the last time)" if guess
+                    else "not known yet: this is the first picture this model makes here")
         track.plan(picture_run={"engine": f"stable-diffusion.cpp ({backend})", "mode": mode, "steps": steps, "guidance": cfg,
                                 "seed": seed, "size": f"{width} × {height}", "memory_needed": f"about {need / 2**30:.1f} GB",
                                 "files": {slot: Path(p).name for slot, p in (row.get("files") or {}).items()},
+                                "expected": expected,
                                 "limit": f"{self.db.setting('image_timeout_minutes', 60)} minutes"})
         track.at("Get ready")
         status("Making room in memory for the image model…")
@@ -725,7 +825,19 @@ class Images:
         proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(exe.parent), env=env, stdout=asyncio.subprocess.PIPE,
                                                     stderr=asyncio.subprocess.STDOUT, creationflags=NO_WINDOW)
         tail = []
-        drawing = [False]
+        drawing, picture, paces = [False], [1], []
+        beat = getattr(status, "beat", status)
+        which = lambda: f" picture {picture[0]} of {count}" if count > 1 else ""        # noqa: E731
+
+        def draws():
+            """The engine has started to draw: the plan moves on, and a long silence is now normal."""
+            if not drawing[0]:
+                drawing[0] = True
+                track.at("Draw")
+            status(f"{row['name']}: drawing{which()}" + ("" if guess else
+                   " (how long a step takes on this computer shows after the first one)"))
+            # the first step also prepares the model: it took about twice as long as the others in a real run
+            track.expect(guess * 2.5 if guess else (600 if backend == "cpu" else 180))
 
         async def pump():
             buffer = b""
@@ -742,17 +854,30 @@ class Images:
                     tail.append(line)
                     del tail[:-60]
                     track.output(line)
-                    m = re.search(r"(\d+)\s*/\s*(\d+)", line)
-                    if m and int(m.group(2)) == steps and int(m.group(1)) <= steps:
-                        if not drawing[0]:
-                            drawing[0] = True
-                            track.at("Draw")
-                            status(f"{row['name']}: drawing, {steps} steps")
-                        # each step is a sign of life and moves the bar; the program's own lines keep every step
-                        getattr(status, "beat", status)(f"{row['name']}: step {m.group(1)} of {steps}")
-                        if track.id:
-                            self.app.jobs.progress(track.id, f"{row['name']}: step {m.group(1)} of {steps}",
-                                                   fraction=int(m.group(1)) / max(1, steps))
+                    new_picture = PICTURE_LINE.search(line)
+                    if new_picture:
+                        picture[0] = int(new_picture.group(1))
+                        draws()
+                        continue
+                    step = step_line(line)
+                    if not step:
+                        continue
+                    n, total, per = step
+                    if not drawing[0]:
+                        draws()
+                    if per > 0:
+                        paces.append(per)
+                    # each step is a sign of life and moves the bar; the program's own lines keep every step
+                    text = (f"{row['name']}:{which()}{',' if count > 1 else ''} step {n} of {total}"
+                            + (f" · about {step_time(per)} a step" if per >= 5 else ""))
+                    beat(text)
+                    if track.id:
+                        self.app.jobs.progress(track.id, text, fraction=(picture[0] - 1 + n / total) / max(1, count))
+                    if n >= total:               # after the last step the picture is turned into pixels: silent too
+                        beat(f"{row['name']}: finishing{which()} (turning what was drawn into a picture file)…")
+                        track.expect(max(180.0, per * 2))
+                    else:
+                        track.expect(per)
         try:
             await asyncio.wait_for(pump(), float(self.db.setting("image_timeout_minutes", 60)) * 60)
             code = await proc.wait()
@@ -764,6 +889,10 @@ class Images:
         except asyncio.CancelledError:
             proc.kill()
             raise
+        track.expect(None)
+        if len(paces) > 1 or (paces and not known):       # remember this computer's speed with this model
+            usual = sorted(paces[1:] or paces)[len(paces[1:] or paces) // 2]
+            self.db.set_setting(speed_key, {"per_megapixel": round(usual / megapixels, 2), "at": now()})
         paths = sorted(p for p in out_dir.glob(f"{name}*") if p.suffix.lower() in IMAGE_EXT)
         if code != 0 or not paths:
             self.app.log(f"image engine ({backend}) exit {code}: " + " | ".join(tail[-12:]))

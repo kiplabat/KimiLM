@@ -61,7 +61,7 @@ async def _model(ctx, name, image):
 
 
 async def _make(ctx, prompt, image=None, mask=None, model=None, shape=None, width=None, height=None, count=1,
-                seed=None, negative_prompt="", strength=None):
+                seed=None, negative_prompt="", strength=None, effect=None, redraw=False):
     source = mask_path = None
     if image:
         source = ctx.resolve(image)
@@ -71,22 +71,31 @@ async def _make(ctx, prompt, image=None, mask=None, model=None, shape=None, widt
         mask_path = ctx.resolve(mask)
         if not mask_path.is_file():
             raise ToolError(f"No file at {mask_path}")
-    row = await _model(ctx, model, source)
-    if not source or shape or (width and height):               # a change keeps the picture's own shape
-        width, height = size_for(row, shape, width, height)
+    from .. import effects
+    by_code = bool(source) and not mask_path and (bool(effect) or (not redraw and effects.find(prompt) is not None))
+    if by_code:                                                 # an image operation: no model, nothing to ask
+        row = {"id": None, "name": "KimiLM itself (no model)", "kind": "code", "settings": {}}
+    else:
+        row = await _model(ctx, model, source)
+        if not source or shape or (width and height):           # a change keeps the picture's own shape
+            width, height = size_for(row, shape, width, height)
 
     status = ctx.reporter()
     try:
         records = await ctx.app.images.generate(
             prompt, model=row["id"], out_dir=ctx.primary / "images", negative=negative_prompt or "", width=width,
             height=height, seed=seed, count=count, image=source, mask=mask_path, strength=strength,
-            chat_id=ctx.chat["id"], job_id=ctx.job_id, on_status=status)
+            chat_id=ctx.chat["id"], job_id=ctx.job_id, on_status=status, effect=effect or None, redraw=bool(redraw))
     except ImageError as exc:
         raise ToolError(str(exc)) from exc
     ctx.notes.setdefault("media", []).extend(
         {"id": r["id"], "kind": "image", "path": r["path"], "name": r["name"], "prompt": r["prompt"],
          "model": r["model_name"], "source": r["source"], "params": r["params"]} for r in records)
     p = records[0]["params"]
+    if p.get("mode") == "effect":
+        return (f"Changed the picture in code ({p.get('what')}; {p['width']}x{p['height']}, {p.get('format')}, "
+                f"{p['seconds']:g} s; no image model was needed):\n- {records[0]['path']}\n"
+                "The user sees it in the chat. Nothing else in the picture was changed.")
     facts = [f"{p['width']}x{p['height']}"]
     if p.get("seed") is not None:
         facts.append(f"seed {p['seed']}")
@@ -109,9 +118,10 @@ async def generate_image(ctx, prompt, shape=None, count=1, negative_prompt="", s
                        negative_prompt=negative_prompt)
 
 
-async def edit_image(ctx, image, prompt, mask=None, strength=None, count=1, seed=None, model=None, negative_prompt=""):
+async def edit_image(ctx, image, prompt, mask=None, strength=None, count=1, seed=None, model=None, negative_prompt="",
+                     effect=None, redraw=False):
     return await _make(ctx, prompt, image=image, mask=mask, model=model, count=count, seed=seed,
-                       negative_prompt=negative_prompt, strength=strength)
+                       negative_prompt=negative_prompt, strength=strength, effect=effect, redraw=redraw)
 
 
 S = lambda props, req: {"type": "object", "properties": props, "required": req}  # noqa: E731
@@ -131,10 +141,19 @@ TOOLS = [
          generate_image, "images", label="Make picture", summary=lambda a: str(a.get("prompt", ""))[:160]),
     Tool("edit_image",
          "Change a picture that exists (one the user attached, or one made earlier): say what should be different. "
-         "With `mask` (a black picture of the same size, white where the change may happen) only that part changes.",
+         "A simple change is done at once and exactly, with no model: give it as `effect`. For anything else the "
+         "image model does it; if it answers that it can only redraw from a description, call again with `prompt` "
+         "describing the finished picture and `redraw` true. With `mask` (a black picture of the same size, white "
+         "where the change may happen) only that part changes.",
          S({"image": {"type": "string", "description": "Path of the picture to change."},
             "prompt": {"type": "string", "description": "What to change, or what the picture should show afterwards."},
             "mask": {"type": "string"},
+            "effect": {"type": "string", "enum": ["glow", "grayscale", "sepia", "blur", "sharpen", "brighten", "darken",
+                                                  "contrast", "saturate", "invert", "mirror", "flip", "rotate",
+                                                  "resize", "border", "format"],
+                       "description": "A change made in code: keeps the size, the file format and everything else. "
+                                      "Put details in `prompt` (a colour, 'strong', '800 x 600', '90 degrees', 'jpg')."},
+            "redraw": {"type": "boolean", "description": "True when `prompt` describes the finished picture."},
             "strength": {"type": "number", "minimum": 0.1, "maximum": 1,
                          "description": "How far it may move from the original (0.3 a touch-up, 0.8 a new picture)."},
             **COMMON}, ["image", "prompt"]),

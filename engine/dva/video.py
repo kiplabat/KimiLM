@@ -30,6 +30,7 @@ from pathlib import Path
 import httpx
 
 from .db import new_id, now
+from .images import step_line, step_time
 from .jobs import turn
 from .providers import cloud_id, month_key
 from .sound import SoundError, read_pcm, slug, srt
@@ -968,16 +969,19 @@ class Video:
                     tail.append(line)
                     del tail[:-60]
                     track.output(line)
-                    m = re.search(r"(\d+)\s*/\s*(\d+)", line)
-                    if m and int(m.group(2)) == steps and int(m.group(1)) <= steps:
+                    step = step_line(line)             # the engine's own step lines and its own total (2.15.0)
+                    if step:
+                        n, total, per = step
                         if not drawing[0]:
                             drawing[0] = True
                             track.at("Make the frames")
-                            status(f"{row['name']}: making {frames} frames, {steps} steps")
-                        status.beat(f"{row['name']}: step {m.group(1)} of {steps}")
+                            status(f"{row['name']}: making {frames} frames, {total} steps")
+                        text = f"{row['name']}: step {n} of {total}" + (f" · about {step_time(per)} a step" if per >= 5 else "")
+                        status.beat(text)
                         if job_id:
-                            self.app.jobs.progress(job_id, f"{row['name']}: step {m.group(1)} of {steps}",
-                                                   fraction=int(m.group(1)) / max(1, steps))
+                            self.app.jobs.progress(job_id, text, fraction=n / total)
+                            # a step of a clip takes minutes on a processor: that silence is normal
+                            self.app.jobs.expect(job_id, per if n < total else max(300.0, per * 2))
         try:
             await asyncio.wait_for(pump(), minutes * 60)
             code = await proc.wait()

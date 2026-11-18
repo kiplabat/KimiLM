@@ -277,6 +277,7 @@ class Connectors:
         self.sessions = {}
         self.tool_cache = {}  # id -> (time, tools)
         self.info = {}        # id -> what the server said about itself at the last connection
+        self.unreachable = {}  # id -> (when, why) its tools could not be listed
         self.auth_root = plugins.paths.data / "mcp-auth"
 
     # ------------------------------------------------------------------ values kept in the credential store
@@ -505,6 +506,7 @@ class Connectors:
                          "parameters": schema or {"type": "object", "properties": {}},
                          "readonly": readonly, "destructive": bool(destructive) and not readonly})
         self.tool_cache[connector_id] = (time.time(), rows)
+        self.unreachable.pop(connector_id, None)
         info = self.info[connector_id] = dict(session.info)
         # a server may announce resources and prompts and have none: count them, so nothing is offered in vain
         for kind, listing in (("resources", self.resources), ("prompts", self.prompts)):
@@ -523,6 +525,81 @@ class Connectors:
     def has(self, connector_id, kind):
         """Does this server really have resources / prompts (as of its last connection)?"""
         return int((self.info.get(connector_id) or {}).get(f"{kind}_count") or 0) > 0
+
+    # ------------------------------------------------------------------ what planners and agents are told (2.15.0)
+    def usable(self):
+        """The connectors a task may use without anyone choosing them for it: switched on, and able to connect
+        with nobody there (its key is saved, its sign-in was made). A scheduled or long-running task that was
+        given no connectors gets these, so that what is installed is what it can use."""
+        return [c["id"] for c in self.all() if c.get("enabled", True) and c.get("ready", True)]
+
+    async def learn(self, ids):
+        """Make sure each of these servers has said what it offers (one connection each; kept for ten minutes).
+        A server that cannot be reached is remembered with the reason and does not stop the others."""
+        for cid in ids or []:
+            if self.tool_cache.get(cid) and time.time() - self.tool_cache[cid][0] < 600:
+                continue
+            if self.down(cid):
+                continue
+            try:
+                await self.list_tools(cid)
+            except Exception as exc:
+                self.mark_down(cid, exc)
+
+    def mark_down(self, connector_id, exc):
+        self.unreachable[connector_id] = (time.time(), f"{type(exc).__name__}: {str(exc)[:140]}")
+
+    def down(self, connector_id):
+        """Why this server could not be reached, if that was found out in the last ten minutes: a task with
+        nobody watching does not wait for the same dead server again at every step."""
+        when, why = self.unreachable.get(connector_id) or (0, "")
+        return why if why and time.time() - when < 600 else None
+
+    def offers(self, connector_id):
+        """The tools of a server as last heard (from this session, else from what was saved at its last test)."""
+        cached = self.tool_cache.get(connector_id)
+        if cached:
+            return cached[1]
+        conf = self.get(connector_id, reveal=False) or {}
+        return [{"name": t.get("name") or "", "description": t.get("description") or "",
+                 "readonly": bool(READONLY_NAME.match(t.get("name") or ""))}
+                for t in conf.get("tools") or [] if isinstance(t, dict) and t.get("name")]
+
+    def names(self, ids):
+        return [c["name"] for c in (self.get(cid, reveal=False) for cid in ids or []) if c and c.get("enabled", True)]
+
+    def digest(self, ids, tools=10, width=70):
+        """What the connected services promise, in a line or two each: the name, what it is for, and its tools
+        with a few words on each. This is what makes a planner write 'look it up with the X connector' instead of
+        'search the web', and what tells an agent that the endpoint it needs exists. No connection is made here:
+        the text is built from what each server said when it was last connected."""
+        def first(text, n):
+            text = " ".join(str(text or "").split())
+            cut = re.split(r"(?<=[.!?])\s", text, maxsplit=1)[0]
+            return cut[:n].rstrip(" .,;:") + ("…" if len(cut) > n else "")
+
+        lines = []
+        for cid in ids or []:
+            conf = self.get(cid, reveal=False)
+            if not conf or not conf.get("enabled", True):
+                continue
+            info = self.info.get(cid) or conf.get("info") or {}
+            about = first(conf.get("description") or info.get("instructions") or info.get("title") or "", 140)
+            rows = self.offers(cid)
+            head = f"- {conf['name']}" + (f": {about}" if about else "")
+            if self.down(cid) and not rows:
+                lines.append(f"{head} (it could not be reached: {self.down(cid)})")
+                continue
+            if not rows:
+                lines.append(f"{head} (its tools are listed once it is connected)")
+                continue
+            # reading tools first: they are what a step usually needs, and they never ask
+            ordered = sorted(rows, key=lambda t: not t.get("readonly"))
+            shown = "; ".join(t["name"] + (f" ({first(t['description'], width)})" if t.get("description") else "")
+                              for t in ordered[:tools])
+            more = len(rows) - tools
+            lines.append(f"{head}. Tools: {shown}" + (f"; and {more} more" if more > 0 else ""))
+        return "\n".join(lines)
 
     async def resources(self, connector_id):
         """What the server offers to read: documents, records, files (and templates for addresses with blanks)."""

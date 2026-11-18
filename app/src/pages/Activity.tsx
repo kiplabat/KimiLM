@@ -128,7 +128,7 @@ function TaskRow({ j, live, onOpen }: { j: any; live: any; onOpen: () => void })
       <div className="grow">
         <div className="row gap-s"><b className="ellipsis">{j.title}</b><Badge>{KIND_NAME[j.kind] || j.kind}</Badge>
           {j.status === "waiting" && <Badge kind="warn">needs your approval</Badge>}
-          {j.status === "running" && <Pulse seenAt={live?.seenAt ?? (j.quiet == null ? null : j.loaded - j.quiet * 1000)} running now={now} />}</div>
+          {j.status === "running" && <Pulse seenAt={live?.seenAt ?? (j.quiet == null ? null : j.loaded - j.quiet * 1000)} running now={now} pace={live && "pace" in live ? live.pace : j.pace} />}</div>
         {running && now ? <div className="small job-now">{now}</div> : null}
         {running && fraction != null ? <div className="run-bar"><span style={{ width: `${Math.max(2, Math.round(fraction * 100))}%` }} /></div> : null}
         <div className="small muted">{fmtTime(j.created)}{took >= 1 ? ` · ${running ? "running for" : "took"} ${span(took)}` : ""}{j.harness ? ` · ${j.harness}` : ""}{j.model ? ` · ${j.model}` : ""}
@@ -153,8 +153,8 @@ export default function Activity() {
   useEffect(() => { load(); }, []);
   useEvent((e) => {
     if (e.kind === "job") load();
-    if (e.kind === "job_progress") setLive((p) => ({ ...p, [e.id]: { ...p[e.id], text: e.text, fraction: e.fraction ?? p[e.id]?.fraction, seenAt: Date.now() } }));
-    if (e.kind === "job_trail") setLive((p) => ({ ...p, [e.id]: { ...p[e.id], ...(e.entry.kind === "step" ? { text: e.entry.text, fraction: null } : {}), seenAt: Date.now() } }));
+    if (e.kind === "job_progress") setLive((p) => ({ ...p, [e.id]: { ...p[e.id], text: e.text || p[e.id]?.text, fraction: e.fraction ?? p[e.id]?.fraction, pace: e.pace ?? null, seenAt: Date.now() } }));
+    if (e.kind === "job_trail") setLive((p) => ({ ...p, [e.id]: { ...p[e.id], ...(e.entry.kind === "step" ? { text: e.entry.text, fraction: null, pace: null } : {}), seenAt: Date.now() } }));
     if (e.kind === "job_detail") setLive((p) => ({ ...p, [e.id]: { ...p[e.id], seenAt: Date.now() } }));
   });
   if (!jobs) return <div className="page"><Spinner /></div>;

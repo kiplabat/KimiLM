@@ -62,6 +62,10 @@ def engine():
             prog = ace / f"ace-{tool}"
             prog.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{TESTS / "fake_ace.py"}" {tool} "$@"\n')
             prog.chmod(0o755)
+    # KimiLM ships no plugin (2.15.0). The plugin the tests exercise (settings, a set-up script, a pipeline
+    # harness, a connector) is installed the way a user installs one: a folder in the data folder's plugins.
+    import shutil
+    shutil.copytree(TESTS / "plugins" / "datavera", tmp / "data" / "plugins" / "datavera")
     port = free_port()
     token = "test-token"
     env = {**os.environ, "DVA_TEST_CPU": "6x12", "DVA_TOKEN": token, "DVA_LLAMA_SERVER": str(wrapper), "DVA_SECRETS": "file",
@@ -253,6 +257,8 @@ def test_plugins(engine):
     c = engine["client"]
     plugins = {p["id"]: p for p in c.get("/api/plugins").json()["plugins"]}
     dv = plugins["datavera"]
+    assert dv["source"] == "user"                       # installed by the test: nothing is built in any more
+    assert not list((ENGINE / "builtin" / "plugins").glob("*/plugin.json")) if (ENGINE / "builtin" / "plugins").exists() else True
     assert dv["enabled"] and not dv["configured"] and dv["connectors"][0]["url"].startswith("https://")
     c.put("/api/plugins/datavera/settings", json={"api_key": "not-a-key", "topics": "glaciers"})
     dv = {p["id"]: p for p in c.get("/api/plugins").json()["plugins"]}["datavera"]
@@ -547,9 +553,11 @@ def test_loop_guard_rules():
     assert "limit" in g.check("web_search", {"query": "geothermal output olkaria"})
     g.record("read_file", {"path": "a"}, False, "Error: x")
     assert g.nudge() and g.should_stop() is None
-    for i in range(3):
-        g.record("read_file", {"path": str(i)}, False, "Error: x")
-    assert "nothing new" in g.should_stop()
+    for i, error in enumerate(("Error: no such file", "Error: it is a folder")):
+        g.record("read_file", {"path": str(i)}, False, error)
+    assert g.should_stop() is None
+    g.record("read_file", {"path": "z"}, False, "Error: the disk is full")
+    assert "nothing new" in g.should_stop()                       # six results in a row that brought nothing
 
 
 def test_scripts_can_import_their_neighbours_like_the_installed_app(tmp_path):
@@ -1142,12 +1150,13 @@ def test_a_plan_can_wait_for_approval(engine):
 
 def test_plan_repair_and_failure_kinds():
     """The pure parts: which failure a step had, and whether feedback repeats itself."""
-    from dva.orchestrator import RunFit, classify, same_objection
-    assert classify("TurnStopped: The model stopped responding twice in a row") == "timeout"
+    from dva.orchestrator import RunFit, same_objection
+    from dva.recovery import classify
+    assert classify("TurnStopped: The model stopped responding twice in a row") == "stall"
     assert classify(None, timed_out=True) == "timeout"
     assert classify("RuntimeError_: Not enough memory to load this model with these settings.") == "memory"
     assert classify("LLMContextFull: the prompt does not fit the model's context: 9000 > 8192") == "context"
-    assert classify("ToolError: no such file") == "error" and classify("") is None
+    assert classify("ToolError: no such file") == "approach" and classify("") is None
     assert same_objection("the second greeting is still missing", "The second greeting is still missing.")
     assert not same_objection("add a second greeting", "the file report.csv was not saved")
     fit = RunFit()
@@ -1563,6 +1572,77 @@ def test_the_relay_moves_on_the_last_handoff_when_the_planner_cannot_be_asked(en
     assert any("follows the last agent's handoff" in line["text"] for line in team["log"]), team["log"]
 
 
+def test_a_step_that_failed_is_not_given_again_the_same_way(engine):
+    """Two failures must not be the same (2.15.0). A step that failed is written down with the class of its
+    failure; a planner that gives the same step again is refused by code and told why, and the agent that takes
+    the other way knows what failed before it."""
+    c = engine["client"]
+    _, status, msg = start_task(c, "Long task with a stubborn planner.")
+    assert status == "done"
+    team = team_of(msg)
+    assert [t["name"] for t in team["tasks"]] == ["Fetch", "Mirror"], team["log"]
+    fetch, mirror = team["tasks"]
+    assert fetch["status"] == "failed" and fetch["kind"] == "approach" and mirror["status"] == "done"
+    assert 2 <= fetch["attempts"] <= 3
+    log = [line["text"] for line in team["log"]]
+    assert any(t.startswith("Not run again: “Fetch” already failed this way") for t in log), log
+    assert any(t.startswith("Round 3 of 3 for s1 with a fresh agent") for t in log), log    # the third round differed
+    h = team["mission"]["handoffs"][0]
+    assert h["status"] == "failed" and h["class"] == "approach" and "exploded" in h["found"]
+    brief = first_user_text(c, mirror["chat_id"])
+    assert "do not do it again the same way" in brief and "\nFailed: what you tried that did not work" in brief
+    assert "### s1 Fetch (failed)" in brief
+    assert team["mission"]["changes"] == 1
+
+
+def test_a_task_that_cannot_get_past_a_failure_pauses_and_says_what_was_tried(engine):
+    """After several different recoveries have failed too, a person is needed: the task pauses, says what was
+    tried and how each try failed, and goes on with what the user answers."""
+    c = engine["client"]
+    c.put("/api/settings", json={"recovery_attempts": 1})
+    try:
+        chat_id, status, msg = start_task(c, "Long task: a hopeless task that fails whatever is tried.")
+        assert status == "done" and msg["content"].startswith("**Paused:** 2 steps in a row failed"), msg["content"][:300]
+        assert "What was tried and how it failed" in msg["content"]
+        assert "s1 “Try 1”" in msg["content"] and "s2 “Try 2”" in msg["content"] and "exploded" in msg["content"]
+        run = c.get(f"/api/chats/{chat_id}").json()["open_run"]
+        assert run["status"] == "paused" and run["pause"]["kind"] == "recovery"
+        assert [t["status"] for t in team_of(msg)["tasks"]] == ["failed", "failed"]
+        job = c.post(f"/api/chats/{chat_id}/messages", json={"text": "leave it and write up what you have"}).json()
+        assert wait_job(c, job["job_id"], timeout=120)["status"] == "done"
+        assert c.get(f"/api/chats/{chat_id}").json()["open_run"] is None
+        assert len(team_of(last_assistant(c, chat_id))["tasks"]) == 2            # nothing more was tried
+    finally:
+        c.put("/api/settings", json={"recovery_attempts": 3})
+
+
+def test_tasks_with_nobody_watching_know_and_use_the_connected_services(engine):
+    """(2.15.0) A long-running or scheduled task that was given no connectors may use every connector that is
+    switched on. Its planner is told what each service promises, its agents are told to go there first, and
+    the service's tools are in their hands."""
+    c = engine["client"]
+    conn = next(x for x in c.get("/api/connectors").json()["connectors"] if x["name"] == "Test MCP")
+    chat_id, status, msg = start_task(c, "Long task: a relay of greetings, kept short.", {"limits": {"steps": 1}})
+    assert status == "done"
+    assert conn["id"] in c.get(f"/api/chats/{chat_id}").json()["connectors"]
+    team = team_of(msg)
+    told = team["mission"]["understanding"]
+    assert "The planner was told of these services: - Test MCP" in told and "whoami" in told, told
+    agent = team["tasks"][0]
+    brief = first_user_text(c, agent["chat_id"])
+    assert "Connected services you have tools for: Test MCP." in brief and "only for what they do not offer" in brief
+    assert conn["id"] in c.get(f"/api/chats/{agent['chat_id']}").json()["connectors"]
+    # a schedule with no connectors chosen: its run has the service's tools and uses them
+    s = c.post("/api/schedules", json={"name": "Who am I", "when": "every day at 06:00", "prompt": "whoami please",
+                                       "harness": "agent"}).json()
+    run = c.post(f"/api/schedules/{s['id']}/run").json()
+    assert wait_job(c, run["job_id"])["status"] == "done"
+    assert conn["id"] in c.get(f"/api/chats/{run['chat_id']}").json()["connectors"]
+    step = [x for x in last_assistant(c, run["chat_id"])["meta"]["steps"] if x["type"] == "tool"][0]
+    assert step["name"].endswith("whoami") and step["ok"], step
+    c.delete(f"/api/schedules/{s['id']}")
+
+
 def test_a_stopped_long_task_continues_where_it_was(engine):
     c = engine["client"]
     made = c.post("/api/missions", json={"text": "Long task: a relay of greetings (slow-steps)."}).json()
@@ -1652,7 +1732,10 @@ def test_handoffs_limits_and_tool_kits_in_code():
     from dva.orchestrator import lean_kit
     h = parse_handoff("I looked at three files.\n\n## Handoff\nDone: read a.csv, 12 rows\nFound: nothing new\n"
                       "Next: chart the rows\nand save it")
-    assert h == {"done": "read a.csv, 12 rows", "found": "nothing new", "next": "chart the rows\nand save it"}
+    assert h == {"done": "read a.csv, 12 rows", "found": "nothing new", "failed": "", "next": "chart the rows\nand save it"}
+    h = parse_handoff("## Handoff\nDone: nothing usable\nFound: the site blocks robots\nFailed: web_fetch on the "
+                      "ministry site, HTTP 403 twice\nNext: try the web archive")
+    assert h["failed"] == "web_fetch on the ministry site, HTTP 403 twice" and h["next"] == "try the web archive"
     h = parse_handoff("**Handoff**\n- **Done:** fixed the test\n- **Next:** nothing: the task is complete")
     assert h["done"] == "fixed the test" and h["next"].startswith("nothing") and h["found"] == ""
     assert parse_handoff("Just an answer without the block.")["done"] == "Just an answer without the block."
@@ -1660,6 +1743,175 @@ def test_handoffs_limits_and_tool_kits_in_code():
         {"hours": 2.5, "steps": 400, "step_minutes": 45, "tokens": 0, "cost": 0.0}
     assert "browser" in lean_kit("Log in to the portal and click the Export button")
     assert "browser" not in lean_kit("Read notes.txt and list the names")
+
+
+def test_failures_have_a_class_and_the_same_attempt_is_not_made_twice():
+    """recovery.py: what kind of failure it was decides what may happen next, and an attempt that equals a failed
+    one is refused unless its class says the same may be tried again."""
+    from types import SimpleNamespace
+    from dva import recovery as rc
+    from dva.orchestrator import Orchestra
+    # the same error is recognised whatever numbers, paths and addresses it carries
+    assert rc.signature("HTTP 403 for https://a.example/x?id=7 after 12.5 s") == rc.signature("HTTP 403 for https://b.example/y after 3 s")
+    assert rc.signature("no such file C:\\Users\\a\\x.csv") == rc.signature("no such file /home/b/y.csv")
+    assert rc.signature("HTTP 403 for https://a.example") != rc.signature("HTTP 404 not found")[:0] + rc.signature("the page is empty")
+    # classes
+    assert rc.classify("ConnectError: connection reset by peer") == "transient"
+    assert rc.classify("CloudError: 503 service unavailable, try again later") == "transient"
+    assert rc.classify(None, guard="the time limit of 30 minutes was reached") == "timeout"
+    assert rc.classify(None, guard="it used all 10 steps this harness allows", objection="not complete") == "timeout"
+    assert rc.classify(None, guard="web_fetch failed three times with the same error (HTTP 403)") == "approach"
+    assert rc.classify(None, guard="the last six tool calls produced nothing new") == "approach"
+    assert rc.classify("ConnectionError: Notes needs you to sign in first") == "permission"
+    assert rc.classify("ImageError: The image engine is not installed. Open Images") == "missing"
+    assert rc.classify(None, failures=[{"error": "The user declined this action.", "declined": True}]) == "permission"
+    assert rc.classify(None, objection="the table has no totals") == "quality"
+    assert rc.classify(None, objection="the table has no totals", repeated=True) == "capability"
+    assert rc.classify("Stopped", stopped=True) == "stopped" and rc.classify(None) is None
+    assert all(k in rc.CLASSES for k in ("transient", "stall", "timeout", "memory", "context", "approach",
+                                         "capability", "missing", "permission"))
+    # what an agent's tools reported, one entry per tool and kind of error
+    steps = [{"type": "tool", "name": "web_fetch", "arguments": {"url": "https://a.example/1"}, "ok": False,
+              "result": "Error: HTTP 403 for https://a.example/1"},
+             {"type": "tool", "name": "web_fetch", "arguments": {"url": "https://a.example/2"}, "ok": False,
+              "result": "Error: HTTP 403 for https://a.example/2"},
+             {"type": "tool", "name": "web_fetch", "arguments": {"url": "https://a.example/2"}, "ok": False, "blocked": True,
+              "result": "Blocked: you already called web_fetch"},
+             {"type": "tool", "name": "read_file", "arguments": {"path": "a.csv"}, "ok": True, "result": "1,2"},
+             {"type": "text", "text": "…"}]
+    fails = rc.tool_failures(steps)
+    assert len(fails) == 1 and fails[0]["tool"] == "web_fetch" and fails[0]["times"] == 2 and "403" in fails[0]["error"]
+    assert not rc.progressing(steps) and not rc.progressing(steps[3:4])
+    good = [{"type": "tool", "name": "read_file", "ok": True}] * 3 + [steps[0]]
+    assert rc.progressing(good) and not rc.progressing(good, guard="the agent kept repeating calls that were already made")
+    # the same attempt again
+    t = {"id": "s1", "name": "Fetch", "goal": "Download the annual report from the ministry site and save it",
+         "agent": "Researcher", "harness": "agent", "model": "m1", "attempts": 3, "failures": fails}
+    failed = rc.record(t, "it ended with an error: HTTP 403", "approach", minutes=45)
+    again = {"goal": "Download the annual report from the ministry site and save it as a file", "harness": "agent",
+             "model": "m1", "minutes": 45}
+    why = rc.refusal(again, [failed])
+    assert why and "already failed this way" in why and "HTTP 403" in why
+    assert rc.refusal({**again, "model": "m2"}, [failed]) is None                  # a stronger model is a difference
+    assert rc.refusal({**again, "harness": "researcher"}, [failed]) is None        # so is another kind of agent
+    assert rc.refusal({**again, "goal": "Find the annual report in the web archive instead"}, [failed]) is None
+    late = rc.record({**t, "progressing": True}, "it ran past its time limit and was stopped", "timeout", minutes=45)
+    assert rc.refusal(again, [late]) and rc.refusal({**again, "minutes": 90}, [late]) is None     # more time is one
+    stuck = rc.record(t, "it ran past its time limit and was stopped", "timeout", minutes=45)     # going in circles
+    assert rc.refusal({**again, "minutes": 90}, [stuck])
+    blip = rc.record(t, "ConnectError: connection reset by peer", "transient", minutes=45)
+    assert rc.refusal(again, [blip]) is None and rc.refusal(again, [blip, blip]) is None and rc.refusal(again, [blip] * 3)
+    line = rc.describe({**failed, "change": "a fresh agent told to go another way"}, "Qwen 9B")
+    assert line.startswith("- s1 “Fetch” [Researcher, Qwen 9B, 45 min] — this way of doing it did not work:")
+    assert "web_fetch ×2" in line and line.endswith("→ then: a fresh agent told to go another way")
+    # more time after a timeout: twice as long, never past what the run has left
+    run = SimpleNamespace(step_minutes=lambda t: float(t["limits"].get("time_limit_minutes") or 30),
+                          minutes_left=lambda: 100.0, harness_of=lambda t: {"max_steps": 10})
+    step = {"limits": {"time_limit_minutes": 30}}
+    assert Orchestra.more_time(run, step) == 60 and step["limits"] == {"time_limit_minutes": 60.0, "max_steps": 20}
+    run.minutes_left = lambda: 35.0
+    assert Orchestra.more_time(run, {"limits": {"time_limit_minutes": 30}}) is None     # not a real difference
+
+
+def test_the_same_error_twice_is_said_and_three_times_stops_the_agent():
+    from types import SimpleNamespace
+    from dva.runner import LoopGuard
+    turn = SimpleNamespace(limits={}, harness={}, db=SimpleNamespace(setting=lambda k, d=None: d))
+    g = LoopGuard(turn)
+    g.record("web_fetch", {"url": "https://a.example/1"}, False, "Error: HTTP 403 for https://a.example/1")
+    assert g.advice is None
+    g.record("run_python", {"code": "x"}, False, "Error: NameError: name 'x' is not defined")     # another failure
+    g.record("web_fetch", {"url": "https://a.example/2"}, False, "Error: HTTP 403 for https://a.example/2")
+    assert "web_fetch has now failed twice with the same error" in g.advice and not g.should_stop()
+    g.advice = None
+    g.record("web_fetch", {"url": "https://a.example/3"}, True, "the page")
+    g.record("web_fetch", {"url": "https://a.example/4"}, False, "Error: HTTP 403 for https://a.example/4")
+    assert g.should_stop().startswith("web_fetch failed three times with the same error (Error: HTTP 403")
+
+
+def test_the_image_engines_own_lines_are_read_as_it_really_prints_them():
+    """Lines copied from a real run of the pinned image engine on Windows (18 Nov 2026): a redraw of 6 steps at
+    strength 0.6 draws 4, and the bars it prints while loading are not steps."""
+    from dva.images import INSTRUCTION, PICTURE_LINE, step_line
+    assert step_line("|============>                                     | 1/4 - 223.44s/it - ETA 11:10") == (1, 4, 223.44)
+    assert step_line("|=========================>                        | 2/4 - 222.96s/it - ETA 07:26") == (2, 4, 222.96)
+    assert step_line("|###                                               |  16/386 -  51.82MB/s") is None
+    assert step_line("|##################################################| 452/452 - 231.85MB/s") is None
+    assert step_line("[I] target t_enc is 3 steps --- image.cpp:245") is None
+    n, total, per = step_line("|=====>              | 3/20 - 4.00it/s")
+    assert (n, total) == (3, 20) and abs(per - 0.25) < 1e-9
+    assert PICTURE_LINE.search("[I] generating image: 1/2 - seed 10 --- image.cpp:1005").groups() == ("1", "2")
+    assert not PICTURE_LINE.search("[I] generate_image 768x768 --- image.cpp:954")
+    assert INSTRUCTION.match("Make the picture glow on its outline. Deliver in the same format.")
+    assert INSTRUCTION.match("please remove the car") and not INSTRUCTION.match("A red kite over a green hill")
+
+
+def test_changes_that_need_no_model(tmp_path):
+    from PIL import Image, ImageDraw
+    from dva import effects
+    assert effects.find("Make the picture glow on its outline. Deliver in the same format.") == ("glow", {"amount": 1.0})
+    assert effects.find("add a strong blue glow around the edges")[1] == {"colour": "blue", "amount": 1.6}
+    assert effects.find("make it black and white")[0] == "grayscale" and effects.find("blur it slightly") == ("blur", {"amount": 0.6})
+    assert effects.find("resize it to 800 x 600")[1]["width"] == 800 and effects.find("make it smaller")[1]["scale"] == 0.5
+    assert effects.find("rotate the image 90 degrees right")[1]["degrees"] == -90
+    assert effects.find("convert the picture to jpg")[1]["format"] == "jpg"
+    # more than an effect, or no effect at all: a model has to do it
+    for text in ("Make the sky glow orange and add a dragon flying over the castle", "a castle on a hill at sunset",
+                 "make the cat wear a hat", "make the background brighter and remove the tree on the left side"):
+        assert effects.find(text) is None, text
+    cut = tmp_path / "cut out.png"                              # a cut-out: the glow goes around what is not transparent
+    img = Image.new("RGBA", (300, 200), (0, 0, 0, 0))
+    ImageDraw.Draw(img).ellipse((100, 50, 200, 150), fill=(200, 40, 40, 255))
+    img.save(cut)
+    path, facts = effects.apply(cut, tmp_path / "out", "glow", {"colour": "blue"})
+    out = Image.open(path)
+    assert path.suffix == ".png" and out.size == (300, 200) and facts["how"] == "the edge of the cut-out"
+    assert out.getpixel((150, 100)) == (200, 40, 40, 255)                         # the subject is untouched
+    edge = out.getpixel((96, 100))
+    assert edge[3] > 60 and edge[2] > edge[0] and out.getpixel((5, 5))[3] == 0    # blue light just outside, none far away
+    plain = tmp_path / "plain.jpg"                              # a plain background: around what stands out from it
+    img = Image.new("RGB", (300, 200), (245, 245, 240))
+    ImageDraw.Draw(img).rectangle((100, 50, 200, 150), fill=(20, 110, 80))
+    img.save(plain, quality=95)
+    path, facts = effects.apply(plain, tmp_path / "out", "glow", {})
+    out = Image.open(path)
+    assert path.suffix == ".jpg" and out.format == "JPEG" and out.size == (300, 200)      # the same format and size
+    assert facts["how"] == "what stands out from the plain background"
+    far, near, inside = out.getpixel((10, 10)), out.getpixel((95, 100)), out.getpixel((150, 100))
+    assert abs(far[2] - 240) < 6 and near[2] < far[2] - 15 and abs(inside[1] - 110) < 8   # warm light at the outline only
+    path, facts = effects.apply(plain, tmp_path / "out", "resize", {"width": 150, "height": 100})
+    assert Image.open(path).size == (150, 100) and facts["was"] == "300 × 200"
+    path, _ = effects.apply(plain, tmp_path / "out", "format", {"format": "png"})
+    assert path.suffix == ".png" and Image.open(path).format == "PNG"
+    grey = Image.open(effects.apply(cut, tmp_path / "out", "grayscale", {})[0]).getpixel((150, 100))
+    assert grey[0] == grey[1] == grey[2] and grey[3] == 255
+
+
+def test_what_connected_services_promise_is_put_into_words():
+    from dva.mcp import Connectors
+    cn = Connectors.__new__(Connectors)
+    cn.tool_cache, cn.info, cn.unreachable = {}, {}, {}
+    confs = {"a": {"id": "a", "name": "Datasets", "enabled": True, "tools": [],
+                   "description": "A catalogue of public datasets. It has more to say."},
+             "b": {"id": "b", "name": "Mail", "enabled": True, "description": "",
+                   "tools": [{"name": "send_mail", "description": "Send a message."},
+                             {"name": "list_mail", "description": "List the inbox."}]},
+             "c": {"id": "c", "name": "Off", "enabled": False},
+             "d": {"id": "d", "name": "Far away", "enabled": True, "description": "A remote service", "tools": []}}
+    cn.get = lambda cid, reveal=True: confs.get(cid)
+    cn.tool_cache["a"] = (time.time(), [
+        {"name": "publish", "description": "Publish a dataset. It becomes public.", "readonly": False},
+        {"name": "search_datasets", "readonly": True,
+         "description": "Search the catalogue by keyword and year, with a great many options that go on and on and on"}])
+    cn.mark_down("d", ConnectionError("no route to host"))
+    lines = cn.digest(["a", "b", "c", "d", "gone"]).splitlines()
+    assert len(lines) == 3
+    assert lines[0].startswith("- Datasets: A catalogue of public datasets. Tools: search_datasets (Search the catalogue by")
+    assert "…); publish (Publish a dataset)" in lines[0]               # reading tools first, a few words on each
+    assert lines[1] == "- Mail. Tools: list_mail (List the inbox); send_mail (Send a message)"
+    assert lines[2] == "- Far away: A remote service (it could not be reached: ConnectionError: no route to host)"
+    assert cn.names(["a", "b", "c", "gone"]) == ["Datasets", "Mail"] and cn.down("d") and not cn.down("a")
+    assert cn.digest(["a"], tools=1).endswith("; and 1 more")
 
 
 def test_the_browser_tools_click_type_and_download_in_a_real_browser(tmp_path):
@@ -2071,8 +2323,13 @@ def test_pictures_are_made_and_changed_on_this_computer(engine):
     # changing a picture: redrawn from the original; with a mask only there; a model that follows instructions
     # about a picture is given it as a reference instead
     source = made["images"][0]["path"]
-    redo = wait_picture(c, c.post("/api/images/generate", json={"prompt": "make the kite blue", "image": source,
+    told = wait_picture(c, c.post("/api/images/generate", json={"prompt": "make the kite blue", "image": source,
                                                                 "strength": 0.4}).json()["id"])
+    # an instruction to a model that can only redraw fails at once and says what to do (2.15.0): it does not
+    # spend minutes on a different picture
+    assert told["state"] == "failed" and "cannot follow an instruction" in told["error"] and "redraw" in told["error"]
+    redo = wait_picture(c, c.post("/api/images/generate", json={"prompt": "make the kite blue", "image": source,
+                                                                "strength": 0.4, "redraw": True}).json()["id"])
     a, _ = asked(redo["images"][0]["path"])
     assert a["init"] == source and a["strength"] == "0.4" and not a["refs"] and redo["images"][0]["params"]["mode"] == "redraw"
     part = wait_picture(c, c.post("/api/images/generate", json={"prompt": "a cloud", "image": source, "mask": source}).json()["id"])
@@ -2137,12 +2394,76 @@ def test_an_agent_makes_a_picture_and_changes_it(engine):
     assert step["name"] == "edit_image" and step["ok"], step
     a, size = asked(step["media"][0]["path"])
     assert a["init"] == picture["path"] and a["prompt"] == "the kite is blue" and size == (512, 512)
+    assert a["steps"] == "6" and a["strength"] == "0.6"            # (the engine then draws 4 of the 6 steps)
     # a picture outside the chat's folders is not touched
     job = c.post(f"/api/chats/{chat['id']}/messages",
                  json={"text": f"repaint {tmp / 'checkpoints' / 'tiny-sd.safetensors'} so that it is blue"}).json()
     wait_job(c, job["job_id"])
     step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
     assert not step["ok"] and "outside the folders" in step["result"] and "media" not in step
+
+
+def test_simple_changes_need_no_model_and_instructions_go_to_a_model_that_follows_them(engine):
+    """(2.15.0) "Make the picture glow on its outline" is an image operation: done in code in a moment, at the
+    picture's own size and in its own format. An instruction that is more than that goes to a model that follows
+    instructions when one is installed; and the bar of a redraw follows the steps the engine really does."""
+    from PIL import Image, ImageDraw
+    c, tmp = engine["client"], engine["tmp"]
+    folder = tmp / "logo-project"
+    folder.mkdir()
+    src = folder / "logo.png"
+    img = Image.new("RGBA", (300, 200), (0, 0, 0, 0))
+    ImageDraw.Draw(img).ellipse((100, 50, 200, 150), fill=(200, 40, 40, 255))
+    img.save(src)
+    job = wait_picture(c, c.post("/api/images/generate", json={
+        "prompt": "Make the picture glow on its outline. Deliver in the same format.", "image": str(src), "count": 2}).json()["id"])
+    assert job["state"] == "done" and len(job["images"]) == 1, job
+    p = job["images"][0]
+    assert p["params"]["mode"] == "effect" and p["params"]["effect"] == "glow" and p["source"] == "code"
+    assert p["model_name"].startswith("KimiLM itself") and p["params"]["seconds"] < 5
+    out = Image.open(p["path"])
+    assert out.size == (300, 200) and out.format == "PNG" and out.getpixel((150, 100)) == (200, 40, 40, 255)
+    assert out.getpixel((96, 100))[3] > 60 and out.getpixel((5, 5))[3] == 0
+    task = c.get(f"/api/jobs/{job['job_id']}").json()
+    assert task["detail"]["stages"] == ["Change the picture", "Save"] and task["detail"]["picture"]["change"] == "a glow on its outline"
+    assert any("no image model is needed" in e["text"] for e in task["trail"])
+    # an agent asked for a simple change: the same way, and it says so
+    chat = c.post("/api/chats", json={"harness": "agent", "folders": [str(folder)]}).json()
+    run = c.post(f"/api/chats/{chat['id']}/messages", json={"text": f"repaint {src} so that it is black and white"}).json()
+    assert wait_job(c, run["job_id"])["status"] == "done"
+    step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
+    assert step["ok"] and "Changed the picture in code" in step["result"] and step["media"][0]["params"]["effect"] == "grayscale"
+    # more than an effect: the model that follows instructions takes it, when nobody chose the model
+    weights = tmp / "checkpoints" / "tiny-sd.safetensors"
+    editor = c.post("/api/images/models", json={"name": "Tiny Edit 2", "files": {"diffusion_model": str(weights), "vae": str(weights)},
+                                                "edit": "reference", "settings": {"steps": 4, "cfg": 1.0}}).json()
+    c.put("/api/images/models/tiny-sd", json={"default": True})      # the default is the model that only redraws
+    done = wait_picture(c, c.post("/api/images/generate", json={"prompt": "remove the red circle and add a tree",
+                                                                "image": str(src)}).json()["id"])
+    assert done["state"] == "done", done
+    a, _ = asked(done["images"][0]["path"])
+    assert a["refs"] == [str(src)] and done["images"][0]["model_name"] == "Tiny Edit 2"
+    note = c.get(f"/api/jobs/{done['job_id']}").json()["trail"]
+    assert any("Tiny Edit 2 is used instead of Tiny SD" in e["text"] for e in note), [e["text"] for e in note if e["kind"] != "output"]
+    c.delete(f"/api/images/models/{editor['id']}")
+    # a redraw of 8 steps at strength 0.5 draws 5: the bar counts what the engine does, for each picture in turn
+    slow = c.post("/api/images/generate", json={"prompt": "a slow picture, redrawn", "image": str(src), "redraw": True,
+                                                "steps": 8, "strength": 0.5, "count": 2}).json()
+    seen = None
+    for _ in range(150):
+        rows = c.get("/api/jobs", params={"status": "active", "kinds": "images"}).json()["jobs"]
+        seen = next((r for r in rows if r["id"] == slow["job_id"] and r.get("fraction")
+                     and "picture 2 of 2, step" in (r.get("progress") or "")), None)
+        if seen:
+            break
+        time.sleep(0.1)
+    assert seen and " of 5" in seen["progress"] and 0.5 < seen["fraction"] <= 1, seen
+    live = c.get(f"/api/jobs/{slow['job_id']}").json()
+    assert live["detail"]["stage"] == 2 and live["detail"]["picture_run"]["mode"] == "redraw"
+    drawn = [e["text"] for e in live["trail"] if e["kind"] == "step"]
+    assert "Tiny SD: drawing picture 1 of 2" in drawn and drawn[-1] == "Tiny SD: drawing picture 2 of 2"
+    c.delete(f"/api/images/jobs/{slow['id']}")
+    assert wait_picture(c, slow["id"])["state"] == "stopped"
 
 
 def test_picture_sizes_recipes_and_file_choice():
@@ -2603,7 +2924,8 @@ def test_music_is_made_on_this_computer_without_any_online_service(engine):
     start = c.get("/api/sound").json()
     eng = start["music_engine"]
     assert not eng["installed"] and not start["can"]["music"] and eng["commit"].startswith("ed53caf")
-    assert eng["url"].startswith("https://github.com/kiplabat/KimiLM/releases/download/music-engine-ed53caf/acestep-")
+    # the programs come from a public repository of their own (2.15.0), so that KimiLM's repository can be private
+    assert eng["url"].startswith("https://github.com/kiplabat/kimilm-engines/releases/download/music-engine-ed53caf/acestep-")
     light = next(m for m in start["catalog"] if m["key"] == "ace-step-light")
     assert light["role"] == "music" and light["recommended"] and light["licence"] == "MIT" and light["mb"] == 3300
     # a model folder needs its four files; without the engine it is there but cannot be used yet
@@ -2871,7 +3193,10 @@ def test_every_piece_of_work_is_a_task_with_a_plan_and_a_trail(engine):
     assert any(e["kind"] == "output" and "stand-in" in e["text"] for e in live["trail"])
     assert any(e["kind"] == "note" and e["text"].startswith("Started: ") and "--steps 8" in e["text"] for e in live["trail"])
     drawn = [e["text"] for e in live["trail"] if e["kind"] == "step"]          # a counter that moves is not a line each time
-    assert drawn[-1].endswith("drawing, 8 steps") and not any("step 2 of 8" in t for t in drawn)
+    assert drawn[-1].endswith(": drawing") and not any("step 2 of 8" in t for t in drawn)
+    # the work says how long a silence is normal now (the stand-in's steps take "1.20s/it"), and what to expect
+    assert live["pace"] and 1 <= live["pace"] <= 200
+    assert live["detail"]["picture_run"]["expected"].startswith("about ")
     assert any(e["kind"] == "output" and "/8 " in e["text"] for e in live["trail"])       # the program's own lines have every step
     assert c.post(f"/api/jobs/{slow['job_id']}/cancel").json()["cancelled"]          # stopped from Activity
     assert wait_picture(c, slow["id"])["state"] == "stopped"
@@ -2885,7 +3210,7 @@ def test_every_piece_of_work_is_a_task_with_a_plan_and_a_trail(engine):
     assert wait_job(c, job["job_id"])["status"] == "done"
     step = next(s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool")
     said = [t["text"] for t in step["trail"]]
-    assert step["ok"] and any(t.startswith("Loading ") for t in said) and said[-1].endswith("drawing, 6 steps")
+    assert step["ok"] and any(t.startswith("Loading ") for t in said) and said[-1].endswith(": drawing")
     trail = c.get(f"/api/jobs/{job['job_id']}").json()["trail"]
     texts = [e["text"] for e in trail]
     assert any(t.startswith("Make picture") or "red kite" in t for t in texts) and any(t.startswith("Done: ") for t in texts)

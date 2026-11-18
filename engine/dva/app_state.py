@@ -66,6 +66,10 @@ DEFAULT_SETTINGS = {
     # a clip made by a model on this computer is stopped after this long
     "video_online": False, "video_online_model": "gemini-omni-1.1-flash", "video_clip_cost": 1.0,
     "video_timeout_minutes": 240,
+    # 2.15.0: failure recovery. recovery_attempts: after this many different recoveries in a row have failed too,
+    # a long-running task pauses and says what was tried; retry_wait_seconds: the first wait before a step that
+    # met a passing fault (a dropped connection, a busy service) is given again (the next wait is three times it)
+    "recovery_attempts": 3, "retry_wait_seconds": 15,
 }
 CHAT_LIMIT_KEYS = ("max_reply_tokens", "max_steps", "time_limit_minutes", "temperature", "max_searches",
                    "max_tool_calls")
@@ -295,6 +299,9 @@ class App:
         text = (text or setup["goal"]).strip()
         if not text:
             raise ValueError("Describe the task first")
+        if not connectors:                     # none chosen: every connector that can be used with nobody there
+            project = self.db.get("projects", project_id) if project_id else None
+            connectors = list((project or {}).get("connectors") or []) or self.connectors.usable()
         if not chat_id:
             chat = self.create_chat(project_id=project_id, title=setup["name"] or " ".join(text.split())[:70],
                                     model=model or None, harness="long-task", connectors=connectors,

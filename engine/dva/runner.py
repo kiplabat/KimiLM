@@ -46,6 +46,7 @@ from .llm import LLMContextFull, LLMError, LLMTimeout, LLMUnreachable, estimate_
 from .mcp import tool_key
 from .orchestrator import Orchestra, RunFit, looks_multistep, team_tools
 from .providers import is_cloud
+from .recovery import signature
 from .runtime import RuntimeError_
 from .tools import GROUPS, Tool, ToolContext, ToolDenied, ToolError, builtin_tools
 
@@ -127,6 +128,8 @@ class LoopGuard:
         self.blocked = 0
         self.nudged_at = 0
         self.stop_reason = None
+        self.errors = Counter()   # tool + what its error says -> times: two failures must not be the same (2.15.0)
+        self.advice = None        # what the model is told with the result of a call that failed the same way twice
 
     def check(self, name, args):
         """None if the call may run, else the message returned to the model instead of running it."""
@@ -163,6 +166,17 @@ class LoopGuard:
         self.done[sig] = result
         if name == "web_search":
             self.searches.append(_terms((args or {}).get("query", "")))
+        if not ok:
+            # the same tool failing with the same error: once more is a try, a third time is a loop
+            first = (result.strip().splitlines() or [""])[0]
+            key = name + "|" + signature(first)
+            self.errors[key] += 1
+            if self.errors[key] == 2:
+                self.advice = (f"Note from the app: {name} has now failed twice with the same error. Calling it "
+                               "again the same way will fail the same way. Change what causes the error, or use "
+                               "another tool or another source; if there is none, say so in your answer.")
+            elif self.errors[key] >= 3 and not self.stop_reason:
+                self.stop_reason = f"{name} failed three times with the same error ({first[:140]})"
         digest = hashlib.sha1(result[:4000].encode("utf-8", "ignore")).hexdigest()
         useless = (not ok) or result.startswith(self.UNPRODUCTIVE) or digest in self.results
         self.results.add(digest)
@@ -450,18 +464,24 @@ class Turn:
         if team:                                   # this chat is an agent in a running team
             tools += team_tools(team[0], team[1], self)
         connector_ids = list(self.chat.get("connectors") or []) or list((self.project or {}).get("connectors") or [])
-        connector_tools = []
+        connector_tools, connected = [], []
         if self.harness.get("connectors", True) and connector_ids:
             for cid in connector_ids:
                 conf = self.app.connectors.get(cid, reveal=False)
                 if not conf or not conf.get("enabled", True):
                     continue
+                down = self.app.connectors.down(cid) if self.chat.get("parent_chat_id") else None
+                if down:                       # an agent of a run does not wait again for a server found dead
+                    self.status(f"Connector {conf['name']} is unavailable: {down[:120]}")
+                    continue
                 try:
                     listed = await self.app.connectors.list_tools(cid)
                 except Exception as exc:
+                    self.app.connectors.mark_down(cid, exc)
                     self.status(f"Connector {conf['name']} is unavailable: {str(exc)[:120]}")
                     continue
                 mode = self.app.connectors.approval_mode(conf)
+                connected.append(cid)
                 for t in listed:
                     connector_tools.append(self._connector_tool(cid, conf, t, mode))
             with_resources = [cid for cid in connector_ids if self.app.connectors.has(cid, "resources")]
@@ -475,6 +495,9 @@ class Turn:
             self.connector_index = connector_tools
         else:
             tools += connector_tools
+        # the services this reply has tools for, and what each promises (system_prompt)
+        self.services = {"names": self.app.connectors.names(connected),
+                         "digest": self.app.connectors.digest(connected)} if connector_tools else None
         self.tool_map = {t.name: t for t in tools}
         return tools
 
@@ -629,10 +652,18 @@ class Turn:
             index = self.app.skills.index()
             if index:
                 parts.append("Skills (reusable instructions). If one fits the task, call load_skill first:\n" + index)
-        if getattr(self, "connector_index", None):
-            names = sorted({t.label.split(':')[0] for t in self.connector_index})
-            parts.append("Connected services: " + ", ".join(names) +
-                         ". Use find_connector_tools then use_connector_tool to work with them.")
+        services = getattr(self, "services", None)
+        if services:
+            # An agent that does not know a service has the endpoint it needs goes to the web for it (2.15.0).
+            # With many tools a local model reaches the services' tools through a find / use pair: then what
+            # each service promises is listed here, so that it knows the endpoint exists before it looks.
+            behind = bool(getattr(self, "connector_index", None))
+            parts.append("Connected services: " + ", ".join(services["names"]) + ". They are the first place to go "
+                         "for what they offer: use their tools before you search or browse the web for the same "
+                         "thing; go to the web only for what they do not offer."
+                         + ("\nTheir tools are reached with find_connector_tools (shows a tool's parameters) and "
+                            "use_connector_tool (calls it). What each service offers:\n" + services["digest"]
+                            if behind else ""))
         return "\n\n".join(parts)
 
     def history(self):
@@ -1178,6 +1209,8 @@ class Turn:
                             + ("" if ok else " (" + result.splitlines()[0][:200] + ")" if result else ""), "note", ok=ok)
         self.guard.record(call["name"], call["arguments"], ok, result, blocked=bool(blocked),
                           changed=bool(ok and tool and (tool.changes or call["name"] == "use_connector_tool")))
+        if self.guard.advice:                             # the second failure of the same kind: say so with the result
+            result, self.guard.advice = f"{result}\n{self.guard.advice}", None
         step.update(ok=ok, result=result[:4000])
         self.emit("tool_result", call_id=call["id"], ok=ok, result=result[:4000], declined=step.get("declined", False),
                   blocked=bool(blocked), media=step.get("media"), trail=step.get("trail"))

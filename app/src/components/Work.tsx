@@ -37,14 +37,19 @@ export function useTick(on = true, every = 1000) {
 }
 
 // A running task's pulse: "working" while it reports, then how long it has been quiet.
-export function Pulse({ seenAt, running, long, now }: { seenAt?: number | null; running: boolean; long?: boolean; now?: string }) {
+// `pace` is what the work itself says about its silences (2.15.0): a drawing step on a processor takes minutes, and
+// the engine says nothing until the step is done. Silence within about one and a half such steps is "working";
+// it is called possibly stuck only after three of them.
+export function Pulse({ seenAt, running, long, now, pace }: { seenAt?: number | null; running: boolean; long?: boolean; now?: string; pace?: number | null }) {
   useTick(running);
   if (!running || !seenAt) return null;
   const quiet = (Date.now() - seenAt) / 1000;
+  const calm = pace ? pace * 1.5 + 30 : QUIET, stuck = pace ? pace * 3 + 90 : STUCK;
   // work that goes one at a time says when it waits its turn: quiet then is expected, not a sign of trouble
   if ((now || "").startsWith("Waiting for")) return <span className="pulse pulse-quiet" title="It starts when the work before it is finished"><i />waiting its turn{quiet >= QUIET ? ` for ${span(quiet)}` : ""}</span>;
   if (quiet < QUIET) return <span className="pulse pulse-ok" title="It reported in the last seconds"><i />working</span>;
-  if (quiet < STUCK) return <span className="pulse pulse-quiet" title="Time since its last sign of life"><i />no news for {span(quiet)}</span>;
+  if (quiet < calm) return <span className="pulse pulse-ok" title="The program says nothing while it works on a step. This long a silence is normal here."><i />working on a step · {span(quiet)} so far, a step takes about {span(pace || 0)}</span>;
+  if (quiet < stuck) return <span className="pulse pulse-quiet" title="Time since its last sign of life"><i />no news for {span(quiet)}{pace ? ` (a step takes about ${span(pace)})` : ""}</span>;
   return (
     <span className="pulse pulse-stuck" title="Some steps are silent for a while (loading a large model, a slow processor). If this keeps growing, it is probably stuck: stop it and try again.">
       <AlertTriangle size={13} />no sign of life for {span(quiet)}{long ? ": it may be stuck" : ""}
@@ -60,22 +65,24 @@ export function useTask(id?: string | null) {
   const [now, setNow] = useState<string>("");
   const [fraction, setFraction] = useState<number | null>(null);
   const [seenAt, setSeenAt] = useState<number | null>(null);
+  const [pace, setPace] = useState<number | null>(null);
   const load = () => {
     if (!id) return;
     api.get(`/jobs/${id}`).then((j) => {
       setJob(j); setTrail(j.trail || []); setDetail(j.detail || {}); setNow(j.progress || ""); setFraction(j.fraction ?? null);
+      setPace(j.pace ?? null);
       setSeenAt(j.quiet == null ? null : Date.now() - j.quiet * 1000);
     }).catch(() => setJob({ id, missing: true }));
   };
   useEffect(() => { setJob(null); setTrail([]); setDetail({}); setNow(""); setFraction(null); load(); }, [id]);
   useEvent((e) => {
     if (!id || e.id !== id) return;
-    if (e.kind === "job_trail") { setTrail((t) => [...t, e.entry].slice(-800)); setSeenAt(Date.now()); if (e.entry.kind === "step") { setNow(e.entry.text); setFraction(null); } }
+    if (e.kind === "job_trail") { setTrail((t) => [...t, e.entry].slice(-800)); setSeenAt(Date.now()); if (e.entry.kind === "step") { setNow(e.entry.text); setFraction(null); setPace(null); } }
     if (e.kind === "job_detail") { setDetail(e.detail || {}); setSeenAt(Date.now()); }
-    if (e.kind === "job_progress") { setNow(e.text); setSeenAt(Date.now()); if (e.fraction != null) setFraction(e.fraction); }
+    if (e.kind === "job_progress") { if (e.text) setNow(e.text); setSeenAt(Date.now()); if (e.fraction != null) setFraction(e.fraction); setPace(e.pace ?? null); }
     if (e.kind === "job") load();
   }, [id]);
-  return { job, trail, detail, now, fraction, seenAt, reload: load };
+  return { job, trail, detail, now, fraction, seenAt, pace, reload: load };
 }
 
 const LABEL: any = {
@@ -187,7 +194,7 @@ export function WorkOutput({ trail, running }: { trail: any[]; running: boolean 
 
 // A task, opened: what it is, where it is, the plan, the trail, the program's own words, the result.
 export function WorkDetail({ id, onClose }: { id: string; onClose: () => void }) {
-  const { job, trail, detail, now, fraction, seenAt } = useTask(id);
+  const { job, trail, detail, now, fraction, seenAt, pace } = useTask(id);
   const running = !!job && ACTIVE.includes(job.status);
   useTick(running);
   if (!job) return <Modal wide title="Task" onClose={onClose}><Spinner /></Modal>;
@@ -208,7 +215,7 @@ export function WorkDetail({ id, onClose }: { id: string; onClose: () => void })
           <Badge>{KIND_NAME[job.kind] || job.kind}</Badge>
           {job.harness && <Badge>{job.harness}</Badge>}
           <span className="small muted">{began ? `started ${stamp(began)}` : ""}{took >= 1 ? ` · ${running ? "running for" : "took"} ${span(took)}` : ""}{job.model ? ` · ${job.model}` : ""}</span>
-          <Pulse seenAt={seenAt} running={job.status === "running"} long now={now} />
+          <Pulse seenAt={seenAt} running={job.status === "running"} long now={now} pace={pace} />
         </div>
         {running && now && <div className="work-now"><Loader2 size={14} className="spin accent" /><span>{now}</span></div>}
         {running && fraction != null && <div className="run-bar"><span style={{ width: `${Math.max(2, Math.round(fraction * 100))}%` }} /></div>}
@@ -240,17 +247,19 @@ export function WorkLine({ jobId, running, since }: { jobId?: string; running: b
   const [open, setOpen] = useState(false);
   const [seenAt, setSeenAt] = useState<number | null>(since || Date.now());
   const [stepAt, setStepAt] = useState<number>(Date.now());
+  const [pace, setPace] = useState<number | null>(null);
   useTick(running);
   useEvent((e) => {
     if (!jobId || e.id !== jobId) return;
     if (e.kind === "job_trail" || e.kind === "job_progress" || e.kind === "job_detail") setSeenAt(Date.now());
-    if (e.kind === "job_trail" && e.entry.kind === "step") setStepAt(Date.now());
+    if (e.kind === "job_trail" && e.entry.kind === "step") { setStepAt(Date.now()); setPace(null); }
+    if (e.kind === "job_progress") setPace(e.pace ?? null);
   }, [jobId]);
   if (!jobId) return null;
   return (
     <span className="work-line">
       {running && <span className="small muted">{span((Date.now() - stepAt) / 1000)} on this step</span>}
-      <Pulse seenAt={seenAt} running={running} />
+      <Pulse seenAt={seenAt} running={running} pace={pace} />
       <button className="link" onClick={() => setOpen(true)}><Eye size={13} /> {running ? "What is it doing?" : "What it did"}</button>
       {open && <WorkDetail id={jobId} onClose={() => setOpen(false)} />}
     </span>

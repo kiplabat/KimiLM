@@ -40,6 +40,7 @@ import re
 import time
 from pathlib import Path
 
+from . import recovery
 from .db import new_id, now
 from .forecast import pretty_seconds, pretty_tokens
 from .llm import LLMError, estimate_tokens
@@ -190,19 +191,6 @@ def same_objection(a, b):
     return bool(wa and wb) and len(wa & wb) / len(wa | wb) >= 0.7
 
 
-def classify(error, timed_out=False):
-    """What kind of failure a step had, so the next round changes the right thing."""
-    low = (error or "").lower()
-    if timed_out or any(k in low for k in ("did not start answering", "stopped writing", "did not respond",
-                                           "not reachable", "stopped responding", "took more than")):
-        return "timeout"
-    if "not enough memory" in low or "out of memory" in low or "failed to allocate" in low:
-        return "memory"
-    if "does not fit the model's context" in low or ("context" in low and "exceed" in low):
-        return "context"
-    return "error" if low else None
-
-
 # What a step's goal has to mention for a tool group to be handed to its agent (files are always given).
 KIT_WORDS = {
     "web": r"web|online|internet|search|look up|url|https?:|site|page|latest|news|download|research|source|publish|api\b",
@@ -235,7 +223,8 @@ def lean_kit(goal, harness_groups=None):
 SAVED = ("id", "name", "goal", "done_when", "depends_on", "role", "harness", "agent", "model", "limits", "status",
          "auto_model", "chosen", "kit", "started_at",
          "attempts", "output", "files", "loop", "expects", "rounds", "feedback", "partial", "note", "result_file",
-         "chat_id", "used", "forecast", "brief_tokens", "kind", "best", "error", "result_state", "full_kit")
+         "chat_id", "used", "forecast", "brief_tokens", "kind", "best", "error", "result_state", "full_kit",
+         "more_time", "tried_fresh")
 
 
 class Orchestra:
@@ -279,6 +268,7 @@ class Orchestra:
         self.resumes = 0
         self.lean = bool(s("lean_tools", True))
         self.escalate = bool(s("escalate_models", True))
+        self.failures = []                    # every failed attempt at a step, with its class (recovery.py)
 
     # ------------------------------------------------------------------ saved state: a run can continue later
     def save(self, status="running"):
@@ -288,6 +278,7 @@ class Orchestra:
                      "chain": self.chain, "roster": self.roster, "dir": str(self.dir), "log": self.step["log"][-40:],
                      "agent_chats": self.agent_chats,
                      "need": dict(self.fit.need) if self.fit is not None else {},
+                     "failures": self.failures[-60:],
                      "tasks": [{k: t.get(k) for k in SAVED} for t in self.tasks.values()], **self.extra_state()}
             row = {"chat_id": self.turn.chat["id"], "status": status, "state": state, "resumes": self.resumes,
                    "kind": self.kind, "updated": now()}
@@ -322,6 +313,7 @@ class Orchestra:
         self.chain = bool(state.get("chain"))
         self.resumes = int(row.get("resumes") or 0) + 1
         self.step["log"] = list(state.get("log") or [])
+        self.failures = list(state.get("failures") or [])
         if state.get("dir"):
             self.dir = Path(state["dir"])
             self.dir.mkdir(parents=True, exist_ok=True)
@@ -512,6 +504,7 @@ class Orchestra:
         direct = ("Choose approach 'direct' with no tasks when one agent can do this alone in about ten tool "
                   "steps or fewer — that is the usual case; a plan costs time. " if allow_direct else "")
         limit = min(self.max_tasks, 6)
+        services = self.services_text()
         prompt = (
             "You plan work for AI agents on the user's computer. " + direct +
             f"Otherwise write a plan of 2 to {limit} steps for my last request (fewer is better). The steps run one "
@@ -519,6 +512,9 @@ class Orchestra:
             "- One agent does each step with tools (files in my folders, the web, Python and shell commands, memory, "
             "skills, connectors). goal: everything that agent needs to know (paths, sources, formats, limits); it "
             "sees only its goal and the results it builds on. done_when: a test the result can be checked against.\n"
+            + ("- Connected services the agents have tools for (what each promises):\n" + services + "\n  When a "
+               "service offers what a step needs, say in its goal which service and tool to use. Send an agent to "
+               "search or browse the web only for what no service offers.\n" if services else "") +
             "- depends_on: the ids of the earlier steps whose results this step needs; it receives them. With no "
             "depends_on a step receives the result of the step before it.\n"
             "- loop: true for a step that usually takes several rounds of try, check and fix (writing and running "
@@ -708,6 +704,16 @@ class Orchestra:
             out.append(t)
         return out
 
+    def connector_ids(self):
+        turn = self.turn
+        return list(turn.chat.get("connectors") or []) or list((turn.project or {}).get("connectors") or [])
+
+    def services_text(self):
+        """What the chat's connectors promise, for a planner: it writes 'use the X service' only if it knows
+        that X has the endpoint (2.15.0). Built from what each server said when it was last connected."""
+        ids = self.connector_ids()
+        return self.app.connectors.digest(ids) if ids else ""
+
     def brief(self, t, planned=False, redo=None):
         """What an agent is told when its step starts: only its goal and the results it builds on."""
         ids = list(self.tasks)
@@ -720,6 +726,11 @@ class Orchestra:
             parts.append(f"Done when: {t['done_when']}")
         if t.get("expects"):
             parts.append("Save these files in the shared team folder: " + ", ".join(t["expects"]))
+        names = self.app.connectors.names(self.connector_ids())
+        if names:
+            parts.append("Connected services you have tools for: " + ", ".join(names) + ". When one of them offers "
+                         "what your task needs, use its tools: they are made for it. Search or browse the web only "
+                         "for what they do not offer.")
         deps = [self.tasks[d] for d in t["depends_on"] if d in self.tasks]
         if deps and not planned:
             budget = self.dep_budget(t)
@@ -736,6 +747,7 @@ class Orchestra:
                      "earlier chats.\n"
                      "Work efficiently: use tools only as needed. If code fails, read the error, fix the cause and run "
                      "it again; check outputs before you rely on them. Use ask_lead only if you are truly blocked.\n"
+                     + recovery.AGENT_RULES + "\n"
                      "Finish with your result: what you did, the result itself (facts, numbers, sources, file paths), "
                      "and whether 'done when' is met." + self.length_hint(t))
         return "\n\n".join(parts)
@@ -824,7 +836,8 @@ class Orchestra:
                 self.agent_chats[t["agent"]] = chat_id
             await self.forecast(t, message)
         else:
-            self.db.update("chats", chat_id, {"model": model, "harness": t.get("harness") or "agent"})
+            self.db.update("chats", chat_id, {"model": model, "harness": t.get("harness") or "agent",
+                                              "settings": clean_limits(limits)})
         await self.admit(t, model)
         t["chat_id"] = chat_id
         self.app.team_of_chat[chat_id] = (self, t["id"])
@@ -870,6 +883,9 @@ class Orchestra:
         t["output"] = msg.get("content") or ""
         t["error"] = error
         t["files"] = self._files_since(t.get("started_at") or 0)
+        t["failures"] = recovery.tool_failures(meta.get("steps"))     # what its tools reported as failed
+        t["guard"] = meta.get("guard")                                # why it stopped using tools, if the app made it
+        t["progressing"] = recovery.progressing(meta.get("steps"), meta.get("guard"))
         from .runner import private_tool_names
         if any(s.get("type") == "tool" and s.get("name") in private_tool_names() for s in meta.get("steps", [])):
             self.turn.private.add("files")        # its result may quote your files: ask before it goes online
@@ -1021,8 +1037,6 @@ class Orchestra:
             self.settle(t, "failed", "stopped")
             self.logline(f"{t['id']} was stopped.")
             return
-        kind = classify(t.get("error"), t.get("timed_out"))
-        t["kind"] = kind
         problems = self.code_check(t) if not t.get("timed_out") else ["it ran past its time limit and was stopped"]
         hard = bool(problems)
         if not problems:
@@ -1036,40 +1050,111 @@ class Orchestra:
             problems = [reason or "it does not meet its 'done when'"]
         self.keep_best(t, problems, hard)
         why = "; ".join(problems)
+        repeated = bool(t["feedback"]) and same_objection(t["feedback"][-1], why)
+        # what kind of failure this was decides what the next round changes (recovery.py)
+        kind = recovery.classify(t.get("error"), timed_out=t.get("timed_out"), guard=t.get("guard"),
+                                 failures=t.get("failures"), objection=None if hard else why, repeated=repeated)
+        t["kind"] = kind
+        rec = recovery.record(t, why, kind, minutes=self.step_minutes(t))
+        earlier = [r for r in self.failures if r["step"] == t["id"] and r["class"] == rec["class"]
+                   and r["sig"] == rec["sig"]]
+        self.failures.append(rec)
         if t["attempts"] >= t["rounds"] or self.finished:
             return self.exhausted(t, why)
-        repeated = bool(t["feedback"]) and same_objection(t["feedback"][-1], why)
+        if kind in ("permission", "missing"):          # another round cannot give what is not there
+            rec["change"] = "not tried again: " + recovery.CLASSES[kind]["label"]
+            return self.exhausted(t, why)
         t["feedback"].append(why)
         t["note"] = why
         model = t["model"]
+        if kind == "transient" and len(earlier) < recovery.CLASSES["transient"]["repeat"]:
+            wait = float(self.db.setting("retry_wait_seconds", 15)) * 3 ** len(earlier)
+            rec["change"] = f"the same again after {wait:g} seconds"
+            self.logline(f"{t['id']} met a passing fault ({why[:120]}): the same again in {wait:g} seconds.")
+            await asyncio.sleep(wait)
+            t["_fresh"] = False
+            return await self.start(t, "That looked like a passing fault, not a mistake of yours: "
+                                    + _clip(why, 300) + "\n\nDo the same once more, then finish your task and reply "
+                                    "with the complete result.")
+        if kind == "timeout" and t.get("progressing") and not t.get("more_time"):
+            minutes, more = self.step_minutes(t), self.more_time(t)
+            if more:
+                t["more_time"], t["_fresh"] = True, False
+                rec["change"] = f"more time: {minutes:g} → {more:g} minutes"
+                self.logline(f"{t['id']} ran out of time while it was still getting somewhere: it gets {more:g} "
+                             f"minutes instead of {minutes:g} and continues.")
+                return await self.start(t, f"You ran out of time while you were still getting somewhere. You now "
+                                        f"have {more:g} minutes. Continue from where you stopped: do not redo what "
+                                        "is already done. Then reply with the complete result.")
         if kind == "memory" and self.fit is not None and not is_cloud(model):
             now_ctx = self.fit.overrides(self.app.runtime, model)["ctx"]
             if now_ctx > 4096:
                 self.fit.cap[model] = max(4096, now_ctx // 2)
+                rec["change"] = f"a smaller context ({self.fit.cap[model]:,} tokens)"
                 self.logline(f"{t['id']} ran out of memory; {self.model_name(model)} is reloaded with a "
                              f"{self.fit.cap[model]:,}-token context.")
         elif kind == "context" and self.fit is not None and not is_cloud(model):
             self.fit.cap.pop(model, None)
             self.fit.want(model, self.fit.tokens(model) * 2)
+            rec["change"] = f"a larger context ({self.fit.overrides(self.app.runtime, model)['ctx']:,} tokens)"
             self.logline(f"{t['id']} did not fit its context; {self.model_name(model)} gets a larger one "
                          f"({self.fit.overrides(self.app.runtime, model)['ctx']:,} tokens).")
-        fresh = repeated or kind in ("timeout", "context", "memory")
+        twice = bool(earlier)                 # the same failure as an earlier round of this step
+        fresh = repeated or twice or kind in ("timeout", "stall", "context", "memory", "transient")
         t["_fresh"] = fresh
         if fresh:
             t["full_kit"] = True              # a fresh attempt gets every tool of its harness
-            if self.escalate and repeated:
+            before = t["model"]
+            if self.escalate and (repeated or twice):
                 self.step_up(t)
+            if twice and t["model"] == before and t.get("tried_fresh") == rec["sig"]:
+                # a fresh agent already failed this very way: a third identical attempt would fail the same
+                rec["change"] = "not tried again the same way"
+                return self.exhausted(t, why + " (the same failure again, and nothing was left to change)")
+            if twice:
+                t["tried_fresh"] = rec["sig"]
+            rec["change"] = (rec["change"] + ", " if rec["change"] else "") + "a fresh agent" + (
+                f" on {self.model_name(t['model'])}" if t["model"] != before else "") + " told to go another way"
             self.logline(f"Round {t['attempts'] + 1} of {t['rounds']} for {t['id']} with a fresh agent"
-                         + (" (the same objection twice)" if repeated else f" ({kind})") + f": {why[:160]}")
+                         + (" (the same objection twice)" if repeated else " (the same failure twice)" if twice
+                            else f" ({kind})") + f": {why[:160]}")
+            avoid = "; ".join(f"{f['tool']}" + (f" ({f['what']})" if f.get("what") else "") + f": {f['error'][:110]}"
+                              for f in (t.get("failures") or [])[:3])
             await self.start(t, self.brief(t, redo=(
                 f"An earlier attempt at this task did not pass: {_clip(why, 500)}\n"
-                "Take a different approach this time" +
+                + (f"What failed in it (do not do these again the same way): {avoid}\n" if avoid else "")
+                + "Take a different approach this time" +
                 (", and keep it short: work in smaller pieces and read less at once." if kind in ("timeout", "context", "memory") else "."))),
                 fresh=True)
         else:
+            rec["change"] = "the same agent was told what to fix"
             self.logline(f"Round {t['attempts'] + 1} of {t['rounds']} for {t['id']}: {why[:160]}")
             await self.start(t, "The planner reviewed your result and asks for this:\n" + _clip(why, 800)
                              + "\n\nFix it, check it, and reply with the complete corrected result.")
+
+    def step_minutes(self, t):
+        """The minutes one attempt at this step may take."""
+        return float((t.get("limits") or {}).get("time_limit_minutes") or self.harness_of(t).get("time_limit_minutes")
+                     or self.db.setting("turn_time_limit_minutes", 30) or 30)
+
+    def minutes_left(self):
+        """How long this run may still work (a long-running task answers with its own limit)."""
+        return (self.time_limit - (time.monotonic() - self.started)) / 60
+
+    def more_time(self, t):
+        """The longer time a step gets after it ran out of time while still getting somewhere: twice as long, and
+        never past what the run itself has left. None when that would not be a real difference."""
+        minutes = self.step_minutes(t)
+        more = min(minutes * 2, max(0.0, self.minutes_left() - 2), 480.0)
+        if more < minutes * 1.3:
+            return None
+        more = float(int(more))
+        limits = dict(t.get("limits") or {})
+        limits["time_limit_minutes"] = more
+        steps = int(limits.get("max_steps") or self.harness_of(t).get("max_steps") or 10)
+        limits["max_steps"] = min(60, steps * 2)           # more time is of no use without more steps to take
+        t["limits"] = limits
+        return more
 
     def step_up(self, t):
         """A step that failed the same way twice moves to a stronger model, if one is installed and allowed."""

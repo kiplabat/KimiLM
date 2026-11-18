@@ -67,6 +67,12 @@ class Track:
             self.owns = True
             self.jobs.plan(self.id, {"stages": list(names), "stage": 0})
 
+    def expect(self, seconds):
+        """How long this work may now be silent without anything being wrong (one step of a slow program takes
+        this long here). None: nothing is known, the usual thresholds apply."""
+        if self.id:
+            self.jobs.expect(self.id, seconds)
+
     def at(self, name):
         """The stage that is being worked on now. Only the work that said the stages moves through them: a
         picture made for a video has a "Save" of its own, which is not the video's."""
@@ -96,6 +102,7 @@ class Jobs:
         self.seen = {}       # id -> time of the last sign of life
         self.details = {}    # id -> plan and facts of a running task
         self.fraction = {}   # id -> how far it is (0..1), when that is known
+        self.pace = {}       # id -> seconds of silence that are normal right now (a slow program's step), if known
         self._last_step = {}
         for row in self.db.all("SELECT id FROM jobs WHERE status IN ('queued','running','waiting')"):
             self.db.update("jobs", row["id"], {"status": "interrupted", "finished": now(),
@@ -131,6 +138,7 @@ class Jobs:
             self.seen.pop(job_id, None)
             self.details.pop(job_id, None)
             self.fraction.pop(job_id, None)
+            self.pace.pop(job_id, None)
             self._last_step.pop(job_id, None)
         if error:
             self.trail(job_id, error if status != "cancelled" else "Stopped", "error" if status == "failed" else "note", final=True)
@@ -173,6 +181,7 @@ class Jobs:
             self._last_step[job_id] = text
             self.live[job_id] = text
             self.fraction.pop(job_id, None)                    # how far the step before was says nothing about this one
+            self.pace.pop(job_id, None)                        # … nor does how long its silences were
         if not final:
             self.seen[job_id] = time.time()
         entry = {"t": now(), "kind": kind, "text": text, **({"data": data} if data else {})}
@@ -224,6 +233,19 @@ class Jobs:
         if job_id not in self.tasks:
             return None
         return round(time.time() - self.seen[job_id]) if job_id in self.seen else None
+
+    def expect(self, job_id, seconds):
+        """The work says how long it may be silent now (2.15.0): a drawing step on a processor takes minutes, and
+        the windows should call that 'working', not 'stuck'. The windows get it with the task and with every
+        progress event; a new step forgets it."""
+        if not job_id or job_id not in self.tasks:
+            return
+        if seconds:
+            self.pace[job_id] = round(float(seconds), 1)
+        else:
+            self.pace.pop(job_id, None)
+        self.app.bus.publish("job_progress", id=job_id, text=self.live.get(job_id), fraction=self.fraction.get(job_id),
+                             pace=self.pace.get(job_id))
 
     def reporter(self, on_status, job_id):
         """What a piece of work reports through: every step goes to the caller (a window's job, a chat's status
@@ -293,7 +315,8 @@ class Jobs:
         t = time.monotonic()
         if t - self._last_pub.get(job_id, 0) > 0.7:
             self._last_pub[job_id] = t
-            self.app.bus.publish("job_progress", id=job_id, text=text, fraction=self.fraction.get(job_id))
+            self.app.bus.publish("job_progress", id=job_id, text=text, fraction=self.fraction.get(job_id),
+                                 pace=self.pace.get(job_id))
 
     def log(self, job_id, line):
         path = self.app.paths.data / "jobs" / f"{job_id}.log"
@@ -340,6 +363,7 @@ class Jobs:
             r["progress"] = self.live.get(r["id"])
             r["quiet"] = self.quiet(r["id"])
             r["fraction"] = self.fraction.get(r["id"])
+            r["pace"] = self.pace.get(r["id"])
         return rows
 
     def get(self, job_id):
@@ -351,6 +375,7 @@ class Jobs:
             row["detail"] = self.read_detail(job_id)
             row["quiet"] = self.quiet(job_id)
             row["fraction"] = self.fraction.get(job_id)
+            row["pace"] = self.pace.get(job_id)
         return row
 
     async def shutdown(self):

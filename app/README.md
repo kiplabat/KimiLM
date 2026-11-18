@@ -13,8 +13,8 @@ results it needs are ready, reads every result (accept, send back with feedback,
 writes the answer — automatically in chats, projects and scheduled tasks when a request looks multi-step. Agents can
 run commands (tests, git, build tools) and fix their own code. **Memory** covers past chats (search by words, and by
 meaning with the optional search model), project knowledge files, living project notes, and per-project isolation.
-Plugins are optional; Datavera is one of them (it runs the command-line agent in the repository root, which keeps
-working on its own).
+Plugins are optional and none is built in (2.15.0): a service such as Datavera is connected as an MCP connector
+in Plugins & connectors.
 
 From 2.9.0 there are **long-running tasks**: work that goes on until a problem is solved. A planner keeps its
 understanding of the problem, gives one step at a time to an agent, reads the handoff that agent leaves and decides
@@ -54,8 +54,9 @@ slides or text (or attach it in a chat and ask for a podcast), and KimiLM reads 
 plans the episode, writes each part as a conversation with the matching pieces of the document in front of the
 model, and records it with two voices; the script is saved beside the recording. **Music is made on this
 computer** with ACE-Step 1.5 through acestep.cpp: the programs are built from the pinned source by the workflow
-`.github/workflows/music-engine.yml` in this repository (run it once: Actions → Build music engine → Run workflow)
-and installed from this repository's release; the model (about 3.3 GB) is downloaded in the app.
+`music-engine.yml` of the public repository named in `engine/dva/versions.json` (`music_engine_repo`, since 2.15.0
+`kiplabat/kimilm-engines`; run it once: Actions → Build music engine → Run workflow) and installed from that
+repository's release; the model (about 3.3 GB) is downloaded in the app.
 
 KimiLM was called **Datavera Agent** up to 2.1.x. Version 2.2.0 renamed it; see "Upgrading from Datavera Agent".
 
@@ -96,7 +97,7 @@ npm run dist:win
 
 `dist:win` does three things:
 1. `vite build` — the UI into `app\dist`.
-2. `prepare-resources.mjs --platform win` — copies the engine and the Datavera plugin's pipeline code into
+2. `prepare-resources.mjs --platform win` — copies the engine into
    `app\resources\engine`, downloads the embeddable Python 3.12 (`python.org`) and installs the engine's packages
    into it (`pip --target … --platform win_amd64`), and downloads the llama.cpp CPU build of the pinned release
    (`engine\dva\versions.json`). Downloads are cached in `app\.cache`.
@@ -115,7 +116,7 @@ signing certificate is added (`win.certificateFile` / Azure Trusted Signing in `
 | Data (database `kimilm.sqlite3`, chats' workspaces, your skills/harnesses/plugins, logs) | `%APPDATA%\KimiLM` |
 | Models | `%APPDATA%\KimiLM\models` by default; change in **Settings → Models folder** (e.g. `D:\models`) |
 | Keys and tokens | Windows Credential Manager (service `KimiLM`) |
-| Datavera plugin data (catalogue, runs) | `%APPDATA%\KimiLM\plugin-data\datavera` |
+| A plugin's own data | `%APPDATA%\KimiLM\plugin-data\<plugin>` (the earlier built-in Datavera plugin's data stays in `plugin-data\datavera`) |
 
 ## Upgrading from Datavera Agent
 

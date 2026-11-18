@@ -18,7 +18,11 @@ steps done, which the prompt states: three steps Survey → Draft → Polish, th
 change the script: "hits a blocker" (the first agent reports one, the planner changes the plan), "needs my
 answer" (the planner asks after the first step), "planner breaks" (the second move fails with a server error),
 "note-step" (the first step writes a file), "slow-steps". An agent whose brief asks for a handoff ends its reply
-with one. A set-up request (schema with team + limits) answers with values out of range, to be repaired."""
+with one. A set-up request (schema with team + limits) answers with values out of range, to be repaired.
+
+Failure recovery (2.15.0): "stubborn planner" gives a step that fails, then the same step again (which the app
+refuses), and only then another way; "hopeless task" gives a different failing step every time, until the app
+pauses the task."""
 import argparse
 import json
 import re
@@ -198,6 +202,9 @@ def mission_move(body, users):
             "reason": f"after {n} steps", "decision": "continue", "steps": [],
             "outline": ["Survey", "Draft", "Polish"]}
     step = lambda name, goal, **kw: {"name": name, "goal": goal, "done_when": "a greeting", **kw}  # noqa: E731
+    if "Connected services the agents have tools for" in last:       # what the planner was told about connectors
+        told = last.split("Connected services the agents have tools for (what each promises):\n", 1)[1].split("\n")[0]
+        move["understanding"] += " The planner was told of these services: " + told[:200]
     if "hits a blocker" in users:
         if n == 0:
             move["steps"] = [step("Fetch", "say hello and report a blocker")]
@@ -216,6 +223,23 @@ def mission_move(body, users):
         elif n == 1:
             colour = last.split("My latest message to you:", 1)[1].split("\n")[0].strip()
             move["steps"] = [step(f"Paint {colour}"[:40], f"say hello in {colour}")]
+        else:
+            move["decision"] = "finish"
+        return move
+    if "stubborn planner" in users:
+        if n == 0 or (n == 1 and "Not run, because it repeats a failure" not in last):
+            move["steps"] = [step("Fetch", "say hello then explode at the site")]     # the second time: the same again
+        elif n == 1:
+            move.update(reason="the site fails every time, so read the mirror", changed=True,
+                        steps=[step("Mirror", "say hello from the mirror instead", agent="Archivist", harness="agent")])
+        else:
+            move["decision"] = "finish"
+        return move
+    if "hopeless task" in users:
+        ways = ["explode while reading the archive", "phone the owner and explode there", "use a cached copy then explode",
+                "explode after asking a colleague", "explode in a completely new manner tomorrow"]
+        if n < 4 and "My latest message to you" not in last:
+            move["steps"] = [step(f"Try {n + 1}", f"say hello, {ways[n]}")]
         else:
             move["decision"] = "finish"
         return move
