@@ -150,6 +150,10 @@ class Jobs:
             self.pace.pop(job_id, None)
             self._last_step.pop(job_id, None)
             ctl = self.controls.pop(job_id, None)
+            # 2.19.0: a program the task started and that still runs (its tool call was cut off) ends with it
+            ended = self.app.procs.end_owner(job_id) if getattr(self.app, "procs", None) else 0
+            if ended:
+                self.app.log(f"job {job_id}: ended {ended} program(s) it had left running")
             self.listeners.pop(job_id, None)
             timer = self._pause_end.pop(job_id, None)
             if timer:

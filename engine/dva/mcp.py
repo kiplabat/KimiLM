@@ -76,7 +76,7 @@ def save_blob(data, mime, save_dir, stem):
         return None
 
 
-def result_text(result, save_dir=None):
+def result_text(result, save_dir=None, limit=None):
     if getattr(result, "structured_content", None) and not any(
             getattr(c, "type", "") in ("image", "audio") for c in getattr(result, "content", None) or []):
         text = json.dumps(result.structured_content, ensure_ascii=False, default=str)
@@ -104,8 +104,9 @@ def result_text(result, save_dir=None):
             else:
                 parts.append(str(c)[:500])
         text = "\n".join(parts)
-    if len(text) > RESULT_LIMIT:
-        text = text[:RESULT_LIMIT] + f"\n…(trimmed {len(text) - RESULT_LIMIT:,} characters)"
+    limit = RESULT_LIMIT if limit is None else limit
+    if len(text) > limit:
+        text = text[:limit] + f"\n…(trimmed {len(text) - limit:,} characters)"
     return text
 
 
@@ -655,11 +656,13 @@ class Connectors:
                 lines.append(text if getattr(m, "role", "user") == "user" else f"({m.role}) {text}")
         return "\n\n".join(lines)
 
-    async def call(self, connector_id, tool_name, arguments, timeout=300, save_dir=None):
+    async def call(self, connector_id, tool_name, arguments, timeout=300, save_dir=None, limit=None):
+        """`limit`: characters of the answer kept (default RESULT_LIMIT). An agent's call keeps far more (2.19.0):
+        the runner gives the model what it can read and keeps the whole answer in a file."""
         conf = self.get(connector_id)
         result = await self._session(conf).call(
             lambda client: client.call_tool(tool_name, arguments or {}, raise_on_error=False), timeout=timeout)
-        text = result_text(result, save_dir)
+        text = result_text(result, save_dir, limit)
         if getattr(result, "is_error", False):
             return False, text or "The connector reported an error"
         return True, text

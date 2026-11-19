@@ -762,6 +762,8 @@ def test_pause_and_resume_an_agent(engine):
 def test_code_errors_point_at_the_line_and_commands_run(tmp_path):
     import asyncio
     sys.path.insert(0, str(ENGINE))
+    import types
+    from dva.procs import Procs
     from dva.tools import python_exec
     from dva.tools import ToolContext
 
@@ -771,6 +773,9 @@ def test_code_errors_point_at_the_line_and_commands_run(tmp_path):
 
     class App:
         db = DB()
+        paths = types.SimpleNamespace(data=tmp_path)
+        log = print
+    App.procs = Procs(App)                  # 2.19.0: programs run through the app's list of programs
     ctx = ToolContext(app=App(), chat={"id": "c"}, project=None, workspace=tmp_path, folders=[str(tmp_path)],
                       readonly=[], emit=lambda *a, **k: None, approve=None)
     out = asyncio.run(python_exec.run_python(ctx, "x = 1\ny = 2\nprint(x / (y - 2))\n"))
@@ -4260,3 +4265,248 @@ def wave_file(path, rate=24000):
     f.setsampwidth(2)
     f.setframerate(rate)
     return f
+
+
+# ---------------------------------------------------------------------------------------------- 2.19.0
+def catalogue_chat(c):
+    """A chat whose agent has the stand-in connector with a paged catalogue and a long guide."""
+    conn = c.post("/api/connectors", json={"name": "Catalogue", "transport": "stdio", "command": "{python}",
+                                           "args": [str(TESTS / "fake_mcp_server.py"), "--catalogue"]}).json()
+    assert c.post(f"/api/connectors/{conn['id']}/test").json()["ok"]
+    chat = c.post("/api/chats", json={"harness": "agent", "connectors": [conn["id"]]}).json()
+    return conn, chat, Path(c.get(f"/api/chats/{chat['id']}").json()["workspace"])
+
+
+def test_a_tool_result_is_saved_whole_and_a_long_one_is_kept_in_a_file(engine):
+    """2.19.0. A small model could not copy a service's long answer into a file: it saw only the start, and had to
+    type it again. Now any tool call can take save_to (the app writes the whole answer), and an answer too long to
+    read whole is kept in a file whose path the model is given."""
+    c = engine["client"]
+    conn, chat, ws = catalogue_chat(c)
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "please save the guide to team-notes/guide.txt"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    step = [s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool"][0]
+    saved = Path(step["saved"])
+    assert saved == ws / "team-notes" / "guide.txt" and step["ok"], step
+    text = saved.read_text(encoding="utf-8")
+    guide = json.loads(text)["result"]                   # the service's answer as it came, whole (not 12,000 characters)
+    assert guide.startswith("GUIDE START") and guide.endswith("GUIDE END") and len(guide) > 40_000
+    assert step["result"].startswith(f"Saved the whole result ({len(text):,} characters) to {saved}")
+    assert "save_to" not in json.dumps(step["arguments"])                # the service never saw it
+    # read without save_to: the model reads the start, the whole answer is in a file it is told about
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "read the guide"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    step = [s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool"][0]
+    kept = Path(step["saved"])
+    assert kept.parent == ws / "tool-results" and kept.name.endswith("get-guide.txt") and kept.read_text(encoding="utf-8") == text
+    assert step["result"].endswith(f"(the whole result is in {kept})")
+    # the rule is in every agent's instructions
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "show system prompt"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    prompt = last_assistant(c, chat["id"])["content"]
+    assert "save_to (a file path)" in prompt and "from kimilm import call" in prompt
+    c.delete(f"/api/connectors/{conn['id']}")
+
+
+def test_code_pages_through_a_service_and_only_while_it_runs(engine):
+    """2.19.0. Paging through a service was a turn of the model per page. In run_python, kimilm.call reaches the
+    agent's own connectors: one program pages through all of it and writes the file. Its token is valid only
+    while that program runs, and code never sees the app's own token."""
+    c = engine["client"]
+    conn, chat, ws = catalogue_chat(c)
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "page through the items into items.csv"}).json()
+    done = wait_job(c, job["job_id"], approve="allow")
+    assert done["status"] == "done", done
+    step = [s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool"][0]
+    assert step["ok"] and "47 items from 5 pages" in step["result"], step["result"]
+    rows = (ws / "items.csv").read_text(encoding="utf-8").splitlines()
+    assert rows[0] == "id,title" and len(rows) == 48 and rows[-1] == "47,Item 47"
+    trail = [e["text"] for e in c.get(f"/api/jobs/{job['job_id']}").json()["trail"]]
+    assert len([t for t in trail if t.startswith("From code: Catalogue")]) == 5          # each call is in the trail
+    # without a valid token the bridge answers nothing, and the app's own token is not the bridge's
+    r = httpx.post(f"http://127.0.0.1:{engine['port']}/api/bridge/call", json={"tool": "list_items"},
+                   headers={"X-KimiLM-Bridge": "made-up"}, trust_env=False)
+    assert r.status_code == 403 and "only while its run_python call runs" in r.json()["error"]
+    r = httpx.post(f"http://127.0.0.1:{engine['port']}/api/bridge/tools", trust_env=False,
+                   headers={"X-KimiLM-Bridge": engine["token"]})
+    assert r.status_code == 403
+    c.delete(f"/api/connectors/{conn['id']}")
+
+
+def test_a_program_that_hangs_is_ended_with_everything_it_started(engine):
+    """2.19.0. A long-running task left the computer full of Python processes: code kept running after its agent
+    was stopped, and a program it had started outlived it. Now Stop, the time limit and the end of the task end
+    the program and every program it started; the time limit has a ceiling; Activity lists what runs."""
+    import psutil
+    c = engine["client"]
+    chat = c.post("/api/chats", json={"harness": "agent"}).json()
+    ws = Path(c.get(f"/api/chats/{chat['id']}").json()["workspace"])
+    pids_file = ws / "hang-pids.txt"
+
+    def started(job_id):
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            job = c.get(f"/api/jobs/{job_id}").json()
+            if job["status"] == "waiting":
+                for ap in c.get(f"/api/chats/{chat['id']}").json()["pending_approvals"]:
+                    c.post(f"/api/approvals/{ap['approval_id']}", json={"allow": True})
+            if pids_file.exists() and len(pids_file.read_text().split()) == 2:
+                return [int(x) for x in pids_file.read_text().split()]
+            time.sleep(0.2)
+        raise AssertionError("the code did not start")
+
+    def gone(pids, within=10):
+        deadline = time.time() + within
+        while time.time() < deadline:
+            if not any(psutil.pid_exists(p) and psutil.Process(p).status() != psutil.STATUS_ZOMBIE for p in pids):
+                return True
+            time.sleep(0.2)
+        return False
+
+    # Stop: the program and the one it started end with the task
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "hang in code"}).json()
+    pids = started(job["job_id"])
+    listed = c.get("/api/procs").json()["procs"]
+    mine = [p for p in listed if p["owner"] == job["job_id"]]
+    assert len(mine) == 1 and mine[0]["kind"] == "python" and mine[0]["processes"] >= 2, listed   # the script and its child
+    if os.name != "nt":
+        assert psutil.Process(mine[0]["pid"]).nice() >= 10                            # it runs at low priority
+    c.post(f"/api/jobs/{job['job_id']}/cancel")
+    assert wait_job(c, job["job_id"])["status"] == "cancelled"
+    assert gone(pids) and not [p for p in c.get("/api/procs").json()["procs"] if p["owner"] == job["job_id"]]
+    # the time limit the model asks for has a ceiling; at the limit, everything the program started ends too
+    pids_file.unlink()
+    c.put("/api/settings", json={"code_timeout_max_seconds": 6})
+    try:
+        job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "hang in code for 99999 seconds"}).json()
+        pids = started(job["job_id"])
+        assert wait_job(c, job["job_id"], timeout=60, approve="allow")["status"] == "done"
+        step = [s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool"][0]
+        assert not step["ok"] and "ran longer than 6 seconds and was stopped, with every program it started" in step["result"]
+        assert gone(pids)
+    finally:
+        c.put("/api/settings", json={"code_timeout_max_seconds": 900})
+    # a program in the list can be ended by hand (Activity)
+    pids_file.unlink()
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "hang in code"}).json()
+    pids = started(job["job_id"])
+    top = [p for p in c.get("/api/procs").json()["procs"] if p["owner"] == job["job_id"]][0]
+    assert c.delete(f"/api/procs/{top['pid']}").json()["owner"] == job["job_id"]
+    assert gone(pids)
+    assert wait_job(c, job["job_id"], timeout=60, approve="allow")["status"] == "done"
+    step = [s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool"][0]
+    assert step["result"].startswith("FAILED")                         # the agent is told its code did not finish
+    assert c.delete(f"/api/procs/{top['pid']}").status_code == 404
+
+
+def test_programs_left_by_an_engine_that_went_away_are_ended(tmp_path):
+    """2.19.0. The list of running programs is kept on disk: at the next start, what an engine that crashed or was
+    killed left running is ended, but only if the program with that number is still the one it started."""
+    import subprocess
+    import types
+    import psutil
+    from dva.procs import Procs, end_tree, python_argv
+    said = []
+    app = types.SimpleNamespace(paths=types.SimpleNamespace(data=tmp_path), log=said.append,
+                                db=types.SimpleNamespace(setting=lambda k, d=None: d))
+    script = tmp_path / "parent.py"
+    script.write_text("import subprocess, sys, time\nsubprocess.Popen([sys.executable, '-c', 'import time; "
+                      "time.sleep(60)'])\ntime.sleep(60)\n")
+    left = subprocess.Popen(python_argv(script))
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline and not psutil.Process(left.pid).children():
+            time.sleep(0.1)
+        child = psutil.Process(left.pid).children()[0].pid
+        (tmp_path / "procs.json").write_text(json.dumps([
+            {"pid": left.pid, "started": psutil.Process(left.pid).create_time(), "kind": "python", "label": "parent"},
+            {"pid": other.pid, "started": psutil.Process(other.pid).create_time() - 100, "kind": "python"},
+            {"pid": 99999999, "started": 1.0, "kind": "python"}]))
+        ended = Procs(app).end_leftovers()
+        assert len(ended) == 1 and "parent" in ended[0] and left.wait(timeout=10) is not None
+        deadline = time.time() + 10
+        while time.time() < deadline and psutil.pid_exists(child) and psutil.Process(child).status() != psutil.STATUS_ZOMBIE:
+            time.sleep(0.1)
+        assert not psutil.pid_exists(child) or psutil.Process(child).status() == psutil.STATUS_ZOMBIE
+        assert other.poll() is None and json.loads((tmp_path / "procs.json").read_text()) == []
+        assert said and "ended programs left by the engine before" in said[0]
+        assert end_tree(99999999) == 0
+    finally:
+        for p in (left, other):
+            if p.poll() is None:
+                p.kill()
+
+    async def queue():
+        # at most `code_runs_at_once` programs run together; a long one's output is kept start and end
+        procs = Procs(types.SimpleNamespace(paths=app.paths, log=said.append,
+                                            db=types.SimpleNamespace(setting=lambda k, d=None: 1 if k == "code_runs_at_once" else d)))
+        waits = []
+        env = {**os.environ}
+        argv = [sys.executable, "-c", "import time; time.sleep(0.8); print('x' * 50000)"]
+        began = time.monotonic()
+        both = await asyncio.gather(*(procs.run(argv, cwd=tmp_path, env=env, timeout=30, limit=1000,
+                                                on_line=lambda t: waits.append(t) if t is None else None)
+                                      for _ in range(2)))
+        assert time.monotonic() - began > 1.5 and waits == [None]           # the second waited for the first
+        code, out = both[0]
+        assert code == 0 and out.startswith("x" * 400) and "characters of output left out" in out and len(out) < 1200
+        with pytest.raises(asyncio.TimeoutError):
+            await procs.run([sys.executable, "-c", "import time; time.sleep(30)"], cwd=tmp_path, env=env, timeout=1)
+        assert procs.live == {}
+    import asyncio
+    asyncio.run(queue())
+
+
+def test_a_step_names_its_files_exactly_and_recovery_knows_files_not_left(tmp_path):
+    """2.19.0. A planner wrote "team/guide.json" for a file of the team folder, and the agent and the check read
+    it differently. Now one place says where an expected file belongs; the brief lists exact paths; a step whose
+    agent did not leave its files is a failure of its own kind, with advice that is not "do the same again"."""
+    import types
+    from dva.orchestrator import Orchestra
+    from dva.recovery import CLASSES, classify
+    team = tmp_path / "team"
+    team.mkdir()
+    o = types.SimpleNamespace(dir=team)
+    where = lambda n: Orchestra.expected_path(o, n)                    # noqa: E731
+    assert where("team/guide.json") == team / "guide.json" == where("guide.json") == where("./guide.json")
+    assert where("team\\\\inventory.csv".replace("\\\\", os.sep)) == team / "inventory.csv"
+    assert where("cycles/a/source.md") == team / "cycles" / "a" / "source.md"
+    assert where(str(tmp_path / "elsewhere.txt")) == tmp_path / "elsewhere.txt"
+    o.expected_path = where
+    has = lambda n: Orchestra.has_output(o, n)                         # noqa: E731
+    assert not has("team/guide.json")
+    (team / "guide.json").write_text("")
+    assert not has("guide.json")                                       # an empty file is not a result
+    (team / "guide.json").write_text("{}")
+    assert has("team/guide.json") and has("guide.json")
+    (team / "deep").mkdir()
+    (team / "deep" / "inventory.csv").write_text("id\n1\n")
+    assert has("inventory.csv")                                        # found by name, as before
+    assert classify(objection="the file /x/team/coverage.json was not saved") == "output"
+    assert classify(objection="the summary leaves out the second source") == "quality"
+    assert "save_to" in CLASSES["output"]["advice"] and CLASSES["output"]["repeat"] == 0
+
+
+def test_an_agent_is_told_of_a_missing_file_before_it_finishes(engine):
+    """2.19.0. An agent that ended without the file its step must leave was told so only by the check after its
+    round, twenty minutes later on a slow computer. Now the app tells it before it finishes, with the exact path,
+    and the file lands where the planner meant it ("team/report.txt" is report.txt in the team folder)."""
+    c = engine["client"]
+    made = c.post("/api/chats", json={"harness": "agent"}).json()
+    c.put(f"/api/chats/{made['id']}", json={"auto_approve": True})      # the agent writes without asking
+    job = c.post(f"/api/chats/{made['id']}/messages", json={"text": "As a team with a file-leaving plan: keep a report."}).json()
+    status, msg = wait_job(c, job["job_id"], timeout=150)["status"], None
+    msg = last_assistant(c, made["id"])
+    assert status == "done"
+    team = team_of(msg)
+    t = team["tasks"][0]
+    assert t["status"] == "done", t
+    report = Path(team["folder"]) / "report.txt"
+    assert report.read_text(encoding="utf-8") == "the report" and not (Path(team["folder"]) / "team").exists()
+    brief = first_user_text(c, t["chat_id"])
+    assert f"Leave these files, at exactly these paths (the app checks them):\n- {report}" in brief
+    steps = [s for m in c.get(f"/api/chats/{t['chat_id']}").json()["messages"] if m["role"] == "assistant"
+             for s in (m.get("meta") or {}).get("steps") or []]
+    assert any(s.get("type") == "note" and "Reminded the agent of 1 missing file" in (s.get("text") or "") for s in steps), steps
+    assert [s["arguments"]["path"] for s in steps if s.get("type") == "tool"] == [str(report)]

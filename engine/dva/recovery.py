@@ -52,6 +52,11 @@ CLASSES = {
     "capability": {"label": "the result was wrong the same way twice", "repeat": 0,
                    "advice": "Give it to another kind of agent or a stronger model (role: strategist), or split it "
                              "so that each piece is easy to check."},
+    "output": {"label": "its files were not left where they belong", "repeat": 0,
+               "advice": "The agent was told about the missing files before it finished and still did not leave "
+                         "them. Do not repeat the step as it was: give each file its own small step, say in the "
+                         "goal to save a tool's answer with save_to (or to page through a service in one run_python "
+                         "program with kimilm.call), or give it to a stronger model."},
     "missing": {"label": "something it needs is not there", "repeat": 0,
                 "advice": "Get what is missing another way in a step of its own, or ask me for it ('ask')."},
     "permission": {"label": "it needs you", "repeat": 0,
@@ -72,6 +77,7 @@ PERMISSION = re.compile(r"declined|needs you to sign in|needs its key|needs your
                         r"was not approved|sign in first|unauthori[sz]ed|\b401\b", re.I)
 MISSING = re.compile(r"is not installed|not set up|no (image|video|sound|speech|music|vision)? ?model|there is no "
                      r"tool called|no model is installed|is unavailable|needs .{0,40} first|install it", re.I)
+NOT_SAVED = re.compile(r"was not saved|files? (?:is|are) missing|not left", re.I)
 LOOP = re.compile(r"produced nothing new|kept repeating|same error|did not produce anything", re.I)
 
 
@@ -147,6 +153,8 @@ def classify(error=None, *, timed_out=False, guard=None, failures=(), objection=
         return "transient"
     if error or tools:
         return "approach"
+    if objection and NOT_SAVED.search(str(objection)):
+        return "output"
     if objection:
         return "capability" if repeated else "quality"
     return None

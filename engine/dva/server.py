@@ -59,6 +59,8 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         if host not in ("127.0.0.1", "localhost", "testserver"):
             return JSONResponse({"error": "forbidden host"}, 403)
         path = request.url.path
+        if path.startswith("/api/bridge/"):        # code run by run_python: its own token, checked by the route
+            return await call_next(request)
         if path.startswith("/api/") and path != "/api/health":
             supplied = request.headers.get("authorization", "").removeprefix("Bearer ").strip() or \
                 request.query_params.get("token", "")
@@ -166,6 +168,35 @@ def create_app(data_dir=None, resources_dir=None, token=None):
                 yield sse(event)
         return StreamingResponse(gen(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    # ------------------------------------------------------------------ code → connected services (2.19.0)
+    @api.post("/api/bridge/call")
+    async def bridge_call(request: Request):
+        data = await body(request)
+        token = request.headers.get("x-kimilm-bridge", "")
+        try:
+            result = await A().bridge.call(token, data.get("tool"), data.get("arguments"))
+        except PermissionError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, 403)
+        except Exception as exc:                       # the code gets the reason, as the agent would
+            return JSONResponse({"ok": False, "error": str(exc)[:2000] or type(exc).__name__}, 200)
+        return {"ok": True, "result": result}
+
+    @api.post("/api/bridge/tools")
+    async def bridge_tools(request: Request):
+        try:
+            return {"ok": True, "tools": A().bridge.tools(request.headers.get("x-kimilm-bridge", ""))}
+        except PermissionError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, 403)
+
+    # ------------------------------------------------------------------ programs KimiLM runs (2.19.0)
+    @api.get("/api/procs")
+    async def procs_list():
+        return {"procs": await asyncio.to_thread(A().procs.listing)}
+
+    @api.delete("/api/procs/{pid}")
+    async def procs_end(pid: int):
+        return await asyncio.to_thread(A().procs.end, pid)
 
     @api.post("/api/shutdown")
     async def shutdown():

@@ -56,6 +56,7 @@ class ToolContext:
     harness: dict | None = None
     loaded_skills: set = field(default_factory=set)
     notes: dict = field(default_factory=dict)
+    turn: Any = None         # the Turn that runs the tools (2.19.0: code reaches its connectors through it)
 
     def progress(self, text, beat=False):
         """A tool says what it is doing. Shown live inside the chat's step for this tool call and kept with the

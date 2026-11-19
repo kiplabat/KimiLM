@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Activity as ActivityIcon, Ban, CheckCircle2, ChevronDown, ChevronRight, Clock, Eye, Loader2, Play, Workflow, XCircle } from "lucide-react";
+import { Activity as ActivityIcon, Ban, CheckCircle2, ChevronDown, ChevronRight, Clock, Cpu, Eye, Loader2, Play, Square, Workflow, XCircle } from "lucide-react";
 import { api, fmtTime } from "../api";
 import { go, useEvent } from "../store";
 import { Badge, Button, Empty, PageHeader, Spinner, Tabs } from "../components/ui";
@@ -12,6 +12,31 @@ const STEP_ICON: any = {
   done: <CheckCircle2 size={14} className="ok" />, failed: <XCircle size={14} className="bad" />, cancelled: <Ban size={14} className="muted" />,
   running: <Loader2 size={14} className="spin accent" />, review: <Loader2 size={14} className="spin accent" />,
 };
+
+// The programs agents run (2.19.0): code, commands and pipelines, each with what it started. A program ends with
+// its task, at its time limit, or here.
+function Programs({ jobs, onOpen }: { jobs: any[]; onOpen: (id: string) => void }) {
+  const [rows, setRows] = useState<any[]>([]);
+  const load = () => api.get("/procs").then((r) => setRows(r.procs)).catch(() => {});
+  useEffect(() => { load(); const t = setInterval(load, 4000); return () => clearInterval(t); }, []);
+  if (!rows.length) return null;
+  const title = (id: string) => jobs.find((j) => j.id === id)?.title;
+  return (
+    <>
+      <div className="work-h"><Cpu size={14} /> Programs agents are running ({rows.length})</div>
+      <div className="card">
+        {rows.map((r) => (
+          <div key={r.pid} className="list-row" style={{ cursor: "default" }}>
+            <div><b>{r.kind === "python" ? "Python" : r.kind === "command" ? "Command" : r.kind}</b> <span className="small muted">{r.label}</span>
+              <div className="small muted">{r.processes} process{r.processes === 1 ? "" : "es"} · {dur(r.cpu_seconds)} of processor time · {r.memory_mb} MB · since {fmtTime(r.since)}
+                {r.owner && title(r.owner) ? <> · for <button className="link" onClick={() => onOpen(r.owner)}>{title(r.owner)}</button></> : null}</div></div>
+            <Button small kind="danger" icon={<Square size={12} />} onClick={() => api.del(`/procs/${r.pid}`).then(load).catch(load)} title="End it and every program it started: the agent is told it failed">End</Button>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
 
 // One run, opened: every step with how long it took and what it read, took from the cache and wrote. The bar is
 // the step's share of the run's model time, so the slow step is visible at a glance.
@@ -179,6 +204,7 @@ export default function Activity() {
         {running.length === 0
           ? <div className="card small muted">Nothing is working right now.</div>
           : <div className="card">{running.map((j) => <TaskRow key={j.id} j={j} live={live[j.id]} onOpen={() => setOpen(j.id)} />)}</div>}
+        <Programs jobs={jobs} onOpen={setOpen} />
         <div className="work-h" style={{ marginTop: 18 }}>Earlier</div>
         {earlier.length === 0
           ? <Empty icon={<ActivityIcon size={32} />} title="Nothing yet">Start a chat, make a picture or a recording, or plan a scheduled task.</Empty>

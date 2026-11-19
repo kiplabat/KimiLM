@@ -727,7 +727,10 @@ class Orchestra:
         if t.get("done_when"):
             parts.append(f"Done when: {t['done_when']}")
         if t.get("expects"):
-            parts.append("Save these files in the shared team folder: " + ", ".join(t["expects"]))
+            # the exact paths (2.19.0): "team/guide.json" was read as a folder inside the team folder, and a
+            # small model could not tell where its relative paths land
+            parts.append("Leave these files, at exactly these paths (the app checks them):\n"
+                         + "\n".join(f"- {self.expected_path(n)}" for n in t["expects"]))
         names = self.app.connectors.names(self.connector_ids())
         if names:
             parts.append("Connected services you have tools for: " + ", ".join(names) + ". When one of them offers "
@@ -955,12 +958,31 @@ class Orchestra:
         if not (t.get("output") or "").strip():
             problems.append("it gave no result")
         for name in t.get("expects") or []:
-            p = Path(name)
-            found = (p.is_absolute() and p.exists()) or (self.dir / name).exists() or \
-                any(f.name.lower() == p.name.lower() for f in self.dir.rglob("*") if f.is_file())
-            if not found:
-                problems.append(f"the file {name} was not saved in the shared team folder ({self.dir})")
+            if not self.has_output(name):
+                problems.append(f"the file {self.expected_path(name)} was not saved")
         return problems
+
+    def expected_path(self, name):
+        """Where a file a step must leave belongs: an absolute path as it is; otherwise in the team folder, with a
+        leading "team/" (how planners often write it) taken off."""
+        p = Path(str(name).strip().strip('"'))
+        if p.is_absolute():
+            return p
+        parts = [x for x in p.parts if x not in (".", "")]
+        if len(parts) > 1 and parts[0].lower() in ("team", self.dir.name.lower()):
+            parts = parts[1:]
+        return self.dir.joinpath(*parts) if parts else self.dir
+
+    def has_output(self, name):
+        """The file is at its expected path, or (as before 2.19.0) a file of that name is anywhere in the team
+        folder, and it is not empty."""
+        p = self.expected_path(name)
+        try:
+            if p.is_file() and p.stat().st_size > 0:
+                return True
+            return any(f.name.lower() == p.name.lower() and f.stat().st_size > 0 for f in self.dir.rglob("*") if f.is_file())
+        except OSError:
+            return False
 
     async def verify(self, t):
         """A short, strict check by the planner's model: does the result meet 'done when'? (met, what is missing)"""

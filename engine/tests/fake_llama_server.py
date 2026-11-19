@@ -159,7 +159,25 @@ def decide(body):
         return {"tool": ("list_files", {"path": "."}), "delay": 1.5}
     if "Message from me while you were working" in text:
         return {"text": "Noted your new message: " + text.split(":)")[-1].strip()[:60]}
+    m = re.search(r"\(From the app\) Not finished: these files your task must leave are not there:\n- (\S+)", text)
+    if m and "write_file" in tools and not after_tool:    # the app's reminder of a missing file (2.19.0)
+        return {"tool": ("write_file", {"path": m.group(1), "content": "the report"})}
     if tools and not after_tool:
+        # 2.19.0: a tool's answer kept with save_to; a long answer read; paging in code; a program that hangs
+        m = re.search(r"save the guide to (\S+)", text)
+        if m and any(n.endswith("get_guide") for n in tools):
+            return {"tool": (next(n for n in tools if n.endswith("get_guide")), {"save_to": m.group(1)})}
+        if "read the guide" in text and any(n.endswith("get_guide") for n in tools):
+            return {"tool": (next(n for n in tools if n.endswith("get_guide")), {})}
+        m = re.search(r"page through the items into (\S+)", text)
+        if m and "run_python" in tools:
+            return {"tool": ("run_python", {"code": PAGING.replace("OUT", m.group(1))})}
+        m = re.search(r"hang in code(?: for (\d+) seconds)?", text)
+        if m and "run_python" in tools:
+            args = {"code": HANG}
+            if m.group(1):
+                args["timeout"] = int(m.group(1))
+            return {"tool": ("run_python", args)}
         if "list files" in text and "list_files" in tools:
             return {"tool": ("list_files", {"path": "."})}
         if "write" in text and "write_file" in tools:
@@ -185,6 +203,30 @@ def step_goal(last, said=None):
         if mark in (said if said is not None else last):
             return last.split("Done when")[0].split(mark)[-1]
     return ""
+
+
+PAGING = """import csv
+from kimilm import call, tools
+assert "list_items" in tools(), tools()
+rows, page = [], 1
+while True:
+    got = call("list_items", page=page, per_page=10)
+    rows += got["items"]
+    if not got["has_more"]:
+        break
+    page += 1
+with open("OUT", "w", newline="", encoding="utf-8") as f:
+    w = csv.DictWriter(f, fieldnames=["id", "title"])
+    w.writeheader()
+    w.writerows(rows)
+print(f"{len(rows)} items from {page} pages")
+"""
+HANG = """import os, subprocess, sys, time
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+with open("hang-pids.txt", "w") as f:
+    f.write(f"{os.getpid()} {child.pid}")
+time.sleep(600)
+"""
 
 
 def handoff(text):
@@ -372,6 +414,10 @@ def structured(schema, body):
         return out
     if "approach" in props and "tasks" in props:
         allowed = props["approach"]["enum"]
+        if "team" in allowed and "file-leaving plan" in users:   # a step that must leave a file (2.19.0)
+            return {"approach": "team", "reason": "one step", "final": "the report", "tasks": [
+                {"id": "t1", "name": "Report", "goal": "say hello and keep a report", "done_when": "a greeting",
+                 "expects": ["team/report.txt"]}]}
         if "team" in allowed and "forgetful plan" in users:
             return {"approach": "team", "reason": "three steps", "final": "all parts", "tasks": [
                 {"id": "t1", "name": "Find", "goal": "say hello" + (" then explode" if "explode-first" in users else ""),
