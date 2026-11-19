@@ -60,13 +60,21 @@ input, textarea, select, button { font: inherit; color: inherit; }
 .side-item:hover { background: var(--surface); } .side-item.active { background: var(--surface); box-shadow: var(--shadow); font-weight: 500; }
 .side-item .ellipsis { flex: 1; }
 .side-empty { color: var(--text-soft); font-size: 12.5px; padding: 2px 8px 6px; }
-.side-nav { border-top: 1px solid var(--line); padding-top: 8px; display: flex; flex-direction: column; gap: 1px; }
+.side-nav { border-top: 1px solid var(--line); padding-top: 8px; margin-top: 12px; display: flex; flex-direction: column; gap: 1px; }
+/* 2.21.0: projects, chats and the pages below them scroll as one; a section's title folds it */
+.side-fold { display: flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; }
+.side-fold:hover { color: var(--text); }
+.side-more { color: var(--text-soft); font-size: 12.5px; padding: 4px 8px; cursor: pointer; } .side-more:hover { color: var(--text); }
 .side-nav .side-item span:nth-child(2) { flex: 1; }
 .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--ink-mid); flex-shrink: 0; margin: 0 4px; }
 .model-chip { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text-soft); padding: 8px; border-radius: 8px; cursor: pointer; background: var(--surface); border: 1px solid var(--line); }
 .live-dot, .idle-dot, .err-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 .live-dot { background: var(--sage); box-shadow: 0 0 0 3px rgba(76, 175, 130, .2); } .idle-dot { background: var(--ink-mid); } .err-dot { background: var(--danger); }
-.main { flex: 1; min-width: 0; overflow: hidden; display: flex; flex-direction: column; }
+.main { flex: 1; min-width: 0; overflow: hidden; display: flex; flex-direction: column; position: relative; }
+/* 2.21.0: every screen you open is kept in a layer of its own; only the one you are on is seen. A hidden layer is
+   not drawn but keeps what was typed and how far it was scrolled. */
+.slot { position: absolute; inset: 0; display: flex; flex-direction: column; min-width: 0; }
+.slot-off { visibility: hidden; content-visibility: hidden; pointer-events: none; }
 .link { background: none; border: 0; color: var(--coral); cursor: pointer; padding: 0; font-size: 12.5px; }
 
 /* controls */

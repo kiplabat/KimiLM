@@ -24,6 +24,10 @@ So:
   On Windows the engine puts itself in a job object that ends every process in it when the engine's last handle
   closes (`contain`): whatever happens to the engine, its programs, models and helpers end with it.
 
+A program that ends but leaves another running (a program in the background, a server) does not leave it
+unaccounted for (2.21.0): what it started is noted while it runs, and what is still running when it ends stays on
+the list as "left running", with the same task; it ends when the task ends (or at once, with no task).
+
 `GET /api/procs` lists what runs now; `DELETE /api/procs/{pid}` ends one (Activity shows them)."""
 import asyncio
 import json
@@ -214,6 +218,62 @@ class Procs:
         self.live = {}
         self._write()
 
+    # ------------------------------------------------------------------ what a program leaves behind (2.21.0)
+    async def _watch(self, pid, family):
+        """Note what a program starts while it runs, so that what it leaves running can be found when it is gone
+        (a program whose parent has ended is no longer anyone's child)."""
+        while True:
+            try:
+                kids = await asyncio.to_thread(lambda: psutil.Process(pid).children(recursive=True))
+                for c in kids:
+                    try:
+                        family.setdefault(c.pid, c.create_time())
+                    except psutil.Error:
+                        pass
+            except psutil.Error:
+                return
+            await asyncio.sleep(1)
+
+    def strays(self, top, family, since):
+        """Programs that `top` started (seen while it ran, or, on Windows, naming it or one of them as parent) and
+        that are still running: only the outermost of each group (ending it ends what it started)."""
+        found = {}
+        for pid, created in list(family.items()):
+            try:
+                p = psutil.Process(pid)
+                if abs(p.create_time() - created) <= 1 and p.status() != psutil.STATUS_ZOMBIE:
+                    found[pid] = p
+            except psutil.Error:
+                pass
+        if os.name == "nt":                # Windows keeps an orphan's parent number: ones started too late to be seen
+            known = set(family) | {top}
+            for p in psutil.process_iter(["ppid", "create_time"]):
+                if p.info["ppid"] in known and (p.info["create_time"] or 0) >= since and p.pid not in found:
+                    found[p.pid] = p
+        out = []
+        for pid, p in found.items():
+            try:
+                if p.ppid() not in found:
+                    out.append(p)
+            except psutil.Error:
+                pass
+        return out
+
+    def keep(self, p, label, owner):
+        try:
+            self.live[p.pid] = {"pid": p.pid, "started": p.create_time(), "kind": "left running", "label": label,
+                                "owner": owner, "since": now()}
+            self._write()
+            if hasattr(self.app, "log"):
+                self.app.log(f"a program left {p.pid} running; it ends with its task ({owner})")
+        except psutil.Error:
+            pass
+
+    @staticmethod
+    def _end_strays(left):
+        for p in left:
+            end_tree(p.pid)
+
     # ------------------------------------------------------------------ running one program
     async def run(self, argv, *, cwd, env, timeout, kind="code", label="", owner=None, limit=4_000_000,
                   on_line=None, low=True, queue=True):
@@ -233,6 +293,9 @@ class Procs:
             if low:
                 lower(proc.pid)
             self.add(proc, kind, label, owner)
+            since = time.time() - 1
+            family = {}                    # what it starts, seen while it runs: pid -> start time (2.21.0)
+            watch = asyncio.create_task(self._watch(proc.pid, family))
             head, tail, size = "", "", 0
             half = limit // 2
 
@@ -255,10 +318,21 @@ class Procs:
                 await asyncio.wait_for(read(), timeout)
                 code = await asyncio.wait_for(proc.wait(), 10)
             except BaseException:          # too long, or the task waiting for it was cancelled: end it all
+                watch.cancel()
                 await asyncio.to_thread(end_tree, proc.pid)
+                await asyncio.to_thread(self._end_strays, self.strays(proc.pid, family, since))
                 raise
             finally:
+                watch.cancel()
                 self.drop(proc.pid)
+            # 2.21.0: what it started and left running (a program in the background, a server) stays on the list
+            # with the same task, is shown in Activity, and ends when the task ends; with no task, it ends now
+            left = await asyncio.to_thread(self.strays, proc.pid, family, since)
+            if left and owner:
+                for p in left:
+                    self.keep(p, f"left running by {label or kind}"[:200], owner)
+            elif left:
+                await asyncio.to_thread(self._end_strays, left)
             cut = size - len(head) - len(tail)
             return code, head + (f"\n…({cut:,} characters of output left out)…\n" if cut > 0 else "") + tail
 

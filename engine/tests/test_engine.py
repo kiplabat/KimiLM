@@ -4687,3 +4687,68 @@ def test_an_agent_that_needs_you_says_so_and_the_task_asks_at_once(engine):
     assert [t["name"] for t in team["tasks"]] == ["Fetch", "Mirror"] and team["tasks"][1]["status"] == "done"
     assert team["measures"]["by_agent"] == 1 and team["measures"]["met"] is True
 
+
+
+# ---------------------------------------------------------------------- 2.21.0
+def _gone(pid, seconds=10):
+    import psutil
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        try:
+            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                return True
+        except psutil.Error:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def test_a_program_left_running_by_an_agents_code_ends_with_its_task(tmp_path):
+    """2.21.0. After the evaluation one Python process was left: code an agent ran had ended, but a program it had
+    started went on, and once its parent was gone nothing knew of it. Now what a program starts is noted while it
+    runs; what is still running when it ends stays on the list (Activity) with the same task and ends with it."""
+    import asyncio
+    from types import SimpleNamespace
+    from dva.procs import Procs
+    app = SimpleNamespace(paths=SimpleNamespace(data=tmp_path), log=[].append,
+                          db=SimpleNamespace(setting=lambda k, d=None: d))
+    script = ("import subprocess, sys, time\n"
+              "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], stdin=subprocess.DEVNULL, "
+              "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+              "print(p.pid, flush=True)\ntime.sleep(1.6)\n")
+
+    async def go():
+        procs = Procs(app)
+        env = {**os.environ}
+        code, out = await procs.run([sys.executable, "-c", script], cwd=tmp_path, env=env, timeout=30, owner="job-1",
+                                    label="python run_1.py")
+        pid = int(out.split()[0])
+        assert code == 0 and not _gone(pid, 0.2)
+        row = procs.live[pid]
+        assert row["kind"] == "left running" and row["owner"] == "job-1" and row["label"] == "left running by python run_1.py"
+        assert [r["pid"] for r in procs.listing()] == [pid]
+        assert json.loads((tmp_path / "procs.json").read_text())[0]["pid"] == pid    # ended after a restart too
+        assert procs.end_owner("job-2") == 0 and procs.end_owner("job-1") == 1 and _gone(pid)
+        code, out = await procs.run([sys.executable, "-c", script], cwd=tmp_path, env=env, timeout=30)   # no task
+        assert _gone(int(out.split()[0])) and procs.live == {}
+        code, out = await procs.run([sys.executable, "-c", "print('alone')"], cwd=tmp_path, env=env, timeout=30,
+                                    owner="job-3")
+        assert out.strip() == "alone" and procs.live == {}
+    asyncio.run(go())
+
+
+def test_an_agent_that_names_its_own_folder_means_that_folder(tmp_path):
+    """2.21.0. In the evaluation's folder 'fizz' the model wrote 'fizz/fizz.py': the file went to fizz/fizz/, and its
+    code, run in fizz/, could not find it. A relative path that starts with the folder's own name means the folder,
+    unless a sub-folder of that name really is there."""
+    from dva.tools import ToolContext
+    root = tmp_path / "fizz"
+    root.mkdir()
+    ctx = ToolContext(app=None, chat={}, project=None, workspace=root, folders=[str(root)], readonly=[],
+                      emit=lambda *a, **k: None, approve=None)
+    assert ctx.resolve("fizz/fizz.py", write=True) == (root / "fizz.py").resolve()
+    assert ctx.resolve("FIZZ/out.txt") == (root / "out.txt").resolve()
+    assert ctx.resolve("fizz") == root.resolve() and ctx.resolve("fizz.py") == (root / "fizz.py").resolve()
+    assert ctx.resolve("other/fizz.py") == (root / "other" / "fizz.py").resolve()
+    (root / "fizz").mkdir()                       # a real sub-folder of that name is used as it is
+    assert ctx.resolve("fizz/fizz.py") == (root / "fizz" / "fizz.py").resolve()

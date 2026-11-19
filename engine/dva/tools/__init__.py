@@ -97,7 +97,13 @@ class ToolContext:
         """Resolve a path inside the granted folders (or read-only skill folders for reading)."""
         p = Path(str(path or ".").strip().strip('"'))
         if not p.is_absolute():
-            p = self.primary / p
+            base = self.primary
+            # 2.21.0: an agent that names its own folder ("fizz/fizz.py" in a folder called fizz, "team/x" in the
+            # team folder) means that folder, not a new folder of the same name inside it. A sub-folder that really
+            # has that name is still used.
+            if p.parts and p.parts[0].lower() == base.name.lower() and not (base / p.parts[0]).exists():
+                p = Path(*p.parts[1:]) if len(p.parts) > 1 else Path(".")
+            p = base / p
         p = p.resolve()
         allowed = self.roots + ([] if write else [Path(r).resolve() for r in self.readonly])
         for root in allowed:

@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { FolderOpen } from "lucide-react";
 import { api, desktop } from "../api";
-import { go, useApp } from "../store";
+import { go, useApp, useShown } from "../store";
 import { Badge, Button, Field, FolderInput, PageHeader, Toggle } from "../components/ui";
 
 // The built-in evaluation: twelve small tasks with answers that code checks. It turns "is this setup good?" into
@@ -28,12 +28,13 @@ function EvaluationCard() {
     save("kimilm-evaluation.csv", lines.join("\n") + "\n", "text/csv");
   };
   const load = () => api.get("/evals").then(setData).catch(() => {});
-  useEffect(() => { load(); }, []);
+  const shown = useShown();          // afresh when you come back to Settings (2.21.0)
+  useEffect(() => { if (shown) load(); }, [shown]);
   useEffect(() => {
-    if (!data?.current) return;
+    if (!data?.current || !shown) return;
     const t = setInterval(load, 3000);
     return () => clearInterval(t);
-  }, [!!data?.current]);
+  }, [!!data?.current, shown]);
   const dur = (sec: number) => sec < 90 ? `${Math.round(sec)} s` : sec < 5400 ? `${Math.round(sec / 60)} min` : `${(sec / 3600).toFixed(1)} h`;
   const k = (n: number) => n >= 10000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n || 0);
   const run = async () => { try { await api.post("/evals/run", model ? { model } : {}); load(); } catch (e: any) { toast(e.message, "error"); } };
@@ -96,6 +97,35 @@ function EvaluationCard() {
   );
 }
 
+// 2.21.0: the size of everything in the window, like a browser's zoom (text, spacing and layout together)
+const SIZES = [0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2];
+
+function SizeCard() {
+  const [zoom, setZoom] = useState<number | null>(null);
+  useEffect(() => {
+    if (!desktop?.getZoom) return;
+    desktop.getZoom().then(setZoom);
+    return desktop.onZoom((z: number) => setZoom(z));
+  }, []);
+  const pct = (z: number) => `${Math.round(z * 100)} %`;
+  return (
+    <div className="card stack-s">
+      <h3>Size of text and everything else</h3>
+      {desktop?.getZoom ? <>
+        <div className="row gap-s">
+          <Button small onClick={() => desktop.stepZoom(-1)} disabled={zoom !== null && zoom <= SIZES[0]} title="Ctrl −">Smaller</Button>
+          <select className="input narrow" value={zoom ?? 1} onChange={(e) => desktop.setZoom(Number(e.target.value))}>
+            {[...new Set([...SIZES, zoom ?? 1])].sort((a, b) => a - b).map((z) => <option key={z} value={z}>{pct(z)}</option>)}
+          </select>
+          <Button small onClick={() => desktop.stepZoom(1)} disabled={zoom !== null && zoom >= SIZES[SIZES.length - 1]} title="Ctrl +">Larger</Button>
+          {zoom !== null && zoom !== 1 && <Button small kind="ghost" onClick={() => desktop.setZoom(1)} title="Ctrl 0">Back to 100 %</Button>}
+        </div>
+        <div className="field-help">Like a browser's zoom: text, spacing and layout grow or shrink together, so nothing breaks. Also with Ctrl + and Ctrl − (Ctrl 0 for 100 %), or Ctrl and the mouse wheel. Kept for the next start.</div>
+      </> : <div className="field-help">In a browser, use the browser's own zoom (Ctrl + and Ctrl −).</div>}
+    </div>
+  );
+}
+
 export default function Settings() {
   const { boot, refreshBoot, toast } = useApp();
   const s = boot.settings;
@@ -110,6 +140,7 @@ export default function Settings() {
   return (
     <div className="page narrow-page">
       <PageHeader title="Settings" />
+      <SizeCard />
       {shell && (
         <div className="card stack-s">
           <h3>Running in the background</h3>

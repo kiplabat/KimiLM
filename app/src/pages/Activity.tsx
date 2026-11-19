@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { Activity as ActivityIcon, Ban, CheckCircle2, ChevronDown, ChevronRight, Clock, Cpu, Eye, Loader2, Play, Square, Workflow, XCircle } from "lucide-react";
 import { api, fmtTime } from "../api";
-import { go, useEvent } from "../store";
+import { go, useEvent, useShown } from "../store";
 import { Badge, Button, Empty, PageHeader, Spinner, Tabs } from "../components/ui";
 import { ACTIVE, KIND_NAME, PauseButton, PausedMark, Pulse, STATUS_ICON, WorkDetail, span, useTick } from "../components/Work";
 
@@ -18,7 +18,8 @@ const STEP_ICON: any = {
 function Programs({ jobs, onOpen }: { jobs: any[]; onOpen: (id: string) => void }) {
   const [rows, setRows] = useState<any[]>([]);
   const load = () => api.get("/procs").then((r) => setRows(r.procs)).catch(() => {});
-  useEffect(() => { load(); const t = setInterval(load, 4000); return () => clearInterval(t); }, []);
+  const shown = useShown();          // asked only while you see it, and afresh when you come back (2.21.0)
+  useEffect(() => { if (!shown) return; load(); const t = setInterval(load, 4000); return () => clearInterval(t); }, [shown]);
   if (!rows.length) return null;
   const title = (id: string) => jobs.find((j) => j.id === id)?.title;
   return (
