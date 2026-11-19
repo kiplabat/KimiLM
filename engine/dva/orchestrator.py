@@ -269,6 +269,10 @@ class Orchestra:
         self.lean = bool(s("lean_tools", True))
         self.escalate = bool(s("escalate_models", True))
         self.failures = []                    # every failed attempt at a step, with its class (recovery.py)
+        # 2.20.0: the register. An entry is written the moment an agent reports that it cannot finish, or the app
+        # stops it; the planner is woken by it and decides by rule where the answer is clear (fast_review)
+        self.register = []
+        self.target = float(s("fail_fast_target_seconds", 10) or 10)
 
     # ------------------------------------------------------------------ saved state: a run can continue later
     def save(self, status="running"):
@@ -279,6 +283,7 @@ class Orchestra:
                      "agent_chats": self.agent_chats,
                      "need": dict(self.fit.need) if self.fit is not None else {},
                      "failures": self.failures[-60:],
+                     "register": [recovery.public(e) for e in self.register[-60:]],
                      "tasks": [{k: t.get(k) for k in SAVED} for t in self.tasks.values()], **self.extra_state()}
             row = {"chat_id": self.turn.chat["id"], "status": status, "state": state, "resumes": self.resumes,
                    "kind": self.kind, "updated": now()}
@@ -314,6 +319,7 @@ class Orchestra:
         self.resumes = int(row.get("resumes") or 0) + 1
         self.step["log"] = list(state.get("log") or [])
         self.failures = list(state.get("failures") or [])
+        self.register = list(state.get("register") or [])
         if state.get("dir"):
             self.dir = Path(state["dir"])
             self.dir.mkdir(parents=True, exist_ok=True)
@@ -363,6 +369,9 @@ class Orchestra:
                                      "rounds", "loop", "partial", "forecast", "used", "result_file", "kind", "kit")}
         out["goal"] = _clip(t.get("goal"), 400)
         out["output"] = _clip(t.get("output"), 700)
+        if t.get("flag"):                     # how its latest round stopped, when it stopped fast (2.20.0)
+            f = t["flag"]
+            out["flag"] = {k: f.get(k) for k in ("by", "class", "reason", "need", "decision", "decided_in")}
         out["model_name"] = (model or {}).get("name") or t.get("model")
         out["online"] = is_cloud(t.get("model"))
         out["paused"] = bool(t.get("chat_id") and is_paused(self.app, t["chat_id"])) or t["status"] == "paused"
@@ -387,6 +396,8 @@ class Orchestra:
         done = [t for t in self.tasks.values() if t.get("used")]
         self.step["totals"] = {"tokens": sum(t["used"].get("tokens", 0) for t in done),
                                "seconds": round(time.monotonic() - self.started)}
+        self.step["register"] = [recovery.public(e) for e in self.register[-30:]]
+        self.step["measures"] = self.measures()
         self.turn.emit("orchestra", **{k: v for k, v in self.step.items() if k != "type"})
 
     def model_name(self, model_id):
@@ -751,8 +762,9 @@ class Orchestra:
                      "is not there, say exactly what is missing and stop: never rebuild it from memory or from "
                      "earlier chats.\n"
                      "Work efficiently: use tools only as needed. If code fails, read the error, fix the cause and run "
-                     "it again; check outputs before you rely on them. Use ask_lead only if you are truly blocked.\n"
-                     + recovery.AGENT_RULES + "\n"
+                     "it again; check outputs before you rely on them. Use ask_lead only for a question the planner "
+                     "can answer.\n"
+                     + recovery.AGENT_RULES + "\n" + recovery.FAIL_FAST_RULE + "\n"
                      "Finish with your result: what you did, the result itself (facts, numbers, sources, file paths), "
                      "and whether 'done when' is met." + self.length_hint(t))
         return "\n\n".join(parts)
@@ -854,6 +866,7 @@ class Orchestra:
         t["status"] = "running"
         t["started_at"] = time.time()
         t["timed_out"] = False
+        t.pop("flag", None)                    # a new round starts with a clean slate (2.20.0)
         # a step may run this long before it is stopped: generous against the forecast and the reply time limit
         minutes = float((t.get("limits") or {}).get("time_limit_minutes") or self.harness_of(t).get("time_limit_minutes")
                         or self.db.setting("turn_time_limit_minutes", 30) or 30)
@@ -890,6 +903,8 @@ class Orchestra:
         t["files"] = self._files_since(t.get("started_at") or 0)
         t["failures"] = recovery.tool_failures(meta.get("steps"))     # what its tools reported as failed
         t["guard"] = meta.get("guard")                                # why it stopped using tools, if the app made it
+        if meta.get("fail_fast") and not t.get("flag"):              # (live, flag() has already set it)
+            t["flag"] = {**meta["fail_fast"], "mono": time.monotonic()}
         t["progressing"] = recovery.progressing(meta.get("steps"), meta.get("guard"))
         from .runner import private_tool_names
         if any(s.get("type") == "tool" and s.get("name") in private_tool_names() for s in meta.get("steps", [])):
@@ -1061,8 +1076,18 @@ class Orchestra:
             self.settle(t, "failed", "stopped")
             self.logline(f"{t['id']} was stopped.")
             return
+        if t.get("flag") and not t.get("timed_out"):   # it stopped fast: no check, the planner decides by rule
+            return await self.fast_review(t, t["flag"])
         problems = self.code_check(t) if not t.get("timed_out") else ["it ran past its time limit and was stopped"]
         hard = bool(problems)
+        if not problems and t.get("expects") and recovery.files_only(t.get("done_when"), t["expects"]):
+            # 'done when' asks only for files, and code found them all: accepted at once, no model call (2.20.0)
+            t["kind"] = None
+            self.judge(t, True)
+            self.settle(t, "done", None if t["attempts"] == 1 else f"passed in round {t['attempts']}")
+            self.logline(f"Accepted {t['id']}: its files are there" + (f" (round {t['attempts']})" if t["attempts"] > 1
+                                                                       else "") + ".")
+            return
         if not problems:
             met, reason = await self.verify(t)
             if met:
@@ -1155,6 +1180,173 @@ class Orchestra:
             self.logline(f"Round {t['attempts'] + 1} of {t['rounds']} for {t['id']}: {why[:160]}")
             await self.start(t, "The planner reviewed your result and asks for this:\n" + _clip(why, 800)
                              + "\n\nFix it, check it, and reply with the complete corrected result.")
+
+    # ------------------------------------------------------------------ fail fast (2.20.0)
+    def flag(self, tid, entry):
+        """An agent of this run cannot finish: it said so (report_failure) or the app stopped it (a tripwire). The
+        entry is written to the register now, shown in the run's log and in the task's trail (Activity), and the
+        planner is woken; the agent's turn ends without another model call."""
+        t = self.tasks.get(tid)
+        if not t or t["status"] != "running":
+            return
+        entry.update(step=tid, name=t["name"], agent=t.get("agent"), round=t["attempts"],
+                     second=round(time.monotonic() - self.started, 1))
+        t["flag"] = entry
+        self.register.append(entry)
+        del self.register[:-200]
+        need = recovery.NEEDS.get(entry.get("need"))
+        line = ((f"{tid}" + (f" ({t['agent']})" if t.get("agent") else "") + " reported that it cannot finish"
+                 if entry.get("by") == "agent" else f"The app stopped {tid} at once")
+                + f": {_clip(entry.get('reason'), 200)}" + (f"; it needs {need}" if need else ""))
+        self.logline(line)
+        self.app.jobs.trail(self.turn.job["id"], line, "note", ok=False)
+        self.wake()
+
+    def decided(self, t, flag, text):
+        """The planner's decision about an entry of the register, with the seconds it took from the moment the
+        entry was written (model calls are not part of it: a decision that needs one is timed to the hand-over)."""
+        secs = round(max(0.0, time.monotonic() - float(flag.get("mono") or time.monotonic())), 2)
+        flag.update(decision=text, decided_in=secs)
+        if not any(e is flag for e in self.register):
+            self.register.append(flag)
+        line = f"{t['id']}: decided in {secs:.1f} s — {text}."
+        self.logline(line)
+        self.app.jobs.trail(self.turn.job["id"], line, "note")
+
+    def redo_text(self, flag, hint=""):
+        """What a fresh agent is told about the attempt that stopped before it."""
+        avoid = "; ".join(f"{f['tool']}: {_clip(f.get('error'), 110)}" for f in (flag.get("failures") or [])[:3])
+        need = recovery.NEEDS.get(flag.get("need"))
+        return (f"An earlier attempt at this task stopped early: {_clip(flag.get('reason'), 400)}\n"
+                + (f"It said it needed {need}" + (f" ({_clip(flag.get('detail'), 200)})" if flag.get("detail") else "")
+                   + ".\n" if need else "")
+                + (f"What failed in it (do not do these again the same way): {avoid}\n" if avoid else "")
+                + (hint + "\n" if hint else "") + "Take a different approach this time.")
+
+    def handover(self, t, flag):
+        """A step that needs a tool its agent does not have goes to an agent that has it: the same agent with all of
+        its harness's tools when its lean kit left the tool out, else another harness of the team that has it.
+        Returns what was changed, or None when no agent has it."""
+        wanted = flag.get("wanted")
+        if not wanted:
+            return None
+        from .tools import GROUPS, ON_REQUEST, builtin_tools
+        group = next((x.group for x in builtin_tools() if x.name == wanted), None)
+        if not group or (group == "python" and not self.db.setting("allow_python", True)):
+            return None
+
+        def groups_of(h):
+            g = h.get("tools")
+            everything = {x for x in GROUPS if x not in ON_REQUEST}
+            if g is None:
+                return everything if h.get("mode", "agent") != "chat" else set()
+            return (everything | {x for x in g if x in ON_REQUEST}) if "*" in g else set(g)
+        current = self.harness_of(t)
+        kit = (t.get("limits") or {}).get("tools") or t.get("kit")
+        if group in groups_of(current) and kit and group not in kit:
+            t["full_kit"] = True
+            t["limits"] = {k: v for k, v in (t.get("limits") or {}).items() if k != "tools"}
+            return f"the same kind of agent with all its tools ({wanted} was not in its kit)"
+        for h in self.turn.team_harnesses():
+            if h["id"] != current.get("id") and group in groups_of(h):
+                t["harness"], t["full_kit"] = h["id"], True
+                t["limits"] = {k: v for k, v in (t.get("limits") or {}).items() if k != "tools"}
+                return f"handed to a {h.get('name') or h['id']} agent, which has {wanted}"
+        return None
+
+    async def fast_review(self, t, flag):
+        """An agent's round ended fast (2.20.0): it reported that it cannot finish, or the app stopped it. It is not
+        checked: the failure is plain. What happens next is decided by rule where the answer is clear (recovery.
+        fast_rule): a passing fault is tried again, a missing tool goes to an agent that has it, a stronger model or
+        more time is given where that is what it needs, files not left are asked for with save_to, and what only
+        the user can give is asked for. Where it is not clear, fast_settle decides (a planned run: a fresh agent
+        told what failed; a long-running task: its planner, with the entry in hand)."""
+        why = flag.get("reason") or "it could not finish"
+        kind = flag.get("class") or "approach"
+        t["kind"] = kind
+        self.keep_best(t, [why], True)
+        rec = recovery.record(t, why, kind, minutes=self.step_minutes(t))
+        rec.update(by=flag.get("by"), need=flag.get("need"))
+        earlier = [r for r in self.failures if r["step"] == t["id"] and r["class"] == rec["class"]
+                   and r["sig"] == rec["sig"]]
+        self.failures.append(rec)
+        t["feedback"].append(why)
+        t["note"] = why
+        rule = recovery.fast_rule(flag)
+        flag["rule"] = rule
+        last = t["attempts"] >= t["rounds"] or self.finished
+        if not last and rule == "retry" and len(earlier) < recovery.CLASSES["transient"]["repeat"]:
+            wait = float(self.db.setting("retry_wait_seconds", 15)) * 3 ** len(earlier)
+            rec["change"] = f"the same again after {wait:g} seconds"
+            self.decided(t, flag, f"a passing fault: the same again after {wait:g} seconds")
+            await asyncio.sleep(wait)
+            t["_fresh"] = False
+            return await self.start(t, "That looked like a passing fault, not a mistake of yours: " + _clip(why, 300)
+                                    + "\n\nDo the same once more, then finish your task and reply with the complete "
+                                    "result.")
+        if not last and rule == "more_time":
+            minutes, more = self.step_minutes(t), self.more_time(t)
+            if more:
+                t["more_time"], t["_fresh"] = True, False
+                rec["change"] = f"more time: {minutes:g} → {more:g} minutes"
+                self.decided(t, flag, f"more time: {minutes:g} → {more:g} minutes")
+                return await self.start(t, f"You stopped: {_clip(why, 300)}. You now have {more:g} minutes. Continue "
+                                        "from where you stopped: do not redo what is already done. Then reply with "
+                                        "the complete result.")
+        change, hint = None, ""
+        if not last and rule == "handover":
+            change = self.handover(t, flag)
+            if not change:
+                rule = flag["rule"] = "ask"
+        elif not last and rule == "stronger":
+            before = t["model"]
+            if self.escalate:
+                self.step_up(t)
+            if t["model"] != before:
+                change = f"a stronger model: {self.model_name(t['model'])}"
+        elif not last and rule == "output" and not earlier:
+            change = "a fresh agent told to save each file with save_to"
+            hint = ("Leave each file at its exact path: pass save_to on the tool call whose answer is the file's "
+                    "content, or page through a service in one run_python program with `from kimilm import call` "
+                    "and write the file there. Never retype a tool's answer.")
+        if change:
+            t["_fresh"], t["full_kit"] = True, True
+            rec["change"] = change
+            self.decided(t, flag, change)
+            return await self.start(t, self.brief(t, redo=self.redo_text(flag, hint)), fresh=True)
+        return await self.fast_settle(t, flag, rec, rule, why, last, earlier)
+
+    async def fast_settle(self, t, flag, rec, rule, why, last, earlier):
+        """No rule gave a way on: in a planned run a fresh agent is told what failed and to go another way, unless
+        the same failure came before or no round is left; what only the user can give ends the step, and the
+        answer says what is needed. (A long-running task hands the entry to its planner instead: missions.py.)"""
+        if rule is None and not last and not earlier:
+            change = "a fresh agent told what failed and to go another way"
+            t["_fresh"], t["full_kit"] = True, True
+            rec["change"] = change
+            self.decided(t, flag, change)
+            return await self.start(t, self.brief(t, redo=self.redo_text(flag)), fresh=True)
+        decision = ("it needs you: the step stops here and the answer says what is needed" if rule == "ask" else
+                    "no round is left: the step stops here" if last else
+                    "the same failure as before: the step stops here")
+        rec["change"] = "not tried again: " + decision.split(": ", 1)[0]
+        self.decided(t, flag, decision)
+        return self.exhausted(t, why)
+
+    def measures(self):
+        """How fast failures are handled, so the balance can be judged (shown in the run's card): how many there
+        were and who saw them, the seconds from an entry to the planner's decision against the target, rounds per
+        step, and agents that gave up although nothing outside them was missing (they may have managed)."""
+        reg = self.register
+        decided = [float(e["decided_in"]) for e in reg if e.get("decided_in") is not None]
+        tried = [t for t in self.tasks.values() if t.get("attempts")]
+        return {"failures": len(reg), "by_agent": sum(e.get("by") == "agent" for e in reg),
+                "by_app": sum(e.get("by") == "app" for e in reg),
+                "decide_max": max(decided) if decided else None,
+                "decide_avg": round(sum(decided) / len(decided), 2) if decided else None,
+                "target": self.target, "met": all(d <= self.target for d in decided) if decided else None,
+                "rounds": round(sum(int(t["attempts"]) for t in tried) / len(tried), 2) if tried else 0,
+                "early": sum(bool(e.get("early")) for e in reg)}
 
     def step_minutes(self, t):
         """The minutes one attempt at this step may take."""
@@ -1590,8 +1782,24 @@ def team_tools(orch, tid, turn):
         finally:
             await turn.hold_model()
 
+    async def report_failure(ctx, tried, need="other", error="", detail=""):
+        # 2.20.0: said the moment the agent knows; its turn ends now and the planner decides within seconds
+        need = need if need in recovery.NEEDS else "other"
+        reason = f"it cannot finish: it needs {recovery.NEEDS[need]}" + (f" ({_clip(detail, 160)})" if detail else "")
+        turn.flag_failure("agent", reason=reason, error=error, need=need, tried=tried, detail=detail)
+        return "Reported to the planner. Stop now: your turn ends here, and the planner decides what happens next."
+
     S = lambda props, req: {"type": "object", "properties": props, "required": req}  # noqa: E731
     return [
+        Tool("report_failure", "Say at once that you cannot finish your task, instead of trying again: what you "
+             "tried, the exact error, and what you need. Your turn ends and the planner decides within seconds.",
+             S({"tried": {"type": "string", "description": "what you tried, in one or two sentences"},
+                "error": {"type": "string", "description": "the exact error or what went wrong"},
+                "need": {"type": "string", "enum": list(recovery.NEEDS),
+                         "description": "what would let the task be finished"},
+                "detail": {"type": "string", "description": "exactly what is needed (a tool's name, a file, a fact)"}},
+               ["tried", "need"]), report_failure, "team", label="Report a failure",
+             summary=lambda a: f"Cannot finish: {a.get('need', '')} — {str(a.get('error') or a.get('tried') or '')[:160]}"),
         Tool("team_board", "See the plan's steps, their status and the accepted results of the other agents.",
              S({}, []), team_board, "team", label="Team board", summary=lambda a: "Read the team board"),
         Tool("ask_lead", "Ask the planner a question when you are blocked (missing information or a decision "

@@ -514,6 +514,18 @@ class Mission(Orchestra):
             self.agent_chats.pop(t.get("agent"), None)     # what a step needs to know is in its brief
         await super().start(t, text=text, fresh=fresh)
 
+    async def fast_settle(self, t, flag, rec, rule, why, last, earlier):
+        """A step that stopped fast and that no rule could carry on (2.20.0): it fails now, without more rounds,
+        and its planner decides the next move with the entry in hand; what only you can give is asked for at the
+        next move without a planner call (advance). A declared failure counts toward the failures in a row that
+        pause the task, like any other."""
+        decision = ("it needs you: the task asks you" if rule == "ask" else
+                    "no round is left: handed to the planner" if last else "handed to the planner, which decides "
+                                                                            "the next step")
+        rec["change"] = decision
+        self.decided(t, flag, decision)
+        return self.exhausted(t, why)
+
     async def free_unneeded(self):
         """Between two steps nothing is unloaded: the next step usually needs the same model again. A model
         the next step does not use goes when that step has started."""
@@ -546,11 +558,14 @@ class Mission(Orchestra):
             if tools and status != "done":
                 failed = (failed + " " if failed else "") + f"Its tools reported: {tools}"
             kind = t.get("kind") if status in ("failed", "incomplete") else None
+            flag = t.get("flag") if status != "done" else None      # it stopped fast (2.20.0)
             self.handoffs.append({"id": t["id"], "name": t["name"], "agent": t.get("agent"), "status": status,
                                   "done": _clip(h["done"], 2400), "found": _clip(h["found"], 700),
                                   "failed": _clip(failed, 600), "class": kind,
                                   "next": _clip(h["next"], 500), "files": list(t.get("files") or [])[:10],
-                                  "result_file": t.get("result_file")})
+                                  "result_file": t.get("result_file"),
+                                  "flag": {k: flag.get(k) for k in ("by", "reason", "need", "detail", "rule",
+                                                                    "decision")} if flag else None})
 
     def ledger(self, skip_last=False, last=8):
         rows = self.handoffs[:-1] if skip_last else self.handoffs
@@ -605,7 +620,7 @@ class Mission(Orchestra):
             "is not there, say exactly what is missing: never rebuild it from memory.\n"
             "Work efficiently. If code fails, read the error, fix the cause and run it again; check outputs "
             "before you rely on them.\n"
-            + recovery.AGENT_RULES + "\n"
+            + recovery.AGENT_RULES + "\n" + recovery.FAIL_FAST_RULE + "\n"
             "Finish your reply with this block, filled in:\n"
             "## Handoff\n"
             "Done: what you did and the result itself (facts, numbers, sources, file paths)\n"
@@ -655,6 +670,13 @@ class Mission(Orchestra):
                 + recovery.CLASSES.get(kind, recovery.CLASSES["approach"])["advice"]
                 + "\nA step that is the same as one that failed (the same goal for the same kind of agent on the "
                 "same model with the same time) will not be run: the app refuses it. Change what caused the failure.")
+            flag = last.get("flag")
+            if flag:                          # the entry of the register, in hand (2.20.0)
+                need = recovery.NEEDS.get(flag.get("need"))
+                parts.append(("Its agent reported at once that it could not finish" if flag.get("by") == "agent"
+                              else "The app stopped its agent at once") + f": {flag.get('reason')}"
+                             + (f". It needs {need}" + (f": {flag['detail']}" if flag.get("detail") else "") if need else "")
+                             + ". Decide the next step from this: give what is needed, or go another way.")
         if self.refused:
             parts.append("Not run, because it repeats a failure:\n" + "\n".join(f"- {x}" for x in self.refused[-3:])
                          + "\nGive a step that differs in what matters: another approach in the goal, another "
@@ -708,6 +730,15 @@ class Mission(Orchestra):
         if self.failing(self.failed_from) > tries and not self.said:
             return self.stop_for("recovery", f"{self.failing()} steps in a row failed, each one a different attempt "
                                              "to get past the same point")
+        last = self.handoffs[-1] if self.handoffs else {}
+        flag = last.get("flag") or {}
+        if last.get("status") == "failed" and flag.get("rule") == "ask" and not self.said:
+            # only you can give what it needs: asked now, by rule, without a planner call (2.20.0)
+            need = recovery.NEEDS.get(flag.get("need")) or "something only you can give"
+            return self.stop_for("question", f"{last.get('agent') or 'An agent'} could not finish “{last['name']}”: "
+                                             f"{flag.get('reason')}. It needs {need}"
+                                             + (f" ({flag['detail']})" if flag.get("detail") else "")
+                                             + ". Reply with what to do, or give what it needs, and the task goes on.")
         if self.services is None:             # once per session: what the task's connectors promise
             ids = self.connector_ids()
             try:

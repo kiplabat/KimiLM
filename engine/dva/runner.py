@@ -47,7 +47,7 @@ from .mcp import tool_key
 from .orchestrator import Orchestra, RunFit, looks_multistep, team_tools
 from .procs import end_tree
 from .providers import is_cloud
-from .recovery import signature
+from .recovery import public as public_entry, signature
 from .runtime import RuntimeError_
 from .tools import GROUPS, ON_REQUEST, Tool, ToolContext, ToolDenied, ToolError, builtin_tools
 
@@ -86,6 +86,20 @@ def private_tool_names():
         _PRIVATE_TOOLS = {t.name for t in builtin_tools() if t.group in ("files", "vision", "python")} | \
             set(PRIVATE_MEMORY_TOOLS)
     return _PRIVATE_TOOLS
+
+
+_TOOL_NAMES = None
+# a tool that stands for its group, when an agent says it needs "python" or "the browser" (report_failure)
+GROUP_EXAMPLE = {"python": "run_python", "browser": "browser_open", "web": "web_fetch", "images": "generate_image",
+                 "sound": "speak", "video": "make_video", "vision": "look_at_image"}
+
+
+def builtin_tool_names():
+    """The names of every built-in tool (an agent may call one its kit left out: 2.20.0 hands it over)."""
+    global _TOOL_NAMES
+    if _TOOL_NAMES is None:
+        _TOOL_NAMES = {t.name for t in builtin_tools()}
+    return _TOOL_NAMES
 
 
 class TurnStopped(Exception):
@@ -131,6 +145,11 @@ class LoopGuard:
         self.stop_reason = None
         self.errors = Counter()   # tool + what its error says -> times: two failures must not be the same (2.15.0)
         self.advice = None        # what the model is told with the result of a call that failed the same way twice
+        # 2.20.0: an agent of a run fails fast. The app stops it as soon as the answer is plain (recovery.tripwire)
+        # instead of a third time, and code that failed gets one fix (the same error twice stops it)
+        self.fast = bool(getattr(turn, "fast", False))
+        self.tripped = None       # (class, reason, tool, error, wanted) when the app stopped the agent
+        self.refused = 0          # paths refused because they were outside the agent's folders
 
     def check(self, name, args):
         """None if the call may run, else the message returned to the model instead of running it."""
@@ -153,12 +172,15 @@ class LoopGuard:
                             "web_fetch, or answer with what you have.")
         return None
 
-    def record(self, name, args, ok, result, blocked=False, changed=False):
+    def record(self, name, args, ok, result, blocked=False, changed=False, declined=False, world=False,
+               connector=False, wanted=None):
         sig = name + _norm_args(args)
         if blocked:
             self.blocked += 1
             self.streak += 1
             return
+        if self.fast and not self.tripped:
+            self.trip(name, ok, result, declined, world, connector, wanted)
         if changed:   # a successful change (file written, code run, connector action): earlier reads may be stale
             world = tuple(n + "{" for n in self.WORLD_TOOLS)
             self.done = {s: r for s, r in self.done.items() if s.startswith(world)}
@@ -172,7 +194,7 @@ class LoopGuard:
             first = (result.strip().splitlines() or [""])[0]
             key = name + "|" + signature(first)
             self.errors[key] += 1
-            if self.errors[key] == 2:
+            if self.errors[key] == 2 and not self.tripped:
                 self.advice = (f"Note from the app: {name} has now failed twice with the same error. Calling it "
                                "again the same way will fail the same way. Change what causes the error, or use "
                                "another tool or another source; if there is none, say so in your answer.")
@@ -182,6 +204,26 @@ class LoopGuard:
         useless = (not ok) or result.startswith(self.UNPRODUCTIVE) or digest in self.results
         self.results.add(digest)
         self.streak = self.streak + 1 if useless else 0
+
+    def trip(self, name, ok, result, declined, world, connector, wanted):
+        """Decide whether this call's failure stops a fast agent now (recovery.tripwire)."""
+        from .recovery import CODE_TOOLS, REFUSED_PATH, code_error, tripwire
+        code = code_error(result) if ok and name in CODE_TOOLS else None
+        if ok and not code:
+            return
+        first = code or (result.strip().splitlines() or [""])[0]
+        key = ("code|" if code else name + "|") + signature(first)
+        times = (self.errors[key] + 1) if not code else self.errors.get(key, 0) + 1
+        if code:                          # code failures are answers, not tool errors: counted here
+            self.errors[key] = times
+        if REFUSED_PATH.search(first):
+            self.refused += 1
+        found = tripwire(name, first, declined=declined, world=world, connector=connector, code=bool(code),
+                         times=times, refused=self.refused, wanted=wanted)
+        if found:
+            self.tripped = {"class": found[0], "reason": found[1], "tool": name, "error": first[:300],
+                            "wanted": wanted}
+            self.stop_reason = found[1]
 
     def nudge(self):
         if self.streak >= 3 and self.streak != self.nudged_at:
@@ -200,6 +242,9 @@ class LoopGuard:
             self.stop_reason = "the last six tool calls produced nothing new"
         elif self.blocked >= 5:
             self.stop_reason = "the agent kept repeating calls that were already made"
+        if self.fast and self.stop_reason and not self.tripped and not self.stop_reason.startswith("the time limit"):
+            # going round in circles: a write-up by the model would only cost another turn (2.20.0)
+            self.tripped = {"class": "approach", "reason": self.stop_reason, "tool": None, "error": "", "wanted": None}
         return self.stop_reason
 
 
@@ -263,6 +308,8 @@ class Turn:
         self.ctx = None
         self.server = None
         self._lease = None
+        self.fast = bool(team)                    # an agent of a run fails fast (2.20.0): see flag_failure
+        self.flagged = None                       # the register entry this agent wrote, once it could not finish
         self.guard = LoopGuard(self)
 
     # ------------------------------------------------------------------ settings
@@ -515,8 +562,29 @@ class Turn:
     def _connector_tool(self, cid, conf, t, mode):
         async def call(ctx, **args):
             # pictures and files a tool hands back are saved in the chat's folder (so a vision model can look)
-            ok, text = await self.app.connectors.call(cid, t["name"], args, save_dir=ctx.workspace,
+            async def once():
+                return await self.app.connectors.call(cid, t["name"], args, save_dir=ctx.workspace,
                                                       limit=WHOLE_RESULT)
+            # 2.20.0: a service that could not be reached is tried once more after a short wait (nothing was sent
+            # the first time; a read is safe to repeat); after that, the agent of a run is stopped at once
+            from .recovery import PERMISSION, TRANSIENT
+            wait = float(self.db.setting("connector_retry_seconds", 3) or 0)
+            try:
+                ok, text = await once()
+            except ConnectionError as exc:
+                if PERMISSION.search(str(exc)):   # it needs you (a sign-in, a key): trying again cannot help
+                    raise
+                ctx.progress(f"{conf['name']} could not be reached; trying once more…")
+                await asyncio.sleep(wait)
+                try:
+                    ok, text = await once()
+                except ConnectionError as again:
+                    raise ConnectionError(f"{conf['name']} could not be reached, also when tried again: {again}") \
+                        from exc
+            else:
+                if not ok and t.get("readonly") and TRANSIENT.search(text or ""):
+                    await asyncio.sleep(wait)
+                    ok, text = await once()
             if not ok:
                 raise ToolError(text)
             return text
@@ -638,8 +706,8 @@ class Turn:
             parts.append("You are one agent in a plan run by a planner. Do only your task, then reply with a clear, "
                          "self-contained result (facts, numbers, file paths) that the planner can check and combine "
                          "with the other agents' results."
-                         + (" You can read the team board or ask the planner."
-                            if "team_board" in self.tool_map else ""))
+                         + (" You can read the team board or ask the planner, and when you cannot finish, say so at "
+                            "once with report_failure." if "team_board" in self.tool_map else ""))
         if tools:
             parts.append(AGENT_RULES)
             # Which folders this chat may use is given with each request (request_context), not here: the path of
@@ -911,6 +979,8 @@ class Turn:
             meta["plan"] = self.plan
         if self.guard.stop_reason:
             meta["guard"] = self.guard.stop_reason
+        if self.flagged:
+            meta["fail_fast"] = public_entry(self.flagged)
         self.db.insert("messages", {"id": self.message_id, "chat_id": self.chat["id"], "role": "assistant",
                                     "content": content, "meta": meta, "created": now()})
         self.db.update("chats", self.chat["id"], {"updated": now()})
@@ -1233,8 +1303,16 @@ class Turn:
         self.ctx.notes.pop("call_id", None)
         self.app.jobs.trail(self.job["id"], ("Done: " if ok else "Did not work: ") + step["label"]
                             + ("" if ok else " (" + result.splitlines()[0][:200] + ")" if result else ""), "note", ok=ok)
+        # what the tripwire needs to know (2.20.0): a decline, a web page, a service, a tool that is not in the kit
+        wanted = call["name"] if (not tool and self.fast and call["name"] in builtin_tool_names()) else None
         self.guard.record(call["name"], call["arguments"], ok, result, blocked=bool(blocked),
-                          changed=bool(ok and tool and (tool.changes or call["name"] == "use_connector_tool")))
+                          changed=bool(ok and tool and (tool.changes or call["name"] == "use_connector_tool")),
+                          # a path outside the folders is refused as ToolDenied too: only your "no" is a decline
+                          declined=bool(step.get("declined")) and "declined" in result.lower(),
+                          world=bool(tool and tool.group in ("web", "browser", "browsing")),
+                          connector=bool(tool and ((tool.source or "").startswith("connector:")
+                                                   or call["name"] == "use_connector_tool")),
+                          wanted=wanted)
         if self.guard.advice:                             # the second failure of the same kind: say so with the result
             result, self.guard.advice = f"{result}\n{self.guard.advice}", None
         limit = self.result_limit()
@@ -1262,6 +1340,8 @@ class Turn:
         step.update(ok=ok, result=shown)
         self.emit("tool_result", call_id=call["id"], ok=ok, result=shown, declined=step.get("declined", False),
                   blocked=bool(blocked), media=step.get("media"), trail=step.get("trail"), saved=step.get("saved"))
+        if self.guard.tripped and not self.flagged:       # stopped by the app (2.20.0): said to the planner now
+            self.flag_failure("app", **self.guard.tripped)
         if len(result) > limit:
             result = result[:limit] + f"\n…(trimmed; {len(result) - limit:,} more characters)"
         return result
@@ -1269,6 +1349,74 @@ class Turn:
     def params_of(self, name):
         tool = self.tool_map.get(name)
         return ((tool.parameters or {}).get("properties") or {}) if tool else {}
+
+    # ------------------------------------------------------------------ fail fast (2.20.0)
+    def flag_failure(self, by, *, reason, error="", tool=None, wanted=None, need=None, tried="", detail="", **kw):
+        """This agent of a run cannot finish. The entry goes to the run's register now (the planner is woken by
+        it), and the turn ends without another model call (fast_end). `by`: "agent" (report_failure) or "app"
+        (a tripwire)."""
+        if self.flagged:
+            return self.flagged
+        from . import recovery
+        fails = recovery.tool_failures(self.steps)
+        kind = kw.get("class") or recovery.declared_class(need, error)
+        if not wanted and need == "tool":     # the tool it names, or one of the group it names
+            words = set(re.findall(r"[a-z_]+", f"{detail} {error}".lower()))
+            names = builtin_tool_names()
+            wanted = next((w for w in words if w in names), None) or next(
+                (n for g, n in GROUP_EXAMPLE.items() if g in words), None)
+        entry = {"by": by, "class": kind, "reason": " ".join(str(reason).split())[:300],
+                 "tool": tool, "error": " ".join(str(error or "").split())[:300], "wanted": wanted,
+                 "need": need, "tried": " ".join(str(tried or "").split())[:400],
+                 "detail": " ".join(str(detail or "").split())[:300],
+                 "failures": [{k: f.get(k) for k in ("tool", "error", "times")} for f in fails[:4]],
+                 # an agent that gave up while nothing outside it was missing and no error had come twice may
+                 # have been able to fix it itself: counted, so the balance can be judged (measures)
+                 "early": by == "agent" and need in (None, "other", "more_time")
+                 and all((f.get("times") or 1) < 2 for f in fails) and not any(f.get("declined") for f in fails),
+                 "mono": time.monotonic(), "at": now()}
+        self.flagged = entry
+        self.guard.stop_reason = self.guard.stop_reason or entry["reason"]
+        self.note(("Reported to the planner that it cannot finish: " if by == "agent" else
+                   "The app stopped the agent at once: ") + entry["reason"])
+        team = self.app.team_of_chat.get(self.chat["id"])
+        if team:
+            team[0].flag(team[1], entry)
+        return entry
+
+    def fast_end(self):
+        """The reply of an agent that stopped fast, written by code (no model call): why, what it tried, what it
+        needs, what it did get done, and a handoff for the next agent."""
+        e = self.flagged or {}
+        done = [s for s in self.steps if s.get("type") == "tool" and s.get("ok") and s.get("name") not in
+                ("report_failure", "team_board")]
+        did = "; ".join(dict.fromkeys(s.get("label") or s["name"] for s in done))[:500] or "nothing usable"
+        files = [s.get("saved") or (s.get("arguments") or {}).get("path") for s in done
+                 if s.get("saved") or s.get("name") in ("write_file", "edit_file")]
+        files = [str(f) for f in files if f][:8]
+        failed = "; ".join(f"{f['tool']}" + (f" ×{f['times']}" if (f.get("times") or 1) > 1 else "") + f": {f['error'][:140]}"
+                           for f in e.get("failures") or []) or e.get("error") or ""
+        from .recovery import NEEDS
+        need = NEEDS.get(e.get("need")) or ""
+        lines = [("I stopped and reported it to the planner: " if e.get("by") == "agent" else
+                  "The app stopped me at once: ") + (e.get("reason") or "it could not be finished") + "."]
+        if e.get("tried"):
+            lines.append(f"Tried: {e['tried']}")
+        if e.get("error"):
+            lines.append(f"Error: {e['error']}")
+        if need or e.get("detail"):
+            lines.append("Needed: " + ", ".join(x for x in (need, e.get("detail")) if x))
+        lines.append(f"Done before that: {did}" + (f" (files: {', '.join(files)})" if files else ""))
+        if any("## Handoff" in str(m.get("content")) for m in (getattr(self, "loop_messages", None) or [])
+               if m.get("role") == "user"):
+            lines.append(f"\n## Handoff\nDone: {did}\nFound: {e.get('reason') or 'it could not be finished'}\n"
+                         f"Failed: {failed or 'see above'}\nNext: " + (f"give it {need}" if need else
+                                                                      "go another way than this one"))
+        text = "\n".join(lines)
+        self.steps.append({"type": "text", "text": text})
+        self.text = [text]
+        self.emit("token", text=text)
+        self.status("Stopped early: the planner decides what happens next")
 
     def results_folder(self):
         """Where long tool results are kept: the run's team folder for an agent of a run, else the chat's folder."""
@@ -1423,9 +1571,15 @@ class Turn:
         use_json = self.harness.get("tool_mode") == "json"
         self.loop_messages = messages
         for step in range(max_steps):
+            if self.flagged:                      # 2.20.0: reported or stopped by the app: no write-up by the model
+                return self.fast_end()
             await self.wait_if_paused()
             self.take_steer(messages)
             reason = self.guard.should_stop()
+            if self.guard.tripped and not self.flagged:     # it went round in circles
+                self.flag_failure("app", **self.guard.tripped)
+            if self.flagged:
+                return self.fast_end()
             if reason:
                 return await self.write_up(messages, reason)
             if use_json:
@@ -1466,12 +1620,17 @@ class Turn:
                                              "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}}
                                             for c in calls]})
             for call in calls:
+                if self.flagged:                  # the calls after a stop are not made
+                    messages.append({"role": "tool", "tool_call_id": call["id"], "content": "Not run: you stopped."})
+                    continue
                 result = await self.run_tool(call)
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
             nudge = self.guard.nudge()
             if nudge:
                 self.note("The agent was not making progress, so the app asked it to change approach.")
                 messages.append({"role": "user", "content": nudge})
+        if self.flagged:
+            return self.fast_end()
         await self.write_up(messages, f"it used all {max_steps} steps this harness allows")
 
     async def write_up(self, messages, reason):
@@ -1524,6 +1683,8 @@ class Turn:
         messages.append({"role": "assistant", "content": "Plan:\n" + "\n".join(
             f"{i}. {s['title']}" for i, s in enumerate(self.plan, 1))})
         for i, s in enumerate(self.plan, 1):
+            if self.flagged:                      # 2.20.0: it stopped fast; its reply is already written
+                return
             if self.guard.should_stop():
                 s["state"] = "skipped"
                 continue
