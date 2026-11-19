@@ -98,6 +98,21 @@ function log(line) {
   } catch {}
 }
 
+// Linux (2.22.0): the engine, and every model server it starts, runs in a systemd scope in kimilm.slice with memory
+// limits. A model that runs away is then killed by the kernel instead of taking the computer down. KimiOS defines
+// kimilm.slice with its own limits; elsewhere systemd creates the slice on the fly. DVA_NO_SLICE=1 turns this off,
+// and a scope that cannot be made (no systemd user session) falls back to a plain start once.
+let sliceFailed = false;
+function sliceWrap(cmd, args) {
+  if (process.platform !== "linux" || process.env.DVA_NO_SLICE === "1" || sliceFailed) return null;
+  const rt = process.env.XDG_RUNTIME_DIR;
+  if (!rt || !(fs.existsSync(path.join(rt, "systemd", "private")) || fs.existsSync(path.join(rt, "bus")))) return null;
+  const systemdRun = ["/usr/bin/systemd-run", "/bin/systemd-run"].find((p) => fs.existsSync(p));
+  if (!systemdRun) return null;
+  return [systemdRun, ["--user", "--scope", "--quiet", "--collect", "--slice=kimilm.slice",
+    "--description=KimiLM engine and models", "-p", "MemoryHigh=70%", "-p", "MemoryMax=85%", "--", cmd, ...args]];
+}
+
 function startEngine() {
   return new Promise((resolve, reject) => {
     const uiDir = isDev ? "" : path.join(process.resourcesPath, "ui");
@@ -117,8 +132,10 @@ function startEngine() {
     const args = ["-m", "dva", "serve", "--port", port, "--data-dir", userData, "--resources", resources()];
     let python;
     try { python = pythonPath(); } catch (err) { reject(err); return; }
-    log(`starting engine: ${python} ${args.join(" ")}`);
-    engine = spawn(python, args, { cwd: engineDir(), env, windowsHide: true });
+    const wrapped = sliceWrap(python, args);
+    log(`starting engine: ${wrapped ? `${wrapped[0]} ${wrapped[1].join(" ")}` : `${python} ${args.join(" ")}`}`);
+    engine = wrapped ? spawn(wrapped[0], wrapped[1], { cwd: engineDir(), env, windowsHide: true })
+                     : spawn(python, args, { cwd: engineDir(), env, windowsHide: true });
     const out = fs.createWriteStream(path.join(logsDir, "engine-console.log"), { flags: "a" });
     let ready = false;
     const timer = setTimeout(() => { if (!ready) reject(new Error("The engine did not start within 90 seconds")); }, 90000);
@@ -132,6 +149,13 @@ function startEngine() {
     engine.on("exit", (code) => {
       log(`engine exited with ${code}`);
       engine = null;
+      if (!ready && wrapped && !sliceFailed) {
+        sliceFailed = true;
+        clearTimeout(timer);
+        log("the memory-limited scope could not start the engine; starting it without (see logs/engine-console.log)");
+        startEngine().then(resolve, reject);
+        return;
+      }
       if (!ready) { clearTimeout(timer); reject(new Error(`The engine stopped while starting (code ${code}). See logs/engine-console.log`)); return; }
       if (!quitting && restarts < 3) {
         restarts += 1;

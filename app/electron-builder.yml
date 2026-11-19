@@ -38,6 +38,16 @@ nsis:
   deleteAppDataOnUninstall: false
   runAfterFinish: true
   include: build/installer.nsh      # step-by-step messages; offers to remove Datavera Agent (the old name)
+linux:
+  # tar.gz: unpacked as-is by KimiOS into /usr/lib/kimilm (2.22.0); runs on any x64 Linux with a desktop
+  target:
+    - target: tar.gz
+      arch: [x64]
+  executableName: kimilm
+  icon: build/icon.png
+  category: Utility
+  artifactName: KimiLM-linux-x64.${ext}
+  synopsis: Local AI agents on your own computer
 mac:
   target: dmg
   category: public.app-category.productivity
