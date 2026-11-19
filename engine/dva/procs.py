@@ -129,6 +129,9 @@ def contain():
         return None
 
 
+# Windows starts a console host for every console program; it is not one of the agent's programs (2.21.0)
+CONSOLE_HOSTS = ("conhost.exe", "openconsole.exe")
+
 class Procs:
     def __init__(self, app):
         self.app = app
@@ -236,19 +239,26 @@ class Procs:
 
     def strays(self, top, family, since):
         """Programs that `top` started (seen while it ran, or, on Windows, naming it or one of them as parent) and
-        that are still running: only the outermost of each group (ending it ends what it started)."""
+        that are still running: only the outermost of each group (ending it ends what it started). A console host
+        (Windows gives each console program one) is not a program the agent started: it ends with its console."""
+        def hosted(p):
+            try:
+                return p.name().lower() in CONSOLE_HOSTS
+            except psutil.Error:
+                return True
         found = {}
         for pid, created in list(family.items()):
             try:
                 p = psutil.Process(pid)
-                if abs(p.create_time() - created) <= 1 and p.status() != psutil.STATUS_ZOMBIE:
+                if abs(p.create_time() - created) <= 1 and p.status() != psutil.STATUS_ZOMBIE and not hosted(p):
                     found[pid] = p
             except psutil.Error:
                 pass
         if os.name == "nt":                # Windows keeps an orphan's parent number: ones started too late to be seen
             known = set(family) | {top}
             for p in psutil.process_iter(["ppid", "create_time"]):
-                if p.info["ppid"] in known and (p.info["create_time"] or 0) >= since and p.pid not in found:
+                if p.info["ppid"] in known and (p.info["create_time"] or 0) >= since and p.pid not in found \
+                        and not hosted(p):
                     found[p.pid] = p
         out = []
         for pid, p in found.items():
