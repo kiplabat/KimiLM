@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Bot, ChevronDown, Cloud, Cpu, CornerDownRight, Eye, FolderOpen, Gauge, ListPlus, Paperclip, Plug, Plus, Send, Sparkles, Square, Users, X, Lightbulb } from "lucide-react";
 import { api, desktop, fmtBytes } from "../api";
-import { useApp } from "../store";
+import { useApp, useShown } from "../store";
 import { Button, Toggle } from "./ui";
 import { DictateButton } from "./Audio";
 
@@ -229,7 +229,8 @@ export function Composer({ onSend, running, onStop, status, placeholder, autoFoc
   const [files, setFiles] = useState<File[]>([]);
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
-  useEffect(() => { if (autoFocus) ref.current?.focus(); }, []);
+  const shown = useShown();
+  useEffect(() => { if (autoFocus && shown) ref.current?.focus(); }, [shown]);   // also when its screen comes back
   useEffect(() => { if (initialText) setText(initialText); }, [initialText]);
   useEffect(() => {
     const el = ref.current;

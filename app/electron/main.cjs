@@ -29,6 +29,30 @@ function prefs() {
 }
 function savePrefs(p) { fs.writeFileSync(prefsPath, JSON.stringify({ ...prefs(), ...p }, null, 2)); }
 
+// 2.21.0: the size of everything in the window, like a browser's zoom: text, spacing and layout grow together, so
+// nothing breaks. Ctrl + / Ctrl - / Ctrl 0, Ctrl + the mouse wheel, or Settings. Kept in shell-prefs.json (the
+// engine's address changes at each start, and Chromium keeps zoom per address).
+const ZOOMS = [0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2];
+function zoomFactor() {
+  const z = Number(prefs().zoom);
+  return Number.isFinite(z) && z > 0 ? Math.min(2, Math.max(0.5, z)) : 1;
+}
+function setZoom(z) {
+  z = Math.round(Math.min(2, Math.max(0.5, Number(z) || 1)) * 100) / 100;
+  savePrefs({ zoom: z });
+  if (win && !win.isDestroyed()) {
+    win.webContents.setZoomFactor(z);
+    win.webContents.send("dva:zoom", z);
+  }
+  return z;
+}
+function stepZoom(dir) {
+  if (!dir) return setZoom(1);
+  const cur = zoomFactor();
+  const next = dir > 0 ? ZOOMS.find((x) => x > cur + 0.001) : [...ZOOMS].reverse().find((x) => x < cur - 0.001);
+  return setZoom(next || cur);
+}
+
 function resources() {
   return isDev ? path.join(__dirname, "..", "resources") : process.resourcesPath;
 }
@@ -133,6 +157,16 @@ function createWindow(show = true) {
     webPreferences: { preload: path.join(__dirname, "preload.cjs"), contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
   win.loadURL(appUrl());
+  win.webContents.on("did-finish-load", () => win.webContents.setZoomFactor(zoomFactor()));
+  win.webContents.on("zoom-changed", (_e, dir) => stepZoom(dir === "in" ? 1 : -1));     // Ctrl + the mouse wheel
+  win.webContents.on("before-input-event", (e, input) => {
+    if (input.type !== "keyDown" || !(input.control || input.meta) || input.alt) return;
+    const k = input.key;
+    const dir = k === "=" || k === "+" ? 1 : k === "-" || k === "_" ? -1 : k === "0" ? 0 : null;
+    if (dir === null) return;
+    e.preventDefault();
+    stepZoom(dir);
+  });
   win.once("ready-to-show", () => { if (show) win.show(); });
   win.webContents.setWindowOpenHandler(({ url }) => { shell.openExternal(url); return { action: "deny" }; });
   win.webContents.on("will-navigate", (e, url) => {
@@ -240,6 +274,9 @@ ipcMain.handle("dva:set-shell-prefs", (_e, p) => {
   return prefs();
 });
 ipcMain.handle("dva:logs-folder", () => shell.openPath(logsDir));
+ipcMain.handle("dva:get-zoom", () => zoomFactor());
+ipcMain.handle("dva:set-zoom", (_e, z) => setZoom(z));
+ipcMain.handle("dva:step-zoom", (_e, dir) => stepZoom(Number(dir) || 0));
 
 // ------------------------------------------------------------------ lifecycle
 if (!app.requestSingleInstanceLock()) {

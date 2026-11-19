@@ -18,4 +18,9 @@ contextBridge.exposeInMainWorld("dva", {
   getShellPrefs: () => ipcRenderer.invoke("dva:get-shell-prefs"),
   setShellPrefs: (p) => ipcRenderer.invoke("dva:set-shell-prefs", p),
   openLogs: () => ipcRenderer.invoke("dva:logs-folder"),
+  // 2.21.0: the size of everything in the window (1 = 100 %)
+  getZoom: () => ipcRenderer.invoke("dva:get-zoom"),
+  setZoom: (z) => ipcRenderer.invoke("dva:set-zoom", z),
+  stepZoom: (dir) => ipcRenderer.invoke("dva:step-zoom", dir),
+  onZoom: (fn) => { const h = (_e, z) => fn(z); ipcRenderer.on("dva:zoom", h); return () => ipcRenderer.removeListener("dva:zoom", h); },
 });

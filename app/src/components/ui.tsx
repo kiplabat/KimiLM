@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Loader2, X } from "lucide-react";
 import { desktop } from "../api";
+import { useShown } from "../store";
 
 export function Button({ kind = "default", small, icon, children, busy, ...rest }: any) {
   return (
@@ -34,11 +35,13 @@ export function Field({ label, help, children, inline }: any) {
 }
 
 export function Modal({ title, onClose, children, wide, footer }: any) {
+  const shown = useShown();                // a kept screen's dialog waits, hidden, until you come back (2.21.0)
   useEffect(() => {
+    if (!shown) return;
     const k = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", k);
     return () => window.removeEventListener("keydown", k);
-  }, [onClose]);
+  }, [onClose, shown]);
   return (
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className={`modal${wide ? " modal-wide" : ""}`}>

@@ -28,6 +28,11 @@ export default function Home({ projectId }: { projectId?: string }) {
       const chat = await api.post("/chats", { project_id: projectId || null, harness, model: model || null, connectors, folders, thinking });
       const attachments = await uploadAll(chat.id, files);
       await api.post(`/chats/${chat.id}/messages`, { text, attachments });
+      // this screen is kept (2.21.0): once a chat has started from it, it starts afresh, so the next chat does not
+      // get this one's folders and connectors without being asked
+      setHarness(project?.default_harness || boot.settings.default_harness || "agent");
+      setModel(project?.default_model || boot.default_model || "");
+      setConnectors(project?.connectors || []); setFolders([]); setThinking(false); setPrefill("");
       go("chat", chat.id);
     } catch (e: any) { toast(e.message, "error"); throw e; }
   };

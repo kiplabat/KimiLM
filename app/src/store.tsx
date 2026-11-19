@@ -17,6 +17,29 @@ type Toast = { id: number; text: string; kind?: "ok" | "error" | "info" };
 const Ctx = createContext<any>(null);
 export const useApp = () => useContext(Ctx);
 
+// 2.21.0: screens are kept when you go elsewhere (App.tsx), so what you typed, a planner at work and the place you
+// had scrolled to are still there when you come back. A kept screen is hidden: it knows it through this context.
+export const Shown = createContext(true);
+export const useShown = () => useContext(Shown);
+
+// A draft kept outside any screen, for as long as the app is open: like useState, but a screen made again finds it,
+// and work that ends while its screen is gone (a planner's proposal) still lands in it.
+const drafts = new Map<string, any>();
+export function useDraft<T>(key: string, initial: T): [T, (v: T | ((cur: T) => T)) => void] {
+  const [value, setValue] = useState<T>(() => (drafts.has(key) ? drafts.get(key) : initial));
+  const first = useRef(initial);
+  const set = useCallback((v: any) => {
+    const cur = drafts.has(key) ? drafts.get(key) : first.current;
+    const next = typeof v === "function" ? v(cur) : v;
+    drafts.set(key, next);
+    setValue(next);
+  }, [key]);
+  return [value, set];
+}
+export function clearDrafts(prefix: string) {
+  for (const k of [...drafts.keys()]) if (k.startsWith(prefix)) drafts.delete(k);
+}
+
 export function useEvent(handler: (e: any) => void, deps: any[] = []) {
   const ref = useRef(handler);
   ref.current = handler;

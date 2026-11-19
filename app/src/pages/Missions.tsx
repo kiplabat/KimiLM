@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { CheckCircle2, CircleHelp, Loader2, Pause, Play, Plus, Rocket, Sparkles, Square, XCircle } from "lucide-react";
 import { api, desktop, fmtTime } from "../api";
-import { go, useApp, useEvent } from "../store";
+import { clearDrafts, go, useApp, useDraft, useEvent, useShown } from "../store";
 import { Badge, Button, ConfirmButton, Empty, Field, Modal, PageHeader, Spinner } from "../components/ui";
 import { ModelPicker } from "../components/Pickers";
 import { EMPTY_SETUP, SetupCard } from "../components/Setup";
@@ -19,13 +19,15 @@ function statusOf(m: any) {
 }
 
 // Describe the task → the planner proposes the set-up → change or confirm → it starts in a chat of its own.
+// What you typed, and the planner's proposal, are drafts (2.21.0): they wait for you when you go elsewhere while
+// the planner works, and the proposal lands even if this screen was made again in the meantime.
 function NewTask({ onClose, allowable, defaults }: any) {
   const { toast, projects } = useApp();
-  const [text, setText] = useState("");
-  const [model, setModel] = useState("");
-  const [project, setProject] = useState("");
-  const [setup, setSetup] = useState<any>(null);
-  const [busy, setBusy] = useState("");
+  const [text, setText] = useDraft("newtask.text", "");
+  const [model, setModel] = useDraft("newtask.model", "");
+  const [project, setProject] = useDraft("newtask.project", "");
+  const [setup, setSetup] = useDraft<any>("newtask.setup", null);
+  const [busy, setBusy] = useDraft("newtask.busy", "");
   const plan = async () => {
     setBusy("plan");
     try { setSetup((await api.post("/missions/plan", { text, model: model || undefined })).setup); }
@@ -36,12 +38,13 @@ function NewTask({ onClose, allowable, defaults }: any) {
     setBusy("start");
     try {
       const r = await api.post("/missions", { text, setup: setup || { ...EMPTY_SETUP, limits: defaults }, model: model || undefined, project_id: project || undefined });
-      onClose(); go("chat", r.chat_id);
+      clearDrafts("newtask."); onClose(); go("chat", r.chat_id);
     } catch (e: any) { toast(e.message, "error"); setBusy(""); }
   };
   return (
     <Modal wide title="New long-running task" onClose={onClose}
       footer={<>
+        {(text || setup) && !busy && <Button kind="ghost" title="Closing keeps what you wrote; this starts over" onClick={() => { setText(""); setModel(""); setProject(""); setSetup(null); }}>Clear</Button>}
         {!setup && <Button disabled={!text.trim() || !!busy} busy={busy === "plan"} icon={<Sparkles size={14} />} onClick={plan}>Let the planner set it up</Button>}
         <Button kind="primary" disabled={!text.trim() || !!busy} busy={busy === "start"} icon={<Rocket size={14} />} onClick={start}>{setup ? "Start the task" : "Start with the default set-up"}</Button>
       </>}>
@@ -87,10 +90,11 @@ function Limits({ m, onClose, onDone }: any) {
 export default function Missions() {
   const { toast } = useApp();
   const [data, setData] = useState<any>(null);
-  const [creating, setCreating] = useState(false);
+  const [creating, setCreating] = useDraft("tasks.creating", false);
   const [limits, setLimits] = useState<any>(null);
   const load = () => api.get("/missions").then(setData).catch(() => setData({ missions: [], allowable: {}, default_limits: {} }));
-  useEffect(() => { load(); const t = setInterval(load, 15000); return () => clearInterval(t); }, []);
+  const shown = useShown();          // asked only while you see it, and afresh when you come back (2.21.0)
+  useEffect(() => { if (!shown) return; load(); const t = setInterval(load, 15000); return () => clearInterval(t); }, [shown]);
   useEvent((e) => { if (e.kind === "job") load(); });
   if (!data) return <div className="page"><Spinner /></div>;
   const resume = async (m: any, more?: boolean) => {

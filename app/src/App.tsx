@@ -1,10 +1,10 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   Activity as ActivityIcon, BookOpen, Brain, CalendarClock, Cpu, AudioLines, FolderKanban, Image as ImageIcon, MessageSquarePlus, Plug, Search,
-  Settings as SettingsIcon, Workflow, Loader2, Pin, Rocket, WifiOff, Film,
+  Settings as SettingsIcon, Workflow, Loader2, Pin, Rocket, WifiOff, Film, ChevronDown, ChevronRight,
 } from "lucide-react";
 import { api } from "./api";
-import { go, useApp } from "./store";
+import { go, Shown, useApp } from "./store";
 import { Badge, Spinner } from "./components/ui";
 import Home from "./pages/Home";
 import ChatView from "./pages/ChatView";
@@ -43,9 +43,26 @@ function highlight(snippet: string) {
   return esc.replace(/\*\*(.+?)\*\*/g, "<mark>$1</mark>");
 }
 
+// 2.21.0: the sidebar scrolls as one, projects, chats and the pages below them. Projects and Chats fold by their
+// title (remembered), and Chats shows the most recent CHATS_SHOWN until "Show all", so the pages stay within reach.
+const CHATS_SHOWN = 20;
+function remembered(key: string, initial: boolean): [boolean, (v: boolean) => void] {
+  const read = () => { try { const v = localStorage.getItem(key); return v === null ? initial : v === "1"; } catch { return initial; } };
+  const [v, setV] = useState(read);
+  return [v, (x: boolean) => { setV(x); try { localStorage.setItem(key, x ? "1" : "0"); } catch {} }];
+}
+
+function Fold({ open, onToggle, label }: any) {
+  return <span className="side-fold" onClick={onToggle} title={open ? "Fold" : "Unfold"}>
+    {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}{label}</span>;
+}
+
 function Sidebar() {
   const { route, projects, chats, jobs, modelStatus, connected } = useApp();
   const [q, setQ] = useState("");
+  const [projectsOpen, setProjectsOpen] = remembered("kimilm.side.projects", true);
+  const [chatsOpen, setChatsOpen] = remembered("kimilm.side.chats", true);
+  const [allChats, setAllChats] = useState(false);
   const [found, setFound] = useState<any[] | null>(null);
   const looseChats = chats.filter((c: any) => !c.project_id);
   const filtered = q ? chats.filter((c: any) => (c.title || "").toLowerCase().includes(q.toLowerCase())) : looseChats;
@@ -68,11 +85,11 @@ function Sidebar() {
         {!q && (
           <div className="side-section">
             <div className="side-title">
-              <span>Projects</span>
+              <Fold open={projectsOpen} onToggle={() => setProjectsOpen(!projectsOpen)} label={`Projects${!projectsOpen && projects.length ? ` (${projects.length})` : ""}`} />
               <button className="link" onClick={() => go("project", "new")}>+ New</button>
             </div>
-            {projects.length === 0 && <div className="side-empty">Group chats, folders, instructions and memory.</div>}
-            {projects.map((p: any) => (
+            {projectsOpen && projects.length === 0 && <div className="side-empty">Group chats, folders, instructions and memory.</div>}
+            {projectsOpen && projects.map((p: any) => (
               <div key={p.id} className={`side-item${route.page === "project" && route.id === p.id ? " active" : ""}`}
                 onClick={() => go("project", p.id)}>
                 <FolderKanban size={14} /><span className="ellipsis">{p.name}</span><span className="muted small">{p.chat_count || ""}</span>
@@ -81,8 +98,9 @@ function Sidebar() {
           </div>
         )}
         {(!q || filtered.length > 0) && <div className="side-section">
-          <div className="side-title"><span>{q ? "Chat titles" : "Chats"}</span></div>
-          {filtered.slice(0, 80).map((c: any) => (
+          <div className="side-title">{q ? <span>Chat titles</span> :
+            <Fold open={chatsOpen} onToggle={() => setChatsOpen(!chatsOpen)} label={`Chats${!chatsOpen && looseChats.length ? ` (${looseChats.length})` : ""}`} />}</div>
+          {(q || chatsOpen) && filtered.slice(0, q ? 80 : allChats ? 300 : CHATS_SHOWN).map((c: any) => (
             <div key={c.id} className={`side-item${route.page === "chat" && route.id === c.id ? " active" : ""}`}
               onClick={() => go("chat", c.id)} title={c.title}>
               {c.running ? <Loader2 size={13} className="spin accent" /> : c.pinned ? <Pin size={12} /> : <span className="dot" />}
@@ -90,7 +108,9 @@ function Sidebar() {
               {c.origin === "schedule" && <CalendarClock size={12} className="muted" />}
             </div>
           ))}
-          {!q && looseChats.length === 0 && <div className="side-empty">Your chats appear here.</div>}
+          {!q && chatsOpen && looseChats.length === 0 && <div className="side-empty">Your chats appear here.</div>}
+          {!q && chatsOpen && looseChats.length > CHATS_SHOWN && <div className="side-more" onClick={() => setAllChats(!allChats)}>
+            {allChats ? "Show fewer" : `Show all ${looseChats.length} chats`}</div>}
         </div>}
         {q.trim().length >= 2 && (
           <div className="side-section">
@@ -105,15 +125,15 @@ function Sidebar() {
             ))}
           </div>
         )}
+        <nav className="side-nav">
+          {NAV.map(({ page, label, icon: Icon }) => (
+            <div key={page} className={`side-item${route.page === page ? " active" : ""}`} onClick={() => go(page)}>
+              <Icon size={15} /><span>{label}</span>
+              {page === "activity" && jobs.length > 0 && <Badge kind="accent">{jobs.length}</Badge>}
+            </div>
+          ))}
+        </nav>
       </div>
-      <nav className="side-nav">
-        {NAV.map(({ page, label, icon: Icon }) => (
-          <div key={page} className={`side-item${route.page === page ? " active" : ""}`} onClick={() => go(page)}>
-            <Icon size={15} /><span>{label}</span>
-            {page === "activity" && jobs.length > 0 && <Badge kind="accent">{jobs.length}</Badge>}
-          </div>
-        ))}
-      </nav>
       <div className="model-chip" onClick={() => go("models")}
         title={modelStatus.error || "Model status (models unload after a while to free memory)"}>
         {!connected ? <><WifiOff size={13} /> Reconnecting to the engine…</> :
@@ -126,16 +146,36 @@ function Sidebar() {
   );
 }
 
+// 2.21.0: a screen you leave is kept, not rebuilt. Before, every screen was made afresh on each visit: what you had
+// typed was gone, and a planner setting up a long-running task finished for a screen that no longer existed. Kept
+// screens stay in the order they were first opened (moving one would reset it) and are hidden; the least recently
+// seen go when there are more than KEEP (chats: KEEP_CHATS, they can be long).
+const KEEP = 12, KEEP_CHATS = 6;
+const PER_ID = ["chat", "project", "home"];       // one kept screen per chat or project; the others one per page
+
+function slotKey(page: string, id?: string) {
+  return PER_ID.includes(page) ? `${page}:${id || ""}` : page;
+}
+
+function useKept(key: string, page: React.ReactNode) {
+  const kept = useRef(new Map<string, React.ReactNode>());     // in the order first opened
+  const recent = useRef<string[]>([]);                          // most recent last
+  if (!key) return [];
+  kept.current.set(key, page);                                  // the current screen gets the current route
+  recent.current = [...recent.current.filter((k) => k !== key), key];
+  const drop = (k: string) => { kept.current.delete(k); recent.current = recent.current.filter((x) => x !== k); };
+  for (const k of recent.current.filter((x) => x.startsWith("chat:")).slice(0, -KEEP_CHATS)) drop(k);
+  for (const k of recent.current.slice(0, -KEEP)) drop(k);
+  return [...kept.current.entries()];
+}
+
 export default function App() {
   const { route, boot, bootError } = useApp();
-  if (bootError && !boot) {
-    return <div className="center-screen"><h2>Can't reach the engine</h2><p>{bootError}</p><p className="muted">If this persists, restart KimiLM. Logs are in the app's data folder.</p></div>;
-  }
-  if (!boot) return <div className="center-screen"><Spinner size={28} /><p className="muted">Starting…</p></div>;
-  const needsOnboarding = !boot.settings?.onboarding_done && boot.models.length === 0;
-  let page: React.ReactNode;
-  if (needsOnboarding && !["models", "plugins", "settings"].includes(route.page)) page = <Onboarding />;
-  else switch (route.page) {
+  const needsOnboarding = !!boot && !boot.settings?.onboarding_done && boot.models.length === 0;
+  const onboarding = needsOnboarding && !["models", "plugins", "settings"].includes(route.page);
+  let page: React.ReactNode = null;
+  if (boot && onboarding) page = <Onboarding />;
+  else if (boot) switch (route.page) {
     case "chat": page = <ChatView key={route.id} chatId={route.id} />; break;
     case "project": page = <ProjectView key={route.id} projectId={route.id} />; break;
     case "models": page = <Models tab={route.id} />; break;
@@ -152,10 +192,22 @@ export default function App() {
     case "settings": page = <Settings />; break;
     default: page = <Home projectId={route.page === "home" ? route.id : undefined} />;
   }
+  const key = onboarding ? "onboarding" : slotKey(route.page, route.id);
+  const slots = useKept(boot ? key : "", page);
+  if (bootError && !boot) {
+    return <div className="center-screen"><h2>Can't reach the engine</h2><p>{bootError}</p><p className="muted">If this persists, restart KimiLM. Logs are in the app's data folder.</p></div>;
+  }
+  if (!boot) return <div className="center-screen"><Spinner size={28} /><p className="muted">Starting…</p></div>;
   return (
     <div className="shell">
       <Sidebar />
-      <main className="main">{page}</main>
+      <main className="main">
+        {slots.map(([k, el]) => (
+          <Shown.Provider key={k} value={k === key}>
+            <div className={`slot${k === key ? "" : " slot-off"}`} aria-hidden={k !== key}>{el}</div>
+          </Shown.Provider>
+        ))}
+      </main>
     </div>
   );
 }
