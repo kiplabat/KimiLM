@@ -251,6 +251,9 @@ export default function Settings() {
         <Field label="Programs agents may run at once" help="More wait their turn. Code runs at low priority, so the model and this window stay responsive.">
           <input className="input narrow" type="number" min={1} max={8} value={s.code_runs_at_once ?? 2} onChange={(e) => set({ code_runs_at_once: Number(e.target.value) })} />
         </Field>
+        <Field label="A failure should reach the planner's decision within (seconds)" help="Agents of a plan or a long-running task stop as soon as they cannot finish, and the planner decides by rule where the answer is clear. A run's card shows how fast that was against this target (time spent by a model deciding is not counted).">
+          <input className="input narrow" type="number" min={1} max={600} value={s.fail_fast_target_seconds ?? 10} onChange={(e) => set({ fail_fast_target_seconds: Number(e.target.value) })} />
+        </Field>
         <Field label="If nobody answers an approval, decline after (minutes)">
           <input className="input narrow" type="number" min={1} value={s.approval_timeout_minutes} onChange={(e) => set({ approval_timeout_minutes: Number(e.target.value) })} />
         </Field>

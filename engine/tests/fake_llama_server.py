@@ -22,7 +22,14 @@ with one. A set-up request (schema with team + limits) answers with values out o
 
 Failure recovery (2.15.0): "stubborn planner" gives a step that fails, then the same step again (which the app
 refuses), and only then another way; "hopeless task" gives a different failing step every time, until the app
-pauses the task."""
+pauses the task.
+
+Fail fast (2.20.0): "fail-fast plan: <goal>" gives one step with that goal. Agents: "gate files" reads two files
+that are not there (the same error twice); "broken code" runs code that fails the same way each time; "snake
+program" calls run_python although its kit has no Python, then (with all its tools) writes the step's file in code;
+"need my permission" reports at once that it needs a key. A fresh agent (its brief says an earlier attempt
+"stopped early") just answers. "Long task: needs a key it lacks" is a long-running task whose first step reports
+that; after my answer the planner gives a step that uses the mirror."""
 import argparse
 import json
 import re
@@ -159,6 +166,20 @@ def decide(body):
         return {"tool": ("list_files", {"path": "."}), "delay": 1.5}
     if "Message from me while you were working" in text:
         return {"text": "Noted your new message: " + text.split(":)")[-1].strip()[:60]}
+    task, calls = step_goal(text), sum(1 for m in msgs if m["role"] == "assistant" and m.get("tool_calls"))
+    if task and "stopped early" not in text:      # fail fast (2.20.0): agents that cannot finish
+        if "gate files" in task and "read_file" in tools and calls < 3:
+            return {"tool": ("read_file", {"path": f"gate-{calls + 1}.txt"})}
+        if "broken code" in task and "run_python" in tools and calls < 3:
+            return {"tool": ("run_python", {"code": f"# try {calls + 1}\nraise ValueError('the gate is shut')"})}
+        if "need my permission" in task and "report_failure" in tools and not after_tool:
+            return {"tool": ("report_failure", {"tried": "asked the archive for the file", "need": "permission",
+                                                "error": "the archive needs a key", "detail": "an API key for the archive"})}
+    if task and "snake program" in task and not after_tool:
+        if "run_python" not in tools:             # its kit has no Python: it calls it anyway
+            return {"tool": ("run_python", {"code": "print('hello')"})}
+        path = re.search(r"exactly these paths \(the app checks them\):\n- (.+)", text)
+        return {"tool": ("run_python", {"code": f"open(r'{path.group(1).strip()}', 'w').write('hello from the snake')"})}
     m = re.search(r"\(From the app\) Not finished: these files your task must leave are not there:\n- (\S+)", text)
     if m and "write_file" in tools and not after_tool:    # the app's reminder of a missing file (2.19.0)
         return {"tool": ("write_file", {"path": m.group(1), "content": "the report"})}
@@ -289,6 +310,15 @@ def mission_move(body, users):
         else:
             move["decision"] = "finish"
         return move
+    if "needs a key it lacks" in users:               # 2.20.0: the first agent reports that only I can help
+        if n == 0:
+            move["steps"] = [step("Fetch", "say hello then need my permission")]
+        elif n == 1 and "My latest message to you:" in last:
+            move.update(reason="you said to use the mirror", changed=True,
+                        steps=[step("Mirror", "say hello from the public mirror", agent="Archivist", harness="agent")])
+        else:
+            move["decision"] = "finish"
+        return move
     if "planner breaks" in users and n == 1:
         return None
     if "note-step" in users and n == 0:
@@ -414,6 +444,12 @@ def structured(schema, body):
         return out
     if "approach" in props and "tasks" in props:
         allowed = props["approach"]["enum"]
+        ff = re.search(r"fail-fast plan: ([^.\n]+)", raw)
+        if "team" in allowed and ff:                              # one step whose agent cannot finish (2.20.0)
+            task = {"id": "t1", "name": "Gate", "goal": ff.group(1).strip(), "done_when": "a greeting"}
+            if "snake" in task["goal"]:
+                task.update(done_when="report.txt is saved in the team folder", expects=["team/report.txt"])
+            return {"approach": "team", "reason": "one step", "final": "the result", "tasks": [task]}
         if "team" in allowed and "file-leaving plan" in users:   # a step that must leave a file (2.19.0)
             return {"approach": "team", "reason": "one step", "final": "the report", "tasks": [
                 {"id": "t1", "name": "Report", "goal": "say hello and keep a report", "done_when": "a greeting",

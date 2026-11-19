@@ -206,7 +206,11 @@ function OrchestraTask({ t, live }: any) {
       <div className="small clamp-2" title={t.goal}>{t.goal}</div>
       {t.status === "running" && t.progress && <div className="small accent ellipsis">{t.paused ? "paused" : t.progress}</div>}
       {t.status === "waiting" && t.wait_reason && <div className="small muted">{t.wait_reason}</div>}
-      {t.note && <div className="small orch-note">{t.status === "failed" || t.partial || t.status === "running" ? "Check: " : ""}{t.note}</div>}
+      {t.flag && <div className="small orch-note" title="It stopped fast: it reported that it cannot finish, or the app stopped it (2.20.0)">
+        {t.flag.by === "agent" ? "Reported: " : "Stopped by the app: "}{t.flag.reason}
+        {t.flag.decision ? <span className="muted"> → {t.flag.decision}{t.flag.decided_in != null ? ` (${t.flag.decided_in.toFixed(1)} s)` : ""}</span> : null}
+      </div>}
+      {t.note && !t.flag && <div className="small orch-note">{t.status === "failed" || t.partial || t.status === "running" ? "Check: " : ""}{t.note}</div>}
       {t.output && (
         <div className="orch-output">
           <button className="link small" onClick={() => setOpen(!open)}>{open ? "Hide result" : "Show result"}</button>
@@ -252,8 +256,21 @@ function MissionBanner({ run, onResume, onMore, onDismiss }: any) {
   );
 }
 
+// Fail fast (2.20.0): how failures were handled in this run — who saw them, the seconds from the moment one was
+// written to the planner's decision (model calls not included) against the target, and rounds per step.
+function failMeasures(m: any) {
+  if (!m || !m.failures) return "";
+  const who = [m.by_agent ? `${m.by_agent} reported` : "", m.by_app ? `${m.by_app} stopped by the app` : ""].filter(Boolean).join(", ");
+  return `${m.failures} failure${m.failures === 1 ? "" : "s"} (${who})`
+    + (m.decide_max != null ? ` · decided in ≤ ${m.decide_max.toFixed(1)} s${m.met === false ? ` (target ${m.target} s)` : ""}` : "")
+    + ` · ${m.rounds} round${m.rounds === 1 ? "" : "s"} per step`
+    + (m.early ? ` · ${m.early} gave up early` : "");
+}
+
 function OrchestraCard({ step, live }: any) {
   const [showLog, setShowLog] = useState(false);
+  const [showReg, setShowReg] = useState(false);
+  const register: any[] = step?.register || [];
   const tasks: any[] = step?.tasks || [];
   if (!tasks.length) return null;
   const byId: any = Object.fromEntries(tasks.map((t) => [t.id, t]));
@@ -280,11 +297,17 @@ function OrchestraCard({ step, live }: any) {
           <span className="muted small">{done} of {tasks.length} done{failed ? ` · ${failed} failed` : ""}{skipped ? ` · ${skipped} not run` : ""}{running ? ` · ${running} working` : ""}{sequence ? " · one step at a time" : ""}
             {step.totals?.tokens ? ` · ${fmtTokens(step.totals.tokens)} tokens` : ""}</span></span>
         <span className="row gap-s">
+          {register.length > 0 && <button className="link small" onClick={() => setShowReg(!showReg)} title="Failures reported by agents or caught by the app, and what the planner decided">{showReg ? "Hide failures" : `Failures (${register.length})`}</button>}
           {step.log?.length > 0 && <button className="link small" onClick={() => setShowLog(!showLog)}>{showLog ? "Hide the planner's log" : `Planner's log (${step.log.length})`}</button>}
           {desktop && step.folder && <button className="icon-btn" title="Open the shared team folder" onClick={() => desktop.openPath(step.folder)}><FolderOpen size={13} /></button>}
         </span>
       </div>
       {step.mission && <MissionSummary m={step.mission} />}
+      {failMeasures(step.measures) && <div className="small muted">{failMeasures(step.measures)}</div>}
+      {showReg && <div className="orch-log">{register.map((e: any, i: number) => (
+        <div key={i}><span className="muted">{Math.round(e.second || 0)}s</span> <b>{e.step}</b> {e.by === "agent" ? "reported" : "stopped by the app"} (round {e.round}): {e.reason}
+          {e.decision ? <span className="muted"> → {e.decision}{e.decided_in != null ? ` in ${e.decided_in.toFixed(1)} s` : ""}</span> : <span className="muted"> → waiting for the planner</span>}
+        </div>))}</div>}
       {sequence ? (
         <div className="orch-seq">
           {tasks.map((t, i) => (

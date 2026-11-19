@@ -2449,7 +2449,24 @@ def test_remote_connectors_send_headers_speak_both_transports_and_sign_in(tmp_pa
 
     def person_signs_in(url, *a, **k):        # stands in for the browser: the test authorization server says yes
         opened.append(url)
-        threading.Thread(target=lambda: httpx.get(url, follow_redirects=True, timeout=20, trust_env=False), daemon=True).start()
+
+        def follow():
+            # R125 (2.20.0): the client opens the browser before its callback server listens. A browser waits for a
+            # page; a plain request was refused and the sign-in then waited 300 s. Each hop is tried until it answers.
+            nxt = url
+            for _ in range(10):
+                for _ in range(150):
+                    try:
+                        r = httpx.get(nxt, timeout=20, trust_env=False)
+                        break
+                    except httpx.ConnectError:
+                        time.sleep(0.1)
+                else:
+                    return
+                if not r.is_redirect:
+                    return
+                nxt = str(r.url.join(r.headers["location"]))
+        threading.Thread(target=follow, daemon=True).start()
         return True
     monkeypatch.setattr(webbrowser, "open", person_signs_in)
 
@@ -4510,3 +4527,163 @@ def test_an_agent_is_told_of_a_missing_file_before_it_finishes(engine):
              for s in (m.get("meta") or {}).get("steps") or []]
     assert any(s.get("type") == "note" and "Reminded the agent of 1 missing file" in (s.get("text") or "") for s in steps), steps
     assert [s["arguments"]["path"] for s in steps if s.get("type") == "tool"] == [str(report)]
+
+
+# ---------------------------------------------------------------------- 2.20.0: fail fast
+def fail_fast_run(c, goal, auto_approve=False):
+    made = c.post("/api/chats", json={"harness": "agent"}).json()
+    if auto_approve:
+        c.put(f"/api/chats/{made['id']}", json={"auto_approve": True})
+    job = c.post(f"/api/chats/{made['id']}/messages", json={"text": f"As a team with a fail-fast plan: {goal}."}).json()
+    status = wait_job(c, job["job_id"], timeout=150)["status"]
+    return made["id"], status, team_of(last_assistant(c, made["id"]))
+
+
+def agent_messages(c, chat_id):
+    return [m for m in c.get(f"/api/chats/{chat_id}").json()["messages"] if m["role"] == "assistant"]
+
+
+def test_fail_fast_rules_in_code():
+    """recovery.py (2.20.0): when the app stops an agent without waiting for its model, which class that is, what
+    the planner does about it without a model call, and when 'done when' asks only for files."""
+    from types import SimpleNamespace
+    from dva import recovery as rc
+    from dva.runner import LoopGuard
+    trip = rc.tripwire
+    assert trip("write_file", "Error: The user declined this action.", declined=True)[0] == "permission"
+    assert trip("notes__fetch", "Error: Notes needs you to sign in first")[0] == "permission"
+    assert trip("generate_image", "Error: The image engine is not installed. Open Images")[0] == "missing"
+    assert trip("x__list", "Error: Archive could not be reached, also when tried again: refused", connector=True)[0] == "transient"
+    assert trip("web_fetch", "Error: HTTP 503 service unavailable", world=True) is None          # another source may do
+    assert trip("web_fetch", "Error: HTTP 503 service unavailable", world=True, times=2)[0] == "approach"
+    assert trip("read_file", "Error: No file at /a/b.txt") is None
+    assert trip("read_file", "Error: No file at /a/c.txt", times=2)[1].startswith("read_file failed twice")
+    assert trip("write_file", "Error: /x is outside the folders this chat may use (a)", refused=1) is None
+    assert trip("write_file", "Error: /y is outside the folders this chat may use (a)", refused=2)[0] == "approach"
+    assert trip("run_python", "Hint: install it", code=True) is None                            # code gets one fix
+    assert trip("run_python", "ValueError: the gate is shut", code=True, times=2)[1].startswith("the code failed twice")
+    assert trip("run_python", "There is no tool called 'run_python'", wanted="run_python")[0] == "missing"
+    # code that failed is an answer of the tool, not an error: its error line is found
+    out = ("FAILED (exit code 1)\nTraceback (most recent call last):\n  File \"run_1.py\", line 2, in <module>\n"
+           "ValueError: the gate is shut\n\nThe error is at line 2 of your code:\n>>    2  raise ValueError('x')")
+    assert rc.code_error(out) == "ValueError: the gate is shut" and rc.code_error("exit code 0\nfine") is None
+    # the planner's rules
+    rule = rc.fast_rule
+    assert rule({"class": "transient"}) == "retry" and rule({"class": "permission"}) == "ask"
+    assert rule({"class": "missing", "need": "tool"}) == "handover" and rule({"need": "information", "class": "missing"}) is None
+    assert rule({"class": "capability", "need": "stronger_model"}) == "stronger" and rule({"class": "approach"}) is None
+    assert rule({"class": "timeout", "need": "more_time"}) == "more_time" and rule({"class": "output"}) == "output"
+    assert rc.declared_class("permission", "") == "permission" and rc.declared_class("other", "") == "approach"
+    assert rc.declared_class("other", "ConnectError: connection reset by peer") == "transient"
+    # 'done when' that asks only for files: code checks it
+    assert rc.files_only("report.txt is saved in the team folder", ["team/report.txt"])
+    assert rc.files_only("Both a.csv and b.json exist", ["a.csv", "team/b.json"])
+    assert not rc.files_only("report.txt lists every dataset with its title", ["team/report.txt"])
+    assert not rc.files_only("a greeting", ["team/report.txt"]) and not rc.files_only("report.txt is saved", [])
+    # the guard of an agent of a run: the same error twice stops it, and code gets its one fix first
+    turn = SimpleNamespace(limits={}, harness={}, fast=True, db=SimpleNamespace(setting=lambda k, d=None: d))
+    g = LoopGuard(turn)
+    g.record("run_python", {"code": "1"}, True, "FAILED (exit code 1)\nValueError: the gate is shut")
+    assert not g.tripped and not g.should_stop()
+    g.record("run_python", {"code": "2"}, True, "FAILED (exit code 1)\nKeyError: 'b'")      # another error: fixing
+    assert not g.tripped
+    g.record("run_python", {"code": "3"}, True, "FAILED (exit code 1)\nValueError: the gate is shut")
+    assert g.tripped["class"] == "approach" and g.should_stop().startswith("the code failed twice")
+    g = LoopGuard(turn)
+    g.record("web_fetch", {"url": "https://a.example/1"}, False, "Error: HTTP 403 for https://a.example/1", world=True)
+    assert not g.tripped
+    g.record("web_fetch", {"url": "https://a.example/2"}, False, "Error: HTTP 403 for https://a.example/2", world=True)
+    assert g.tripped and g.stop_reason.startswith("web_fetch failed twice")
+    g = LoopGuard(turn)
+    g.record("write_file", {"path": "a"}, False, "The user declined this action.", declined=True)
+    assert g.tripped["class"] == "permission"
+    plain = LoopGuard(SimpleNamespace(limits={}, harness={}, db=turn.db))                    # a chat: as before
+    plain.record("write_file", {"path": "a"}, False, "The user declined this action.", declined=True)
+    assert not plain.tripped and not plain.should_stop()
+
+
+def test_an_agent_that_fails_the_same_way_twice_is_stopped_at_once(engine):
+    """2.20.0. The same error twice stops an agent of a run without another model turn and without a write-up:
+    the entry is in the run's register at once, the planner decides in seconds (here: a fresh agent told what
+    failed), and the run's card shows how fast that was."""
+    c = engine["client"]
+    lead, status, team = fail_fast_run(c, "say hello after reading the gate files")
+    assert status == "done"
+    t = team["tasks"][0]
+    assert t["status"] == "done" and t["attempts"] == 2, t
+    reg = team["register"]
+    assert len(reg) == 1 and reg[0]["by"] == "app" and reg[0]["step"] == "t1" and reg[0]["round"] == 1
+    assert reg[0]["reason"].startswith("read_file failed twice with the same error") and reg[0]["rule"] is None
+    assert reg[0]["decision"] == "a fresh agent told what failed and to go another way"
+    assert reg[0]["decided_in"] < 10
+    assert reg[0]["failures"] == [{"tool": "read_file", "error": reg[0]["failures"][0]["error"], "times": 2}]
+    m = team["measures"]
+    assert m["failures"] == 1 and m["by_app"] == 1 and m["met"] is True and m["rounds"] == 2 and m["early"] == 0
+    log = [line["text"] for line in team["log"]]
+    assert any(x.startswith("The app stopped t1 at once: read_file failed twice") for x in log), log
+    assert any(x.startswith("t1: decided in ") for x in log), log
+    # the round that failed (its own chat: the next round was a fresh agent): two calls, then a reply written by
+    # code (no write-up by the model)
+    chats = [a["id"] for a in c.get(f"/api/chats/{lead}").json()["agents"]]
+    assert len(chats) == 2 and t["chat_id"] == chats[-1]
+    stopped = next(m for m in agent_messages(c, chats[0]) if (m["meta"] or {}).get("fail_fast"))
+    calls = [s for s in stopped["meta"]["steps"] if s["type"] == "tool"]
+    assert [s["name"] for s in calls] == ["read_file", "read_file"]
+    assert stopped["content"].startswith("The app stopped me at once: read_file failed twice")
+    assert stopped["meta"]["stats"]["model_calls"] == 2
+    # the fresh agent knew what failed
+    brief = [m for m in c.get(f"/api/chats/{t['chat_id']}").json()["messages"] if m["role"] == "user"][-1]["content"]
+    assert "An earlier attempt at this task stopped early: read_file failed twice" in brief
+    assert "report_failure at once" in brief
+
+
+def test_code_gets_one_fix_and_then_the_agent_is_stopped(engine):
+    c = engine["client"]
+    _, status, team = fail_fast_run(c, "say hello with broken code", auto_approve=True)
+    assert status == "done"
+    entry = team["register"][0]
+    assert entry["reason"] == "the code failed twice with the same error (ValueError: the gate is shut)"
+    assert team["tasks"][0]["status"] == "done" and team["tasks"][0]["attempts"] == 2
+
+
+def test_a_tool_the_kit_left_out_is_handed_over_and_files_are_checked_by_code(engine):
+    """An agent called a tool its lean kit did not give it: stopped at once and given all its tools. Its 'done when'
+    asks only for a file: code finds it and accepts the step without asking the planner's model."""
+    c = engine["client"]
+    _, status, team = fail_fast_run(c, "say hello through the snake program", auto_approve=True)
+    assert status == "done"
+    t, entry = team["tasks"][0], team["register"][0]
+    assert entry["class"] == "missing" and entry["rule"] == "handover"
+    assert entry["decision"].startswith("the same kind of agent with all its tools (run_python was not in its kit)")
+    assert t["status"] == "done" and t["attempts"] == 2 and t["kit"] is None      # the second round had every tool
+    assert (Path(team["folder"]) / "report.txt").read_text(encoding="utf-8") == "hello from the snake"
+    assert any(line["text"] == "Accepted t1: its files are there (round 2)." for line in team["log"]), team["log"]
+
+
+def test_an_agent_that_needs_you_says_so_and_the_task_asks_at_once(engine):
+    """A long-running task. The agent reports at once that it needs a key: its step fails after one round (no
+    check, no more rounds), and the task asks you by rule, without a planner call. Your answer reaches the
+    planner, which goes another way. The failure counted like any other (recovery_attempts)."""
+    c = engine["client"]
+    chat_id, status, msg = start_task(c, "Long task: needs a key it lacks.")
+    assert status == "done"
+    run = c.get(f"/api/chats/{chat_id}").json()["open_run"]
+    assert run["pause"]["kind"] == "question", run["pause"]
+    assert "could not finish “Fetch”" in run["pause"]["text"] and "an API key for the archive" in run["pause"]["text"]
+    team = team_of(msg)
+    s1 = team["tasks"][0]
+    assert s1["status"] == "failed" and s1["attempts"] == 1 and team["mission"]["moves"] == 1     # no planner call
+    entry = team["register"][0]
+    assert entry["by"] == "agent" and entry["need"] == "permission" and entry["rule"] == "ask"
+    assert entry["decision"] == "it needs you: the task asks you" and entry["decided_in"] < 10 and not entry["early"]
+    h = team["mission"]["handoffs"][0]
+    assert h["status"] == "failed" and h["flag"]["need"] == "permission"
+    reply = agent_messages(c, s1["chat_id"])[-1]
+    assert reply["content"].startswith("I stopped and reported it to the planner") and "## Handoff" in reply["content"]
+    assert reply["meta"]["stats"]["model_calls"] == 1
+    job = c.post(f"/api/chats/{chat_id}/messages", json={"text": "use the public mirror"}).json()
+    assert wait_job(c, job["job_id"], timeout=120)["status"] == "done"
+    team = team_of(last_assistant(c, chat_id))
+    assert [t["name"] for t in team["tasks"]] == ["Fetch", "Mirror"] and team["tasks"][1]["status"] == "done"
+    assert team["measures"]["by_agent"] == 1 and team["measures"]["met"] is True
+

@@ -27,7 +27,14 @@ Two rules are kept by code and not left to a model's goodwill:
 
 Agents are told the same in their brief, and each leaves a 'Failed' line in its handoff: what it tried that did
 not work and why. What its tools reported is added by code (tool_failures), so the record does not depend on a
-small model remembering to write it."""
+small model remembering to write it.
+
+Fail fast (2.20.0). An agent of a run that cannot finish says so at once (report_failure), and the app stops it
+without waiting for its model when the answer is already plain (tripwire): a tool failed twice with the same error,
+code failed twice with the same error (one fix is allowed: that is how code gets written), the user declined, a
+service is unreachable after one more try, something only the user can give is missing, or two paths were refused.
+Either way an entry is written to the run's register at that moment, and the planner decides by rule where the
+answer is clear (fast_rule) and asks its model only where it is not."""
 import re
 
 from .db import now
@@ -67,7 +74,7 @@ TRANSIENT = re.compile(
     r"connection (reset|aborted|closed|refused)|server disconnected|temporar|try again later|rate.?limit|too many "
     r"requests|\b(429|502|503|504)\b|overloaded|service unavailable|bad gateway|gateway time|network is unreachable|"
     r"name resolution|getaddrinfo|dns|remote end closed|readerror|connecterror|read timed out|connect timeout|"
-    r"did not start within", re.I)
+    r"did not start within|could not be reached", re.I)
 STALL = re.compile(r"did not start answering|stopped writing|did not respond|not reachable|stopped responding", re.I)
 TIMEOUT = re.compile(r"time limit of [\d.]+ minutes|took more than|ran past its time|longer than the limit|"
                      r"ran far past|used all \d+ steps|used its \d+ tool calls", re.I)
@@ -224,3 +231,123 @@ AGENT_RULES = (
     "When something fails, do not do it again the same way: the same action gives the same failure. Read the "
     "error, change what caused it (the input, the tool, the source, the size of the piece) and try once more. "
     "If it fails twice, stop trying that and say so in your handoff, so that nobody repeats it.")
+
+
+# ---------------------------------------------------------------------- fail fast (2.20.0)
+FAIL_FAST_RULE = (
+    "The moment you know you cannot finish your task (something you need is not there: information, a tool, a "
+    "permission, a stronger model or more time; or the fix you tried failed the same way again), call "
+    "report_failure at once with what you tried, the exact error and what you need. Do not keep trying: the "
+    "planner decides what happens next within seconds. The app stops you too when a tool fails twice with the "
+    "same error, or when something only the user can give is missing.")
+# what an agent can say it needs (report_failure), as the planner and the user read it
+NEEDS = {"information": "information it does not have", "tool": "a tool it does not have",
+         "permission": "something only you can give (a permission, a sign-in, a key)",
+         "stronger_model": "a stronger model", "more_time": "more time", "other": "another way"}
+CODE_TOOLS = ("run_python", "run_command")
+CODE_FAILED = re.compile(r"^FAILED \(exit code -?\d+\)")
+ERROR_LINE = re.compile(r"^\s*[\w.]*(?:Error|Exception|Exit|Interrupt|Warning)\b\s*:?.*$", re.M)
+REFUSED_PATH = re.compile(r"is outside the folders this chat may use", re.I)
+NO_TOOL = re.compile(r"There is no tool called '([^']+)'")
+# words a 'done when' may use and still ask for nothing but files: code can check that, no model is needed
+FILE_WORDS = set("is are be been has have was were saved save exists exist written created left made there in at to "
+                 "into the a an team folder folders file files shared and with it its of as on both all each "
+                 "present non empty not".split())
+
+
+def code_error(result):
+    """The error of code that failed (run_python / run_command answer 'FAILED (exit code N)'), as one line: the
+    last 'SomethingError: …' line of its output, else its first line of output. None when the code did not fail."""
+    text = str(result or "")
+    if not CODE_FAILED.match(text):
+        return None
+    body = text.split("\n\nThe error is at line")[0].split("\nHint:")[0].split("\nFiles created/changed:")[0]
+    errors = [m.group(0).strip() for m in ERROR_LINE.finditer(body.split("\n", 1)[-1])]
+    if errors:
+        return errors[-1][:200]
+    rest = [x.strip() for x in body.splitlines()[1:] if x.strip()]
+    return (rest[-1] if rest else body.splitlines()[0])[:200]
+
+
+def tripwire(name, error, *, declined=False, world=False, connector=False, code=False, times=1, refused=0,
+             wanted=None):
+    """Should the app stop an agent of a run now, without another turn of its model? (class, reason) or None.
+
+    `error`: the first line of what the tool said; `times`: how often this tool has now failed with this same
+    error in this reply; `refused`: paths refused so far; `world`: a web or browser tool (a page that fails can
+    have another source, so only the same error twice stops it); `code`: code that failed (one fix is allowed);
+    `wanted`: a tool the agent called that exists but is not in its kit."""
+    error = re.sub(r"^Error:\s*", "", " ".join(str(error or "").split()))[:200]
+    if declined:
+        return "permission", f"you declined {name}"
+    if wanted:
+        return "missing", f"it needs {wanted}, which is not among its tools"
+    if REFUSED_PATH.search(error):
+        return ("approach", f"two paths it chose were outside its folders ({error[:120]})") if refused >= 2 else None
+    if not world and not code:
+        if PERMISSION.search(error):
+            return "permission", f"{name} needs you: {error}"
+        if MISSING.search(error) and not NO_TOOL.search(error):
+            return "missing", f"{name}: {error}"
+        if connector and (TRANSIENT.search(error) or STALL.search(error)):
+            return "transient", f"the service could not be reached, also when tried again ({error[:140]})"
+    if times >= 2:
+        what = "the code" if code else name
+        return "approach", f"{what} failed twice with the same error ({error[:140]})"
+    return None
+
+
+def declared_class(need, error):
+    """The class of a failure an agent reported itself: what its error says when that is specific, else what it
+    says it needs."""
+    said = classify(error) if error else None
+    if said in ("permission", "missing", "transient", "memory", "context", "stall"):
+        return said
+    return {"permission": "permission", "tool": "missing", "information": "missing", "stronger_model": "capability",
+            "more_time": "timeout"}.get(need, "approach")
+
+
+def fast_rule(entry):
+    """What the planner does about an entry of the register when the answer is clear without asking its model:
+    'retry' (a passing fault), 'ask' (only the user can give it), 'handover' (an agent with the tool), 'stronger'
+    (a stronger model), 'more_time', 'output' (files not left: save_to, kimilm.call). None: not clear, the planner's
+    model decides with the entry in hand."""
+    kind, need = entry.get("class"), entry.get("need")
+    if need == "information":
+        return None                   # the planner (or another step) may know it
+    if kind == "transient":
+        return "retry"
+    if kind == "permission" or need == "permission":
+        return "ask"
+    if kind == "missing" or need == "tool":
+        return "handover"             # the caller asks the user when no agent has what is missing
+    if need == "stronger_model" or kind == "capability":
+        return "stronger"
+    if need == "more_time" or kind == "timeout":
+        return "more_time"
+    if kind == "output":
+        return "output"
+    return None
+
+
+def files_only(done_when, names):
+    """True when 'done when' asks for nothing but these files being there: code checks that at once, and the
+    planner's model is not asked (2.20.0)."""
+    text = (done_when or "").lower()
+    if not names or not text.strip():
+        return False
+    forms = sorted({f for n in names for f in (str(n).lower().replace("\\", "/"),
+                                               str(n).lower().replace("\\", "/").rsplit("/", 1)[-1]) if f},
+                   key=len, reverse=True)
+    found = False
+    for form in forms:
+        if form in text.replace("\\", "/"):
+            text = text.replace("\\", "/").replace(form, " ")
+            found = True
+    words = re.findall(r"[a-z]+", text)
+    return found and all(w in FILE_WORDS for w in words)
+
+
+def public(entry):
+    """An entry of the register as it is saved and shown (without what only this process can read)."""
+    return {k: v for k, v in (entry or {}).items() if k != "mono"}

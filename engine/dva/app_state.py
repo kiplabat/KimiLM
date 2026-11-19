@@ -78,6 +78,10 @@ DEFAULT_SETTINGS = {
     # a long-running task pauses and says what was tried; retry_wait_seconds: the first wait before a step that
     # met a passing fault (a dropped connection, a busy service) is given again (the next wait is three times it)
     "recovery_attempts": 3, "retry_wait_seconds": 15,
+    # 2.20.0: fail fast. fail_fast_target_seconds: the most seconds from a failure written to the run's register to
+    # the planner's decision (model calls not counted), shown against the measures of a run; connector_retry_seconds:
+    # the wait before a service that could not be reached is tried once more (after that an agent of a run stops)
+    "fail_fast_target_seconds": 10, "connector_retry_seconds": 3,
     # 2.16.0: browsing. browser_consent: how a cookie banner is answered without asking: necessary (the choice
     # that allows least, else accept) | accept | ask (left to the agent); browser_save_mb: the largest file
     # browser_save fetches through the browser
