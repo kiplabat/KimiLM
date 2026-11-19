@@ -72,6 +72,12 @@ def engine():
            "DVA_SD_CLI": str(painter), "DVA_SOUND_WORKER": str(TESTS / "fake_sound_worker.py"),
            "DVA_SOUND_LIBRARY": "2.0.1", "DVA_SOUND_LOG": str(tmp / "sound-jobs.log"),
            "PYTHONPATH": str(ENGINE), "OLLAMA_MODELS": str(tmp / "ollama"), "HF_HOME": str(tmp / "hf")}
+    # 2.21.0: the engine under test has no internet, on any computer (the tests never need it; a test such as
+    # research_without_internet failed where a real search found real sources). Only this computer is reached.
+    for k in [k for k in env if k.lower() in ("http_proxy", "https_proxy", "all_proxy", "no_proxy")]:
+        del env[k]
+    env.update({"HTTP_PROXY": "http://127.0.0.1:9", "HTTPS_PROXY": "http://127.0.0.1:9",
+                "NO_PROXY": "127.0.0.1,localhost,::1"})
     log = tmp / "engine-output.log"
     proc = subprocess.Popen([sys.executable, "-m", "dva", "serve", "--port", str(port), "--data-dir", str(tmp / "data")],
                             cwd=str(ENGINE), env=env, stdout=log.open("w"), stderr=subprocess.STDOUT, text=True)
@@ -4724,11 +4730,14 @@ def test_a_program_left_running_by_an_agents_code_ends_with_its_task(tmp_path):
                                     label="python run_1.py")
         pid = int(out.split()[0])
         assert code == 0 and not _gone(pid, 0.2)
-        row = procs.live[pid]
-        assert row["kind"] == "left running" and row["owner"] == "job-1" and row["label"] == "left running by python run_1.py"
-        assert [r["pid"] for r in procs.listing()] == [pid]
-        assert json.loads((tmp_path / "procs.json").read_text())[0]["pid"] == pid    # ended after a restart too
-        assert procs.end_owner("job-2") == 0 and procs.end_owner("job-1") == 1 and _gone(pid)
+        # on Windows a virtual environment's python.exe is a launcher that starts the real interpreter, so the
+        # program left running can be two processes; each is listed with the task, and all end with it
+        rows = procs.listing()
+        assert pid in [r["pid"] for r in rows] and len(rows) <= 2, rows
+        assert all(r["kind"] == "left running" and r["owner"] == "job-1" for r in rows)
+        assert procs.live[pid]["label"] == "left running by python run_1.py"
+        assert pid in [r["pid"] for r in json.loads((tmp_path / "procs.json").read_text())]   # ended after a restart too
+        assert procs.end_owner("job-2") == 0 and procs.end_owner("job-1") >= 1 and _gone(pid)
         code, out = await procs.run([sys.executable, "-c", script], cwd=tmp_path, env=env, timeout=30)   # no task
         assert _gone(int(out.split()[0])) and procs.live == {}
         code, out = await procs.run([sys.executable, "-c", "print('alone')"], cwd=tmp_path, env=env, timeout=30,
