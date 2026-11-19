@@ -73,7 +73,7 @@ CATALOG = [
     {"key": "pocket-tts", "role": "clone", "family": "pocket", "name": "Pocket TTS (a voice from a recording)", "mb": 94,
      "url": f"{RELEASES}/tts-models/sherpa-onnx-pocket-tts-int8-2026-01-26.tar.bz2", "licence": "CC-BY-4.0",
      "page": "https://github.com/kyutai-labs/pocket-tts",
-     "about": "Speaks English with the voice of a short recording (10 to 30 seconds). This is what your own voice uses.",
+     "about": "Speaks English with a voice taken from a recording: it hears about one second of it. This is what your own voice uses.",
      "voices": []},
     {"key": "kitten-nano", "role": "tts", "family": "kitten", "name": "Kitten (smallest)", "mb": 25, "needs_espeak": True,
      "url": f"{RELEASES}/tts-models/kitten-nano-en-v0_2-fp16.tar.bz2", "licence": "Apache-2.0",

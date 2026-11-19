@@ -45,6 +45,7 @@ from .db import new_id, now
 from .llm import LLMContextFull, LLMError, LLMTimeout, LLMUnreachable, estimate_tokens
 from .mcp import tool_key
 from .orchestrator import Orchestra, RunFit, looks_multistep, team_tools
+from .procs import end_tree
 from .providers import is_cloud
 from .recovery import signature
 from .runtime import RuntimeError_
@@ -211,6 +212,14 @@ EXTRACT_SCHEMA = {"type": "object", "required": ["relevant", "facts"], "properti
     "relevant": {"type": "boolean"},
     "facts": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 400}},
     "files": {"type": "array", "maxItems": 4, "items": {"type": "integer"}}}}
+
+
+WHOLE_RESULT = 8_000_000      # characters of a connector's answer kept for saving (the model reads far less)
+SAVE_RULE = ("Tool results: any tool call can take one more argument, save_to (a file path): the app then writes the "
+             "tool's whole result to that file and gives you only its start. Use it to keep what a tool returns "
+             "(a service's answer, a page, a listing) instead of typing it again with write_file. A result too long "
+             "to read whole is kept in a file whose path is given with it: read that file in parts or process it "
+             "with run_python; do not call the tool again for the same thing.")
 
 
 class Turn:
@@ -506,7 +515,8 @@ class Turn:
     def _connector_tool(self, cid, conf, t, mode):
         async def call(ctx, **args):
             # pictures and files a tool hands back are saved in the chat's folder (so a vision model can look)
-            ok, text = await self.app.connectors.call(cid, t["name"], args, save_dir=ctx.workspace)
+            ok, text = await self.app.connectors.call(cid, t["name"], args, save_dir=ctx.workspace,
+                                                      limit=WHOLE_RESULT)
             if not ok:
                 raise ToolError(text)
             return text
@@ -665,7 +675,13 @@ class Turn:
                          "thing; go to the web only for what they do not offer."
                          + ("\nTheir tools are reached with find_connector_tools (shows a tool's parameters) and "
                             "use_connector_tool (calls it). What each service offers:\n" + services["digest"]
-                            if behind else ""))
+                            if behind else "")
+                         + ("\nFor many calls (paging through all results, one call per item), do them in one "
+                            "run_python program with `from kimilm import call` instead of one turn each."
+                            if "run_python" in self.tool_map else ""))
+        if self.tool_map:
+            # 2.19.0: a model never retypes what a tool returned, and never works from a cut-off copy of it
+            parts.append(SAVE_RULE)
         return "\n\n".join(parts)
 
     def history(self):
@@ -907,7 +923,7 @@ class Turn:
         self.ctx = ToolContext(app=self.app, chat=self.chat, project=self.project, workspace=self.workspace,
                                folders=self.folders(), readonly=self.app.skills.roots(), emit=self.emit,
                                approve=self.approve, job_id=self.job["id"], model_id=self.model_id,
-                               harness=self.harness)
+                               harness=self.harness, turn=self)
         return self.ctx
 
     async def recall(self):
@@ -1143,6 +1159,9 @@ class Turn:
         return out
 
     async def run_tool(self, call):
+        # `save_to` (2.19.0) is the app's, not the tool's: taken off before the call is checked
+        args = call["arguments"] if isinstance(call["arguments"], dict) else {}
+        save_to = args.pop("save_to", None) if "save_to" not in self.params_of(call["name"]) else None
         # the call is checked against the tool's own parameters first (2.16.0): what is plainly meant is
         # repaired, what cannot be is not run and the model is told exactly what to change
         fixed = toolcheck.repair(self.tool_map, call["name"], call["arguments"])
@@ -1218,13 +1237,108 @@ class Turn:
                           changed=bool(ok and tool and (tool.changes or call["name"] == "use_connector_tool")))
         if self.guard.advice:                             # the second failure of the same kind: say so with the result
             result, self.guard.advice = f"{result}\n{self.guard.advice}", None
-        step.update(ok=ok, result=result[:4000])
-        self.emit("tool_result", call_id=call["id"], ok=ok, result=result[:4000], declined=step.get("declined", False),
-                  blocked=bool(blocked), media=step.get("media"), trail=step.get("trail"))
         limit = self.result_limit()
+        kept = None
+        if ok and save_to:                                # the whole result, written by the app, not retyped
+            try:
+                kept = self.keep_result(result, save_to)
+                result = (f"Saved the whole result ({len(result):,} characters) to {kept}. Read it with read_file "
+                          f"or work on it with run_python; it begins:\n" + result[:min(1500, limit)])
+            except (ToolError, ToolDenied, OSError) as exc:
+                result += f"\n(Note from the app: it could not be saved to {save_to}: {exc})"
+        elif ok and len(result) > limit:                  # too long to read whole: kept whole in a file
+            try:
+                kept = self.keep_result(result, None, call["name"])
+                result = (result[:limit] + f"\n…(trimmed; {len(result) - limit:,} more characters. The whole result "
+                          f"is in {kept}: read parts of it with read_file, or process it with run_python, instead "
+                          "of calling the tool again)")
+            except (ToolError, ToolDenied, OSError):
+                kept = None
+        shown = result[:4000]
+        if kept:
+            step["saved"] = str(kept)
+            if len(result) > 4000:                        # the chat's step says where the whole of it is too
+                shown = result[:3400] + f"\n…(the whole result is in {kept})"
+        step.update(ok=ok, result=shown)
+        self.emit("tool_result", call_id=call["id"], ok=ok, result=shown, declined=step.get("declined", False),
+                  blocked=bool(blocked), media=step.get("media"), trail=step.get("trail"), saved=step.get("saved"))
         if len(result) > limit:
             result = result[:limit] + f"\n…(trimmed; {len(result) - limit:,} more characters)"
         return result
+
+    def params_of(self, name):
+        tool = self.tool_map.get(name)
+        return ((tool.parameters or {}).get("properties") or {}) if tool else {}
+
+    def results_folder(self):
+        """Where long tool results are kept: the run's team folder for an agent of a run, else the chat's folder."""
+        team = self.app.team_of_chat.get(self.chat["id"])
+        base = Path(team[0].dir) if team else self.workspace
+        folder = base / "tool-results"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def keep_result(self, text, path=None, tool=""):
+        """Write a tool's whole result to a file and return its path: `path` as the model gave it (relative to its
+        main folder; a run's agent's relative path, with or without "team/", lands in the team folder), or a new
+        file in the results folder."""
+        team = self.app.team_of_chat.get(self.chat["id"])
+        if path:
+            rel = Path(str(path).strip().strip('"'))
+            if team and not rel.is_absolute():
+                dest = team[0].expected_path(str(rel))
+            else:
+                dest = self.ctx.resolve(rel, write=True)
+            dest = self.ctx.resolve(dest, write=True)
+        else:
+            self.kept = getattr(self, "kept", 0) + 1
+            slug = re.sub(r"[^a-z0-9]+", "-", tool.lower()).strip("-")[:40] or "result"
+            dest = self.results_folder() / f"{time.strftime('%H%M%S')}-{self.kept:02d}-{slug}.txt"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text, encoding="utf-8")
+        self.emit("file_changed", path=str(dest), action="written")
+        return dest
+
+    async def bridge_call(self, name, arguments):
+        """A connected service's tool, called by code that run_python runs (kimilm.call): the same tools, the same
+        approvals as a call by the agent itself; written in the task's trail and shown in the step."""
+        pool = {t.name: t for t in list(self.tool_map.values()) + list(getattr(self, "connector_index", None) or [])
+                if (t.source or "").startswith("connector:")}
+        if not pool:
+            raise ToolError("This agent has no connected services")
+        # code names a tool as the service does ("list_items"); inside KimiLM it carries the service's prefix
+        plain = [k for k in pool if k.endswith("__" + name)]
+        if name not in pool and len(plain) == 1:
+            name = plain[0]
+        fixed = toolcheck.repair(pool, name, arguments if isinstance(arguments, dict) else {})
+        if fixed["error"]:
+            raise ToolError(fixed["error"])
+        tool = pool[fixed["name"]]
+        if not await self.approve(tool, fixed["args"], tool.describe_call(fixed["args"])):
+            raise ToolDenied("The user declined this action.")
+        self.ctx.progress(f"From the code: {tool.label or tool.name}")
+        self.app.jobs.trail(self.job["id"], f"From code: {tool.label or tool.name}", "note")
+        result = await tool.func(self.ctx, **fixed["args"])
+        return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+
+    def bridge_tools(self):
+        """The tools code may call, by the names the services give them (with the prefix only where two
+        services use the same name)."""
+        tools = [t for t in list(self.tool_map.values()) + list(getattr(self, "connector_index", None) or [])
+                 if (t.source or "").startswith("connector:")]
+        short = [t.name.rsplit("__", 1)[-1] for t in tools]
+        return {(s if short.count(s) == 1 else t.name): t.description[:300] for s, t in zip(short, tools)}
+
+    def missing_outputs(self):
+        """The files this agent's step must leave that are not there yet (asked at most twice per turn)."""
+        team = self.app.team_of_chat.get(self.chat["id"])
+        if not team or getattr(self, "reminded", 0) >= 2:
+            return []
+        orch, task_id = team
+        t = orch.tasks.get(task_id)
+        if not t or not t.get("expects"):
+            return []
+        return [str(orch.expected_path(n)) for n in t["expects"] if not orch.has_output(n)]
 
     def wants_team(self):
         """Should the planner look at this request? Cheap filter first; the planner can still say 'direct'."""
@@ -1334,6 +1448,17 @@ class Turn:
             if not calls:
                 if self.take_steer(messages):     # a follow-up arrived while it was answering: carry on
                     messages.insert(len(messages) - 1, {"role": "assistant", "content": text or "(working)"})
+                    continue
+                missing = self.missing_outputs() if step < max_steps - 2 else []
+                if missing:                       # 2.19.0: said now, not after the round
+                    self.reminded = getattr(self, "reminded", 0) + 1
+                    messages.append({"role": "assistant", "content": text or ""})
+                    messages.append({"role": "user", "content":
+                                     "(From the app) Not finished: these files your task must leave are not there:\n"
+                                     + "\n".join(f"- {m}" for m in missing) + "\nWrite each one now at exactly that "
+                                     "path (write_file, run_python, or save_to on the tool call that gives its "
+                                     "content), then finish."})
+                    self.note(f"Reminded the agent of {len(missing)} missing file(s).")
                     continue
                 return
             messages.append({"role": "assistant", "content": text or "", "_native": self._last_native,
@@ -1706,7 +1831,7 @@ class Turn:
                     self.app.jobs.log(self.job["id"], line)
                 await proc.wait()
             except asyncio.CancelledError:
-                proc.kill()
+                await asyncio.to_thread(end_tree, proc.pid)        # with every program it started (2.19.0)
                 raise
             return proc.returncode
 

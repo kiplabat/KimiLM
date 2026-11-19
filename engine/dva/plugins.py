@@ -21,6 +21,7 @@ from jsonschema import Draft202012Validator
 from . import mcp_config, run_script as launcher
 from .db import now
 from .paths import BUILTIN
+from .procs import end_tree
 
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 SCHEMA = {
@@ -173,7 +174,7 @@ class Plugins:
             await asyncio.wait_for(pump(), timeout=timeout)
             await proc.wait()
         except (asyncio.TimeoutError, asyncio.CancelledError):
-            proc.kill()
+            await asyncio.to_thread(end_tree, proc.pid)            # with every program it started (2.19.0)
             raise
         return {"code": proc.returncode, "result": result, "output": "\n".join(lines[-200:])}
 

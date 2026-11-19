@@ -3,6 +3,7 @@ import asyncio
 import time
 from datetime import datetime
 
+from .bridge import Bridge
 from .cloud import Cloud
 from .db import DB, new_id, now
 from .embed import Embedder
@@ -17,6 +18,7 @@ from .mcp import Connectors
 from .memory import Memory
 from .migration import rewrite_moved_paths
 from .models import Models
+from .procs import Procs, contain
 from .paths import Paths
 from .plugins import Plugins
 from .providers import Providers
@@ -28,6 +30,7 @@ from .services import Services
 from .skills import Skills
 from .sound import Sound
 from .video import Video
+from .voices import Voices
 
 STATE = None
 
@@ -35,6 +38,8 @@ DEFAULT_SETTINGS = {
     "default_harness": "agent", "default_compute": "auto", "default_ctx": 8192, "max_reply_tokens": 2048,
     "unload_after_minutes": 20, "memory_enabled": True, "learn_enabled": True, "learn_delay_seconds": 45,
     "allow_python": True, "approval_timeout_minutes": 360, "max_native_tools": 47, "python_timeout_seconds": 180,
+    # 2.19.0: the most a tool call may ask for a program's time, and how many programs agents may run at once
+    "code_timeout_max_seconds": 900, "code_runs_at_once": 2,
     "max_loaded_models": 3, "browser_search": True, "max_parallel_agents": 4, "turn_time_limit_minutes": 30,
     "cloud_privacy": "ask", "cloud_budget_monthly": 10.0, "cloud_max_parallel": 4,
     "team_mode": "auto", "max_team_tasks": 8, "team_time_limit_minutes": 120,
@@ -116,6 +121,10 @@ class App:
         self.services = Services(self)
         self.images = Images(self)
         self.sound = Sound(self)
+        self.voices = Voices(self)                   # your own voice: takes, checks, the reference (2.18.0)
+        # the programs agents run, and code's way to their connectors (2.19.0)
+        self.procs = Procs(self)
+        self.bridge = Bridge(self)
         self.video = Video(self)
         self.approvals = {}
         self.pauses = {}          # chat id -> {"event", "reason"}: paused agent loops (orchestrator.pause_chat)
@@ -173,6 +182,10 @@ class App:
 
     async def start(self):
         self.bus.loop = asyncio.get_running_loop()
+        # 2.19.0: nothing this engine starts outlives it (Windows: a job object), and what an engine before it
+        # left running is ended now
+        self.procs.job = contain()
+        await asyncio.to_thread(self.procs.end_leftovers)
         self._bg = [asyncio.create_task(self.scheduler.loop()), asyncio.create_task(self.runtime.idle_watch()),
                     asyncio.create_task(self.knowledge.loop())]
         self.log(f"engine started; data {self.paths.data}; secrets backend {self.secrets.backend}")
@@ -349,6 +362,7 @@ class App:
         for t in self._bg:
             t.cancel()
         await self.jobs.shutdown()
+        await asyncio.to_thread(self.procs.end_all)
         await self.connectors.shutdown()
         await self.services.shutdown()
         await self.embedder.stop()

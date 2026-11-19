@@ -594,7 +594,9 @@ class Mission(Orchestra):
         if t.get("done_when"):
             parts.append(f"Done when: {t['done_when']}")
         if t.get("expects"):
-            parts.append("Save these files in the shared folder: " + ", ".join(t["expects"]))
+            # the exact paths (2.19.0), as in a planned run's brief
+            parts.append("Leave these files, at exactly these paths (the app checks them):\n"
+                         + "\n".join(f"- {self.expected_path(n)}" for n in t["expects"]))
         if redo:
             parts.append(redo)
         parts.append(

@@ -31,6 +31,7 @@ def main():
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) if os.name != "nt" else None
     sock.bind(("127.0.0.1", args.port))
     port = sock.getsockname()[1]
+    os.environ["DVA_PORT"] = str(port)        # code run by run_python reaches its connectors here (2.19.0)
     app = create_app(args.data_dir, args.resources, os.environ["DVA_TOKEN"])
     config = uvicorn.Config(app, log_level="warning", access_log=False, timeout_graceful_shutdown=5)
     server = uvicorn.Server(config)

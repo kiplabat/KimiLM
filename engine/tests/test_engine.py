@@ -762,6 +762,8 @@ def test_pause_and_resume_an_agent(engine):
 def test_code_errors_point_at_the_line_and_commands_run(tmp_path):
     import asyncio
     sys.path.insert(0, str(ENGINE))
+    import types
+    from dva.procs import Procs
     from dva.tools import python_exec
     from dva.tools import ToolContext
 
@@ -771,6 +773,9 @@ def test_code_errors_point_at_the_line_and_commands_run(tmp_path):
 
     class App:
         db = DB()
+        paths = types.SimpleNamespace(data=tmp_path)
+        log = print
+    App.procs = Procs(App)                  # 2.19.0: programs run through the app's list of programs
     ctx = ToolContext(app=App(), chat={"id": "c"}, project=None, workspace=tmp_path, folders=[str(tmp_path)],
                       readonly=[], emit=lambda *a, **k: None, approve=None)
     out = asyncio.run(python_exec.run_python(ctx, "x = 1\ny = 2\nprint(x / (y - 2))\n"))
@@ -3989,3 +3994,519 @@ def test_work_that_was_cut_off_comes_back_and_leaves_no_engine_behind(tmp_path):
         await asyncio.to_thread(ctl.hold, lambda: time.monotonic() - t > 0.3)
         assert time.monotonic() - t < 1.5
     asyncio.run(limits())
+
+
+# ---------------------------------------------------------------------------------------------- 2.18.0
+def speechlike(path, seconds=5.0, loud=0.3, noise=0.002, rate=24000):
+    """A recording shaped like a spoken sentence: a breath of room at both ends, stretches of sound with short gaps
+    between them, and the room's noise underneath. Values above 1 are cut off, as an overdriven microphone does."""
+    import wave
+    import numpy as np
+    rng = np.random.default_rng(7)
+    t = np.arange(int(seconds * rate)) / rate
+    on = ((t % 1.45) < 1.3) & (t > 0.3) & (t < seconds - 0.3)
+    x = np.clip(loud * np.sin(2 * np.pi * 220 * t) * on + rng.normal(0, noise, len(t)), -1, 1)
+    with wave.open(str(path), "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(rate)
+        f.writeframes((x * 32767).astype("<i2").tobytes())
+    return path
+
+
+def test_your_own_voice_is_recorded_sentence_by_sentence_checked_kept_and_changed(engine):
+    """2.18.0. A voice is made from sentences read aloud: each take is checked at once; the voice is taken from
+    the clearest second of one take, which the user chooses by ear; it keeps its takes and can be heard, renamed,
+    extended, recorded again take by take, and deleted with all that belongs to it."""
+    import sqlite3
+    import numpy as np
+    from dva.sound import read_pcm
+    from dva.voices import SAMPLE, SCRIPT, SECOND, words_of
+    c, tmp = engine["client"], engine["tmp"]
+    ready_for_media(c, tmp)
+    if not c.get("/api/sound").json()["can"].get("clone"):
+        c.post("/api/sound/models", json={"key": "pocket-tts", "path": model_folder(tmp, "pocket")})
+    script = c.get("/api/sound/voices/script").json()
+    assert [s["id"] for s in script["sentences"]] == ["plain", "question", "joy", "list", "calm", "emphasis", "soft", "sounds"]
+    assert script["ready"] and script["words_checked"] and script["heard"] == 1.04 and len(script["tips"]) == 5
+    assert all(s["text"] and s["how"] for s in script["sentences"]) and "English" in script["language"]
+    texts = {s["id"]: s["text"] for s in SCRIPT}
+    uploads, voices_dir = tmp / "data" / "sound" / "uploads", tmp / "data" / "voices"
+
+    def record(sentence=None, name=None, **shape):
+        """A take as the window sends it: recorded, uploaded. Its name tells the stand-in what was said."""
+        said = name or "says-" + "-".join(words_of(texts[sentence]))
+        src = speechlike(tmp / "take.wav", **shape)
+        return c.post("/api/sound/upload", files={"file": (said + ".wav", src.read_bytes(), "audio/wav")}).json()["path"]
+
+    def begins_with(reference, take):
+        """The reference starts with the take's best second: that second is what the voice model hears."""
+        ref = read_pcm(reference, 24000, 1).reshape(-1)[:SECOND]
+        own = read_pcm(take["path"], 24000, 1).reshape(-1)[int(take["best"] * 24000):][:SECOND]
+        return len(ref) == len(own) == SECOND and float(np.corrcoef(ref, own)[0, 1]) > 0.99
+
+    # every take is checked at once: what is in it, and whether the words of the sentence were heard
+    good = record("question")
+    check = c.post("/api/sound/voices/check", json={"audio": good, "sentence": "question"}).json()
+    assert check["verdict"] == "good" and not check["problems"] and not check["notes"], check
+    assert check["match"] >= 0.8 and check["heard"].startswith("did you know") and check["text"] == texts["question"]
+    assert 3 < check["speech_seconds"] < 5 and -16 < check["level_db"] < -11 and check["noise_db"] < -45 and check["clipped"] == 0
+    assert check["steady"] == 1.0 and 0.25 <= check["best"] <= 3.7            # there is a full second of speech in it
+    for shape, said, told in (({"loud": 0.003, "noise": 0.0002}, None, "far too quiet"),
+                              ({"loud": 1.6}, None, "too loud and distorts"),
+                              ({"noise": 0.1}, None, "a lot of noise"),
+                              ({"loud": 0.0, "noise": 0.0005}, None, "Almost nothing was heard"),
+                              ({"seconds": 2.0}, None, "much shorter than the sentence"),
+                              ({}, "says-something-else-entirely-now", "Other words were heard")):
+        bad = c.post("/api/sound/voices/check", json={"audio": record("question", name=said, **shape), "sentence": "question"}).json()
+        assert bad["verdict"] == "again" and any(told in p for p in bad["problems"]), (told, bad)
+    fair = c.post("/api/sound/voices/check", json={"audio": record("question", noise=0.03), "sentence": "question"}).json()
+    assert fair["verdict"] == "fair" and "some background noise" in fair["notes"][0] and not fair["problems"]
+    own = c.post("/api/sound/voices/check", json={"audio": good, "text": "My own words.", "words": False}).json()
+    assert own["sentence"] is None and own["heard"] is None and own["match"] is None and own["verdict"] == "good"
+    assert c.post("/api/sound/voices/check", json={"audio": str(tmp / "nope.wav")}).status_code == 400
+    # what was tried and not kept is removed, and only from the app's own folder for recordings
+    outside = speechlike(tmp / "mine-elsewhere.wav")
+    assert c.post("/api/sound/voices/discard", json={"paths": [p.as_posix() for p in uploads.glob("says-*")] + [str(outside)]}).json()["removed"] >= 7
+    assert not list(uploads.glob("says-*")) and outside.exists()
+
+    # the voice: whose it is has to be said; too little speech is not a voice; nothing is lost when it is refused
+    takes = [{"sentence": s, "audio": record(s)} for s in ("plain", "question", "joy", "list", "calm", "emphasis", "soft")]
+    takes[1]["check"] = c.post("/api/sound/voices/check", json=takes[1]).json()
+    r = c.post("/api/sound/voices", json={"name": "Labatt", "takes": takes, "consent": {"whose": "mine"}})
+    assert r.status_code == 400 and "Confirm" in r.json()["error"] and all(Path(t["audio"]).exists() for t in takes)
+    lone = record("question", seconds=2.0)
+    r = c.post("/api/sound/voices", json={"name": "Labatt", "takes": [{"sentence": "question", "audio": lone}],
+                                          "consent": {"whose": "mine", "confirmed": True}})
+    assert r.status_code == 400 and "too little speech" in r.json()["error"] and Path(lone).exists()
+    assert c.post("/api/sound/voices/discard", json={"paths": [lone]}).json() == {"removed": 1}      # the window, on closing
+    assert c.post("/api/sound/voices", json={"name": "Heart", "takes": takes, "consent": {"whose": "mine", "confirmed": True}}).status_code == 400
+    voice = c.post("/api/sound/voices", json={"name": "Labatt", "note": "recorded at home", "takes": takes,
+                                              "consent": {"whose": "mine", "confirmed": True}}).json()
+    vid = voice["id"].removeprefix("voice:")
+    path = f"/api/sound/voices/{voice['id']}"
+    assert voice["kind"] == "recording" and voice["ready"] and voice["whose"] == "mine" and voice["note"] == "recorded at home"
+    assert voice["statement"] == "I confirm this is my own voice." and voice["missing"] == ["sounds"] and voice["sample"] is None
+    assert [t["sentence"] for t in voice["takes"]] == ["plain", "question", "joy", "list", "calm", "emphasis", "soft"]
+    assert all(t["exists"] and Path(t["path"]).parent == voices_dir / vid and t["steady"] == 1.0 for t in voice["takes"])
+    assert voice["takes"][1]["verdict"] == "good" and voice["takes"][1]["heard"].startswith("did you know")
+    assert not any(Path(t["audio"]).exists() for t in takes)               # the uploads went into the voice
+    # the voice model hears about one second: the voice is taken from the clearest second of one take, an even
+    # way of speaking unless the user chooses another
+    assert voice["heard"] == 1.04 and not voice["old"] and voice["lead"] == voice["takes"][0]["id"]
+    assert [t["lead"] for t in voice["takes"]] == [True] + [False] * 6
+    assert Path(voice["reference"]) == voices_dir / f"{vid}.wav" and begins_with(voice["reference"], voice["takes"][0])
+    assert c.get("/api/sound/peaks", params={"path": voice["reference"]}).json()["seconds"] > 5
+    listed = next(v for v in c.get("/api/sound").json()["voices"] if v["id"] == voice["id"])
+    assert listed["ready"] and listed["name"] == "Labatt" and listed["kind"] == "recording"
+
+    # it speaks like any other voice, asked for by its name
+    spoken = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "speak", "text": "This is me.", "voice": "Labatt"}).json())
+    assert spoken["state"] == "done" and spoken["result"]["model_name"] == "Labatt", spoken
+    seg = sound_jobs(tmp, "speak")[-1]["segments"][0]
+    assert seg["ref_audio"] == voice["reference"] and seg["ref_text"] == texts["plain"]
+    # hearing it: a sentence spoken by the voice, kept with the voice and not in the library
+    before = len(c.get("/api/sound/library").json()["items"])
+    task = task_of(c, c.post(f"{path}/sample", json={}).json()["job_id"])
+    assert task["status"] == "done" and task["kind"] == "sound" and task["title"].startswith("Hear the voice Labatt")
+    assert task["detail"]["stages"] == ["Prepare the voice", "Speak", "Save"] and "1.04 seconds" in task["detail"]["voice"]["what_the_model_hears"]
+    heard = c.get(path).json()
+    assert heard["sample"]["text"] == SAMPLE and Path(heard["sample"]["path"]).parent == voices_dir / vid and heard["sample"]["seconds"] > 1
+    assert heard["takes"][0]["try"] == heard["sample"] and not any(t["try"] for t in heard["takes"][1:]) and not heard["sampling"]
+    assert len(c.get("/api/sound/library").json()["items"]) == before
+    # choosing by ear: the voice says the same sentence taken from every take in turn
+    task_of(c, c.post(f"{path}/sample", json={"which": "all", "text": "Which of these sounds like me?"}).json()["job_id"])
+    every = c.get(path).json()
+    assert all(t["try"] and t["try"]["text"] == "Which of these sounds like me?" and Path(t["try"]["path"]).exists() for t in every["takes"])
+    assert len({t["try"]["path"] for t in every["takes"]}) == 7 and not Path(heard["sample"]["path"]).exists()
+    asked = sound_jobs(tmp, "speak")[-1]
+    assert len(asked["segments"]) == 7 and len({s["ref_audio"] for s in asked["segments"]}) == 7       # one second of each take
+    # … and the one that sounds most like its owner becomes what the voice is taken from
+    chosen = c.put(path, json={"name": "Labatt, calm", "note": "evening voice", "lead": every["takes"][4]["id"]}).json()
+    assert chosen["name"] == "Labatt, calm" and chosen["note"] == "evening voice" and chosen["lead"] == every["takes"][4]["id"]
+    assert [t["lead"] for t in chosen["takes"]] == [False] * 4 + [True] + [False] * 2 and chosen["sample"] == every["takes"][4]["try"]
+    assert begins_with(chosen["reference"], chosen["takes"][4])
+    assert c.put(path, json={"name": "My voice"}).status_code == 400       # taken
+    assert c.put(path, json={"lead": "nope"}).status_code == 404
+    wait_sound(c, c.post("/api/sound/jobs", json={"kind": "speak", "text": "Still me.", "voice": "Labatt, calm"}).json())
+    assert sound_jobs(tmp, "speak")[-1]["segments"][0]["ref_text"] == texts["calm"]
+    # a sentence recorded again replaces its take (the voice follows when it was taken from it); a missing one is added
+    old = chosen["takes"][4]
+    again = c.post(f"{path}/takes", json={"sentence": "calm", "audio": record("calm", loud=0.2)}).json()
+    new = next(t for t in again["takes"] if t["sentence"] == "calm")
+    assert new["id"] != old["id"] and new["lead"] and again["lead"] == new["id"] and len(again["takes"]) == 7
+    assert not Path(old["path"]).exists() and not Path(old["try"]["path"]).exists() and new["try"] is None and again["sample"] is None
+    more = c.post(f"{path}/takes", json={"sentence": "sounds", "audio": record("sounds")}).json()
+    assert len(more["takes"]) == 8 and more["missing"] == [] and more["lead"] == new["id"] and not list(uploads.glob("says-*"))
+    assert c.post(f"{path}/takes", json={"sentence": "joy", "audio": record("joy", loud=0.0, noise=0.0003)}).status_code == 400
+    # a take is removed; when it is the one the voice was taken from, the voice is taken from another
+    less = c.delete(f"{path}/takes/{more['takes'][7]['id']}").json()
+    assert len(less["takes"]) == 7 and not Path(more["takes"][7]["path"]).exists() and less["lead"] == new["id"]
+    moved = c.delete(f"{path}/takes/{new['id']}").json()
+    assert len(moved["takes"]) == 6 and moved["lead"] == moved["takes"][0]["id"] and begins_with(moved["reference"], moved["takes"][0])
+    assert c.delete(f"{path}/takes/nope").status_code == 404
+
+    # a voice from one recording you have: it is taken from that recording's clearest second, not its first
+    late = tmp / "late.wav"
+    speechlike(late, seconds=9.0)
+    data = np.frombuffer(late.read_bytes()[44:], dtype="<i2").copy()
+    data[: 24000 * 2] //= 200                                # two seconds of murmur before the speech proper
+    late.write_bytes(late.read_bytes()[:44] + data.tobytes())
+    up = c.post("/api/sound/upload", files={"file": ("my-old-recording.wav", late.read_bytes(), "audio/wav")}).json()
+    file_voice = c.post("/api/sound/voices", json={"name": "From a file", "audio": up["path"], "transcript": "what I said",
+                                                   "consent": {"whose": "mine", "confirmed": True}}).json()
+    fpath = f"/api/sound/voices/{file_voice['id']}"
+    assert len(file_voice["takes"]) == 1 and file_voice["takes"][0]["whole"] and file_voice["takes"][0]["lead"] and not file_voice["old"]
+    assert file_voice["takes"][0]["best"] >= 2.0 and begins_with(file_voice["reference"], file_voice["takes"][0])
+    assert len(file_voice["missing"]) == 8 and not Path(up["path"]).exists()
+    grown = c.post(f"{fpath}/takes", json={"sentence": "plain", "audio": record("plain")}).json()
+    assert [t["sentence"] for t in grown["takes"]] == ["plain", None] and grown["lead"] == file_voice["lead"] and len(grown["missing"]) == 7
+    # a voice made before this release has no takes: it is shown with its recording, speaks from it as it was
+    # given, and is taken from its clearest second once the user says so
+    fid = file_voice["id"].removeprefix("voice:")
+    db = sqlite3.connect(str(tmp / "data" / "kimilm.sqlite3"))
+    db.execute("UPDATE voices SET detail_json='{}' WHERE id=?", (fid,))
+    db.commit()
+    db.close()
+    before = c.get(fpath).json()
+    assert before["old"] and before["lead"] == "whole" and [t["id"] for t in before["takes"]] == ["whole"] and before["sample"] is None
+    task_of(c, c.post(f"{fpath}/sample", json={"text": "As I was."}).json()["job_id"])
+    assert sound_jobs(tmp, "speak")[-1]["segments"][0]["ref_audio"] == before["reference"]
+    assert c.get(fpath).json()["sample"]["text"] == "As I was."
+    renewed = c.put(fpath, json={"lead": "whole"}).json()
+    assert not renewed["old"] and len(renewed["takes"]) == 1 and renewed["takes"][0]["whole"] and renewed["takes"][0]["lead"]
+    assert renewed["sample"] is None and begins_with(renewed["reference"], renewed["takes"][0])
+    mine = {v["name"]: v for v in c.get("/api/sound/voices/mine").json()["voices"]}
+    assert {"Labatt, calm", "From a file"} <= set(mine) and mine["Labatt, calm"]["updated"] >= mine["Labatt, calm"]["created"]
+
+    # deleting a voice takes everything recorded for it; a default that pointed at it is cleared
+    assert c.put("/api/sound/settings", json={"voice": voice["id"]}).json()["default_voice"] == voice["id"]
+    assert c.get(path).json()["default"]
+    c.delete(path)
+    c.delete(fpath)
+    assert not (voices_dir / vid).exists() and not (voices_dir / f"{vid}.wav").exists() and not (voices_dir / fid).exists()
+    assert c.get(path).status_code == 404
+    assert c.get("/api/sound").json()["default_voice"] != voice["id"]
+    assert "Labatt, calm" not in {v["name"] for v in c.get("/api/sound").json()["voices"]}
+    # agents use voices; none of their tools makes, changes or deletes one
+    from dva.tools import builtin_tools
+    assert [t.name for t in builtin_tools() if "voice" in t.name] == ["list_voices"]
+
+
+def test_a_take_is_measured_and_judged_and_its_best_second_found():
+    """2.18.0. What is said about a take comes from its sound: how much speech, how loud, how clear of the room,
+    and where its fullest second of speech is: the second the voice model is given."""
+    import numpy as np
+    from dva.voices import SECOND, cut, judge, measure
+    rate = 24000
+    t = np.arange(5 * rate) / rate
+    # short words with gaps, then from 2.6 s a stretch of unbroken speech
+    on = (((t % 0.47) < 0.3) & (t > 0.5) & (t < 2.4)) | ((t > 2.6) & (t < 4.2))
+    x = (0.1 * np.sin(2 * np.pi * 200 * t) * on + np.random.default_rng(1).normal(0, 0.0005, len(t))).astype("float32")
+    facts = measure(x)
+    assert facts["seconds"] == 5.0 and 2.5 < facts["speech_seconds"] < 3.1 and abs(facts["level_db"] + 23) < 1.5
+    assert facts["noise_db"] < -60 and 0.45 <= facts["start"] <= 0.55 and 4.1 <= facts["end"] <= 4.25 and facts["clipped"] == 0
+    assert facts["steady"] == 1.0 and 2.58 <= facts["best"] <= 3.2           # inside the unbroken stretch
+    assert judge(facts, "one two three four five six seven")["verdict"] == "good"
+    assert judge(facts, "one two three", heard="one two three")["match"] == 1.0
+    assert judge(facts, "one two three four", heard="one two three for")["verdict"] == "fair"
+    assert "Other words" in judge(facts, "one two three four", heard="")["problems"][0]
+    assert "long silences" in judge({**facts, "seconds": 30.0}, "one two three")["notes"][0]
+    assert "one breath" in judge({**facts, "steady": 0.5})["notes"][0]
+    part = cut(x, facts)                                     # only the speech, at the common loudness, never overdriven
+    assert 3.8 < len(part) / rate < 4.1 and abs(measure(part)["level_db"] + 23) < 0.6 and float(np.abs(part).max()) <= 0.95
+    lead = cut(x, facts, lead=True)                          # from the best second on: what the model hears comes first
+    assert abs(len(lead) / rate - (facts["end"] + 0.12 - facts["best"])) < 0.05 and measure(lead[:SECOND])["speech_seconds"] > 1.0
+    loud = cut(x * 9, measure(x * 9))
+    assert float(np.abs(loud).max()) <= 0.951
+    choppy = measure((0.1 * np.sin(2 * np.pi * 200 * t) * ((t % 0.4) < 0.2)).astype("float32"))
+    assert choppy["steady"] < 0.6 and judge(choppy)["verdict"] == "fair"
+    assert measure(np.zeros(100, dtype="float32"))["speech_seconds"] == 0.0
+    assert judge(measure(np.zeros(rate, dtype="float32")))["verdict"] == "again"
+
+
+@pytest.mark.skipif(not os.environ.get("DVA_TEST_SOUND_MODELS"), reason="needs real speech models (DVA_TEST_SOUND_MODELS=folder)")
+def test_the_real_voice_model_hears_one_second_of_a_recording(tmp_path):
+    """2.18.0 is built on this, measured with the model KimiLM installs: the voice comes from the first 1.04
+    seconds of the recording it is given, however long the recording is, and another second gives another voice.
+    If a later model or library hears more, this fails, and voices.py should give it more."""
+    import numpy as np
+    from dva.sound import read_pcm
+    from dva.voices import SECOND
+    folder = Path(os.environ["DVA_TEST_SOUND_MODELS"]) / "sherpa-onnx-pocket-tts-int8-2026-01-26"
+    voice = read_pcm(folder / "test_wavs" / "bria.wav", 24000, 1)
+
+    def says(name, samples):
+        ref = tmp_path / f"{name}.wav"
+        with wave_file(ref) as f:
+            f.writeframes((np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes())
+        spec = tmp_path / "job.json"
+        spec.write_text(json.dumps({"kind": "speak", "out": str(tmp_path / f"{name}-out.wav"),
+                                    "models": {"p": {"family": "pocket", "dir": str(folder)}},
+                                    "segments": [{"model": "p", "text": "This voice comes from a short recording.", "ref_audio": str(ref)}]}))
+        out = subprocess.run([sys.executable, "-c", "import sys, sherpa_onnx as so, dva.sound_worker as w\n"
+                              "make = so.GenerationConfig\n"
+                              "def seeded():\n    c = make(); c.extra = {'seed': '1'}; return c\n"
+                              "so.GenerationConfig = seeded\n"                      # the same throw of the dice each time
+                              "sys.exit(w.main([sys.argv[1]]))", str(spec)], cwd=str(ENGINE), capture_output=True, text=True)
+        assert json.loads(out.stdout.strip().splitlines()[-1]).get("done"), out.stderr[-600:]
+        return read_pcm(tmp_path / f"{name}-out.wav", 24000, 1).reshape(-1)
+    same = lambda a, b: len(a) == len(b) and bool(np.allclose(a, b, atol=1e-3))      # noqa: E731
+    one, three, ten = says("one", voice[:SECOND]), says("three", voice[: 3 * 24000]), says("ten", voice[: 10 * 24000])
+    assert same(one, three) and same(three, ten)                 # what follows the first 1.04 seconds changes nothing
+    assert not same(ten, says("later", voice[5 * 24000: 15 * 24000]))       # another second of the same speaker: another voice
+    assert not same(one, says("less", voice[: SECOND // 2]))     # … and less than that second is not the same either
+
+
+def wave_file(path, rate=24000):
+    import wave
+    f = wave.open(str(path), "wb")
+    f.setnchannels(1)
+    f.setsampwidth(2)
+    f.setframerate(rate)
+    return f
+
+
+# ---------------------------------------------------------------------------------------------- 2.19.0
+def catalogue_chat(c):
+    """A chat whose agent has the stand-in connector with a paged catalogue and a long guide."""
+    conn = c.post("/api/connectors", json={"name": "Catalogue", "transport": "stdio", "command": "{python}",
+                                           "args": [str(TESTS / "fake_mcp_server.py"), "--catalogue"]}).json()
+    assert c.post(f"/api/connectors/{conn['id']}/test").json()["ok"]
+    chat = c.post("/api/chats", json={"harness": "agent", "connectors": [conn["id"]]}).json()
+    return conn, chat, Path(c.get(f"/api/chats/{chat['id']}").json()["workspace"])
+
+
+def test_a_tool_result_is_saved_whole_and_a_long_one_is_kept_in_a_file(engine):
+    """2.19.0. A small model could not copy a service's long answer into a file: it saw only the start, and had to
+    type it again. Now any tool call can take save_to (the app writes the whole answer), and an answer too long to
+    read whole is kept in a file whose path the model is given."""
+    c = engine["client"]
+    conn, chat, ws = catalogue_chat(c)
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "please save the guide to team-notes/guide.txt"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    step = [s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool"][0]
+    saved = Path(step["saved"])
+    assert saved == ws / "team-notes" / "guide.txt" and step["ok"], step
+    text = saved.read_text(encoding="utf-8")
+    guide = json.loads(text)["result"]                   # the service's answer as it came, whole (not 12,000 characters)
+    assert guide.startswith("GUIDE START") and guide.endswith("GUIDE END") and len(guide) > 40_000
+    assert step["result"].startswith(f"Saved the whole result ({len(text):,} characters) to {saved}")
+    assert "save_to" not in json.dumps(step["arguments"])                # the service never saw it
+    # read without save_to: the model reads the start, the whole answer is in a file it is told about
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "read the guide"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    step = [s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool"][0]
+    kept = Path(step["saved"])
+    assert kept.parent == ws / "tool-results" and kept.name.endswith("get-guide.txt") and kept.read_text(encoding="utf-8") == text
+    assert step["result"].endswith(f"(the whole result is in {kept})")
+    # the rule is in every agent's instructions
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "show system prompt"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    prompt = last_assistant(c, chat["id"])["content"]
+    assert "save_to (a file path)" in prompt and "from kimilm import call" in prompt
+    c.delete(f"/api/connectors/{conn['id']}")
+
+
+def test_code_pages_through_a_service_and_only_while_it_runs(engine):
+    """2.19.0. Paging through a service was a turn of the model per page. In run_python, kimilm.call reaches the
+    agent's own connectors: one program pages through all of it and writes the file. Its token is valid only
+    while that program runs, and code never sees the app's own token."""
+    c = engine["client"]
+    conn, chat, ws = catalogue_chat(c)
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "page through the items into items.csv"}).json()
+    done = wait_job(c, job["job_id"], approve="allow")
+    assert done["status"] == "done", done
+    step = [s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool"][0]
+    assert step["ok"] and "47 items from 5 pages" in step["result"], step["result"]
+    rows = (ws / "items.csv").read_text(encoding="utf-8").splitlines()
+    assert rows[0] == "id,title" and len(rows) == 48 and rows[-1] == "47,Item 47"
+    trail = [e["text"] for e in c.get(f"/api/jobs/{job['job_id']}").json()["trail"]]
+    assert len([t for t in trail if t.startswith("From code: Catalogue")]) == 5          # each call is in the trail
+    # without a valid token the bridge answers nothing, and the app's own token is not the bridge's
+    r = httpx.post(f"http://127.0.0.1:{engine['port']}/api/bridge/call", json={"tool": "list_items"},
+                   headers={"X-KimiLM-Bridge": "made-up"}, trust_env=False)
+    assert r.status_code == 403 and "only while its run_python call runs" in r.json()["error"]
+    r = httpx.post(f"http://127.0.0.1:{engine['port']}/api/bridge/tools", trust_env=False,
+                   headers={"X-KimiLM-Bridge": engine["token"]})
+    assert r.status_code == 403
+    c.delete(f"/api/connectors/{conn['id']}")
+
+
+def test_a_program_that_hangs_is_ended_with_everything_it_started(engine):
+    """2.19.0. A long-running task left the computer full of Python processes: code kept running after its agent
+    was stopped, and a program it had started outlived it. Now Stop, the time limit and the end of the task end
+    the program and every program it started; the time limit has a ceiling; Activity lists what runs."""
+    import psutil
+    c = engine["client"]
+    chat = c.post("/api/chats", json={"harness": "agent"}).json()
+    ws = Path(c.get(f"/api/chats/{chat['id']}").json()["workspace"])
+    pids_file = ws / "hang-pids.txt"
+
+    def started(job_id):
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            job = c.get(f"/api/jobs/{job_id}").json()
+            if job["status"] == "waiting":
+                for ap in c.get(f"/api/chats/{chat['id']}").json()["pending_approvals"]:
+                    c.post(f"/api/approvals/{ap['approval_id']}", json={"allow": True})
+            if pids_file.exists() and len(pids_file.read_text().split()) == 2:
+                return [int(x) for x in pids_file.read_text().split()]
+            time.sleep(0.2)
+        raise AssertionError("the code did not start")
+
+    def gone(pids, within=10):
+        deadline = time.time() + within
+        while time.time() < deadline:
+            if not any(psutil.pid_exists(p) and psutil.Process(p).status() != psutil.STATUS_ZOMBIE for p in pids):
+                return True
+            time.sleep(0.2)
+        return False
+
+    # Stop: the program and the one it started end with the task
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "hang in code"}).json()
+    pids = started(job["job_id"])
+    listed = c.get("/api/procs").json()["procs"]
+    mine = [p for p in listed if p["owner"] == job["job_id"]]
+    assert len(mine) == 1 and mine[0]["kind"] == "python" and mine[0]["processes"] >= 2, listed   # the script and its child
+    if os.name != "nt":
+        assert psutil.Process(mine[0]["pid"]).nice() >= 10                            # it runs at low priority
+    c.post(f"/api/jobs/{job['job_id']}/cancel")
+    assert wait_job(c, job["job_id"])["status"] == "cancelled"
+    assert gone(pids) and not [p for p in c.get("/api/procs").json()["procs"] if p["owner"] == job["job_id"]]
+    # the time limit the model asks for has a ceiling; at the limit, everything the program started ends too
+    pids_file.unlink()
+    c.put("/api/settings", json={"code_timeout_max_seconds": 6})
+    try:
+        job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "hang in code for 99999 seconds"}).json()
+        pids = started(job["job_id"])
+        assert wait_job(c, job["job_id"], timeout=60, approve="allow")["status"] == "done"
+        step = [s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool"][0]
+        assert not step["ok"] and "ran longer than 6 seconds and was stopped, with every program it started" in step["result"]
+        assert gone(pids)
+    finally:
+        c.put("/api/settings", json={"code_timeout_max_seconds": 900})
+    # a program in the list can be ended by hand (Activity)
+    pids_file.unlink()
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "hang in code"}).json()
+    pids = started(job["job_id"])
+    top = [p for p in c.get("/api/procs").json()["procs"] if p["owner"] == job["job_id"]][0]
+    assert c.delete(f"/api/procs/{top['pid']}").json()["owner"] == job["job_id"]
+    assert gone(pids)
+    assert wait_job(c, job["job_id"], timeout=60, approve="allow")["status"] == "done"
+    step = [s for s in last_assistant(c, chat["id"])["meta"]["steps"] if s["type"] == "tool"][0]
+    assert step["result"].startswith("FAILED")                         # the agent is told its code did not finish
+    assert c.delete(f"/api/procs/{top['pid']}").status_code == 404
+
+
+def test_programs_left_by_an_engine_that_went_away_are_ended(tmp_path):
+    """2.19.0. The list of running programs is kept on disk: at the next start, what an engine that crashed or was
+    killed left running is ended, but only if the program with that number is still the one it started."""
+    import subprocess
+    import types
+    import psutil
+    from dva.procs import Procs, end_tree, python_argv
+    said = []
+    app = types.SimpleNamespace(paths=types.SimpleNamespace(data=tmp_path), log=said.append,
+                                db=types.SimpleNamespace(setting=lambda k, d=None: d))
+    script = tmp_path / "parent.py"
+    script.write_text("import subprocess, sys, time\nsubprocess.Popen([sys.executable, '-c', 'import time; "
+                      "time.sleep(60)'])\ntime.sleep(60)\n")
+    left = subprocess.Popen(python_argv(script))
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline and not psutil.Process(left.pid).children():
+            time.sleep(0.1)
+        child = psutil.Process(left.pid).children()[0].pid
+        (tmp_path / "procs.json").write_text(json.dumps([
+            {"pid": left.pid, "started": psutil.Process(left.pid).create_time(), "kind": "python", "label": "parent"},
+            {"pid": other.pid, "started": psutil.Process(other.pid).create_time() - 100, "kind": "python"},
+            {"pid": 99999999, "started": 1.0, "kind": "python"}]))
+        ended = Procs(app).end_leftovers()
+        assert len(ended) == 1 and "parent" in ended[0] and left.wait(timeout=10) is not None
+        deadline = time.time() + 10
+        while time.time() < deadline and psutil.pid_exists(child) and psutil.Process(child).status() != psutil.STATUS_ZOMBIE:
+            time.sleep(0.1)
+        assert not psutil.pid_exists(child) or psutil.Process(child).status() == psutil.STATUS_ZOMBIE
+        assert other.poll() is None and json.loads((tmp_path / "procs.json").read_text()) == []
+        assert said and "ended programs left by the engine before" in said[0]
+        assert end_tree(99999999) == 0
+    finally:
+        for p in (left, other):
+            if p.poll() is None:
+                p.kill()
+
+    async def queue():
+        # at most `code_runs_at_once` programs run together; a long one's output is kept start and end
+        procs = Procs(types.SimpleNamespace(paths=app.paths, log=said.append,
+                                            db=types.SimpleNamespace(setting=lambda k, d=None: 1 if k == "code_runs_at_once" else d)))
+        waits = []
+        env = {**os.environ}
+        argv = [sys.executable, "-c", "import time; time.sleep(0.8); print('x' * 50000)"]
+        began = time.monotonic()
+        both = await asyncio.gather(*(procs.run(argv, cwd=tmp_path, env=env, timeout=30, limit=1000,
+                                                on_line=lambda t: waits.append(t) if t is None else None)
+                                      for _ in range(2)))
+        assert time.monotonic() - began > 1.5 and waits == [None]           # the second waited for the first
+        code, out = both[0]
+        assert code == 0 and out.startswith("x" * 400) and "characters of output left out" in out and len(out) < 1200
+        with pytest.raises(asyncio.TimeoutError):
+            await procs.run([sys.executable, "-c", "import time; time.sleep(30)"], cwd=tmp_path, env=env, timeout=1)
+        assert procs.live == {}
+    import asyncio
+    asyncio.run(queue())
+
+
+def test_a_step_names_its_files_exactly_and_recovery_knows_files_not_left(tmp_path):
+    """2.19.0. A planner wrote "team/guide.json" for a file of the team folder, and the agent and the check read
+    it differently. Now one place says where an expected file belongs; the brief lists exact paths; a step whose
+    agent did not leave its files is a failure of its own kind, with advice that is not "do the same again"."""
+    import types
+    from dva.orchestrator import Orchestra
+    from dva.recovery import CLASSES, classify
+    team = tmp_path / "team"
+    team.mkdir()
+    o = types.SimpleNamespace(dir=team)
+    where = lambda n: Orchestra.expected_path(o, n)                    # noqa: E731
+    assert where("team/guide.json") == team / "guide.json" == where("guide.json") == where("./guide.json")
+    assert where("team\\\\inventory.csv".replace("\\\\", os.sep)) == team / "inventory.csv"
+    assert where("cycles/a/source.md") == team / "cycles" / "a" / "source.md"
+    assert where(str(tmp_path / "elsewhere.txt")) == tmp_path / "elsewhere.txt"
+    o.expected_path = where
+    has = lambda n: Orchestra.has_output(o, n)                         # noqa: E731
+    assert not has("team/guide.json")
+    (team / "guide.json").write_text("")
+    assert not has("guide.json")                                       # an empty file is not a result
+    (team / "guide.json").write_text("{}")
+    assert has("team/guide.json") and has("guide.json")
+    (team / "deep").mkdir()
+    (team / "deep" / "inventory.csv").write_text("id\n1\n")
+    assert has("inventory.csv")                                        # found by name, as before
+    assert classify(objection="the file /x/team/coverage.json was not saved") == "output"
+    assert classify(objection="the summary leaves out the second source") == "quality"
+    assert "save_to" in CLASSES["output"]["advice"] and CLASSES["output"]["repeat"] == 0
+
+
+def test_an_agent_is_told_of_a_missing_file_before_it_finishes(engine):
+    """2.19.0. An agent that ended without the file its step must leave was told so only by the check after its
+    round, twenty minutes later on a slow computer. Now the app tells it before it finishes, with the exact path,
+    and the file lands where the planner meant it ("team/report.txt" is report.txt in the team folder)."""
+    c = engine["client"]
+    made = c.post("/api/chats", json={"harness": "agent"}).json()
+    c.put(f"/api/chats/{made['id']}", json={"auto_approve": True})      # the agent writes without asking
+    job = c.post(f"/api/chats/{made['id']}/messages", json={"text": "As a team with a file-leaving plan: keep a report."}).json()
+    status, msg = wait_job(c, job["job_id"], timeout=150)["status"], None
+    msg = last_assistant(c, made["id"])
+    assert status == "done"
+    team = team_of(msg)
+    t = team["tasks"][0]
+    assert t["status"] == "done", t
+    report = Path(team["folder"]) / "report.txt"
+    assert report.read_text(encoding="utf-8") == "the report" and not (Path(team["folder"]) / "team").exists()
+    brief = first_user_text(c, t["chat_id"])
+    assert f"Leave these files, at exactly these paths (the app checks them):\n- {report}" in brief
+    steps = [s for m in c.get(f"/api/chats/{t['chat_id']}").json()["messages"] if m["role"] == "assistant"
+             for s in (m.get("meta") or {}).get("steps") or []]
+    assert any(s.get("type") == "note" and "Reminded the agent of 1 missing file" in (s.get("text") or "") for s in steps), steps
+    assert [s["arguments"]["path"] for s in steps if s.get("type") == "tool"] == [str(report)]

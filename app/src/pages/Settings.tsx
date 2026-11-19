@@ -245,6 +245,12 @@ export default function Settings() {
       <div className="card stack-s">
         <h3>Safety</h3>
         <Toggle checked={s.allow_python} onChange={(v: boolean) => set({ allow_python: v })} label="Let the agent run code: Python and commands such as tests and git (always asks first unless auto-approve is on)" />
+        <Field label="Longest a program an agent runs may take (seconds)" help="An agent may ask for less or more time for its code; never more than this. A program that runs longer is ended with every program it started.">
+          <input className="input narrow" type="number" min={10} max={7200} value={s.code_timeout_max_seconds ?? 900} onChange={(e) => set({ code_timeout_max_seconds: Number(e.target.value) })} />
+        </Field>
+        <Field label="Programs agents may run at once" help="More wait their turn. Code runs at low priority, so the model and this window stay responsive.">
+          <input className="input narrow" type="number" min={1} max={8} value={s.code_runs_at_once ?? 2} onChange={(e) => set({ code_runs_at_once: Number(e.target.value) })} />
+        </Field>
         <Field label="If nobody answers an approval, decline after (minutes)">
           <input className="input narrow" type="number" min={1} value={s.approval_timeout_minutes} onChange={(e) => set({ approval_timeout_minutes: Number(e.target.value) })} />
         </Field>

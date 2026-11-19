@@ -124,6 +124,8 @@ CREATE TRIGGER IF NOT EXISTS kb_fts_ad AFTER DELETE ON kb_chunks BEGIN
 
 # Columns added after the first release: (table, column, definition). Applied once, on start.
 MIGRATIONS = [
+    # 2.18.0: a voice from recordings keeps its takes, a note and its sample ({"takes", "note", "seconds", "sample"})
+    ("voices", "detail_json", "TEXT DEFAULT '{}'"),
     ("chats", "settings_json", "TEXT DEFAULT '{}'"),        # per-chat limits (reply length, steps, time…)
     ("chats", "parent_chat_id", "TEXT"),                   # agents started by another chat (teams)
     ("chats", "agent_name", "TEXT"),

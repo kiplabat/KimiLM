@@ -59,6 +59,8 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         if host not in ("127.0.0.1", "localhost", "testserver"):
             return JSONResponse({"error": "forbidden host"}, 403)
         path = request.url.path
+        if path.startswith("/api/bridge/"):        # code run by run_python: its own token, checked by the route
+            return await call_next(request)
         if path.startswith("/api/") and path != "/api/health":
             supplied = request.headers.get("authorization", "").removeprefix("Bearer ").strip() or \
                 request.query_params.get("token", "")
@@ -166,6 +168,35 @@ def create_app(data_dir=None, resources_dir=None, token=None):
                 yield sse(event)
         return StreamingResponse(gen(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    # ------------------------------------------------------------------ code → connected services (2.19.0)
+    @api.post("/api/bridge/call")
+    async def bridge_call(request: Request):
+        data = await body(request)
+        token = request.headers.get("x-kimilm-bridge", "")
+        try:
+            result = await A().bridge.call(token, data.get("tool"), data.get("arguments"))
+        except PermissionError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, 403)
+        except Exception as exc:                       # the code gets the reason, as the agent would
+            return JSONResponse({"ok": False, "error": str(exc)[:2000] or type(exc).__name__}, 200)
+        return {"ok": True, "result": result}
+
+    @api.post("/api/bridge/tools")
+    async def bridge_tools(request: Request):
+        try:
+            return {"ok": True, "tools": A().bridge.tools(request.headers.get("x-kimilm-bridge", ""))}
+        except PermissionError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, 403)
+
+    # ------------------------------------------------------------------ programs KimiLM runs (2.19.0)
+    @api.get("/api/procs")
+    async def procs_list():
+        return {"procs": await asyncio.to_thread(A().procs.listing)}
+
+    @api.delete("/api/procs/{pid}")
+    async def procs_end(pid: int):
+        return await asyncio.to_thread(A().procs.end, pid)
 
     @api.post("/api/shutdown")
     async def shutdown():
@@ -482,15 +513,58 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         A().sound.remove(model_id)
         return {"ok": True}
 
+    # Voices from recordings (2.18.0, voices.py): the sentences to read, a check of each take, the voices with
+    # their takes, and hearing a voice. Only the user makes, changes and deletes voices: there are no tools for it.
+    @api.get("/api/sound/voices/script")
+    async def sound_voice_script():
+        return A().voices.script()
+
+    @api.get("/api/sound/voices/mine")
+    async def sound_voices_mine():
+        return {"voices": await asyncio.to_thread(A().voices.mine)}
+
+    @api.post("/api/sound/voices/check")
+    async def sound_voice_check(request: Request):
+        data = await body(request)
+        return await A().voices.check(data.get("audio"), data.get("sentence"), data.get("text"), data.get("words", True))
+
+    @api.post("/api/sound/voices/discard")
+    async def sound_voice_discard(request: Request):
+        return {"removed": A().voices.discard((await body(request)).get("paths") or [])}
+
     @api.post("/api/sound/voices")
     async def sound_voice_add(request: Request):
         data = await body(request)
-        return await A().sound.create_voice(data.get("name"), data.get("audio"), data.get("transcript") or "",
-                                            data.get("consent"))
+        return await A().voices.create(data.get("name"), data.get("consent"), audio=data.get("audio"),
+                                       takes=data.get("takes") or None, transcript=data.get("transcript") or "",
+                                       note=data.get("note") or "")
+
+    @api.get("/api/sound/voices/{voice_id}")
+    async def sound_voice_get(voice_id: str):
+        return await asyncio.to_thread(A().voices.get, voice_id)
+
+    @api.put("/api/sound/voices/{voice_id}")
+    async def sound_voice_update(voice_id: str, request: Request):
+        return await A().voices.update(voice_id, await body(request))
+
+    @api.post("/api/sound/voices/{voice_id}/takes")
+    async def sound_voice_take(voice_id: str, request: Request):
+        data = await body(request)
+        return await A().voices.add_take(voice_id, data.get("audio"), data.get("sentence"), data.get("text"),
+                                         data.get("check"))
+
+    @api.delete("/api/sound/voices/{voice_id}/takes/{take_id}")
+    async def sound_voice_take_remove(voice_id: str, take_id: str):
+        return await A().voices.remove_take(voice_id, take_id)
+
+    @api.post("/api/sound/voices/{voice_id}/sample")
+    async def sound_voice_sample(voice_id: str, request: Request):
+        data = await body(request)          # which: "lead" (the voice as it is) or "all" (taken from each take in turn)
+        return A().voices.sample(voice_id, data.get("text") or "", "all" if data.get("which") == "all" else "lead")
 
     @api.delete("/api/sound/voices/{voice_id}")
     async def sound_voice_remove(voice_id: str):
-        A().sound.delete_voice(voice_id)
+        A().voices.delete(voice_id)
         return {"ok": True}
 
     @api.post("/api/sound/jobs")

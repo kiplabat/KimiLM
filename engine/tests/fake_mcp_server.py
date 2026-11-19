@@ -35,6 +35,21 @@ def set_value(value: int) -> str:
     return f"value is now {value}"
 
 
+if "--catalogue" in sys.argv:       # a paged list and a long answer (2.19.0 tests)
+    @mcp.tool(annotations={"readOnlyHint": True})
+    def list_items(page: int = 1, per_page: int = 10) -> dict:
+        """One page of the 47 items in the catalogue."""
+        start = (page - 1) * per_page
+        items = [{"id": i, "title": f"Item {i}"} for i in range(start + 1, min(47, start + per_page) + 1)]
+        return {"page": page, "items": items, "has_more": start + per_page < 47}
+
+
+    @mcp.tool(annotations={"readOnlyHint": True})
+    def get_guide() -> str:
+        """The publishing guide: long."""
+        return "GUIDE START\n" + "".join(f"Rule {i}: keep every field within its limit.\n" for i in range(1, 900)) + "GUIDE END"
+
+
 if "--full" in sys.argv:            # everything beyond the two basic tools (2.10.0 tests)
     @mcp.tool(title="Wipe everything", annotations={"destructiveHint": True})
     def wipe() -> str:
