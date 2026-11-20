@@ -29,6 +29,10 @@
       "cpu": ["bin-ubuntu-x64"],
       "vulkan": ["bin-ubuntu-vulkan-x64"]
     },
+    "linux-arm64": {
+      "cpu": ["bin-ubuntu-arm64"],
+      "vulkan": ["bin-ubuntu-vulkan-arm64"]
+    },
     "darwin": {
       "metal": ["bin-macos-arm64"]
     }

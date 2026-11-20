@@ -41,12 +41,11 @@ nsis:
 linux:
   # tar.gz: unpacked as-is by KimiOS into /usr/lib/kimilm (2.22.0); runs on any x64 Linux with a desktop
   target:
-    - target: tar.gz
-      arch: [x64]
+    - target: tar.gz          # the architecture comes from the command: --x64 or --arm64 (2.25.0)
   executableName: kimilm
   icon: build/icon.png
   category: Utility
-  artifactName: KimiLM-linux-x64.${ext}
+  artifactName: KimiLM-linux-${arch}.${ext}
   synopsis: Local AI agents on your own computer
 mac:
   target: dmg

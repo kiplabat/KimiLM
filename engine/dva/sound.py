@@ -117,7 +117,7 @@ CATALOG += [
         "1\\.7B", ["Q8_0", "Q6_K"]),
 ]
 ACE_LM, ACE_SYNTH = ("ace-lm.exe", "ace-synth.exe") if os.name == "nt" else ("ace-lm", "ace-synth")
-ACE_ASSET = {"nt": "acestep-windows-x64.zip"}.get(os.name, "acestep-linux-x64.tar.gz")
+ACE_ASSET = {"nt": "acestep-windows-x64.zip"}.get(os.name, "acestep-linux-x64.tar.gz")   # no ARM64 build is published yet
 VAD_URL = f"{RELEASES}/asr-models/silero_vad.onnx"
 ONLINE = {
     "openai": {"name": "OpenAI",

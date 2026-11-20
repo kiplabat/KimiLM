@@ -1,7 +1,7 @@
 {
   "name": "kimilm",
   "productName": "KimiLM",
-  "version": "2.24.0",
+  "version": "2.25.0",
   "description": "Local AI agents on your own computer: chat, projects, memory, skills, plugins, harnesses and scheduled tasks. Models run on your machine.",
   "author": "Kiplabat Tarus",
   "license": "MIT",
@@ -13,6 +13,7 @@
     "prepare:resources": "node scripts/prepare-resources.mjs",
     "dist:win": "npm run build:ui && node scripts/prepare-resources.mjs --platform win && electron-builder --win --x64",
     "dist:linux": "npm run build:ui && node scripts/prepare-resources.mjs --platform linux && electron-builder --linux --x64 --publish never",
+    "dist:linux:arm64": "npm run build:ui && node scripts/prepare-resources.mjs --platform linux && electron-builder --linux --arm64 --publish never",
     "pack:win": "electron-builder --win nsis --x64",
     "pack:win:zip": "electron-builder --win zip --x64",
     "dist:dir": "npm run build:ui && node scripts/prepare-resources.mjs && electron-builder --dir"
