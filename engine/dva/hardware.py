@@ -275,3 +275,58 @@ def recommend_backend(cards):
     if platform.system() == "Darwin" and platform.machine() == "arm64":
         return "metal"
     return "cpu"
+
+
+# ---------------------------------------------------------------------------------------------- drives (2.23.0)
+MEDIA_ROOTS = ("/run/media/", "/media/")
+
+
+def unmounted_drive(path):
+    """The label of the drive a missing file would be on, when the path points into a removable-media folder
+    (/run/media/<user>/<label>/…, /media/<user>/<label>/…) that is not mounted. None otherwise."""
+    p = str(path)
+    if os.name != "posix" or os.path.exists(p):
+        return None
+    for root in MEDIA_ROOTS:
+        if p.startswith(root):
+            parts = p[len(root):].split("/")
+            if len(parts) >= 3 and parts[1]:
+                mount_point = root + parts[0] + "/" + parts[1]
+                if not os.path.ismount(mount_point):
+                    return parts[1]
+    return None
+
+
+def _block_device_with_label(label, run=_run):
+    import json as _json
+    try:
+        data = _json.loads(run(["lsblk", "-J", "-o", "PATH,LABEL,MOUNTPOINT"]) or "{}")
+    except ValueError:
+        return None
+
+    def walk(nodes):
+        for n in nodes or []:
+            yield n
+            yield from walk(n.get("children"))
+    for n in walk(data.get("blockdevices")):
+        if n.get("label") == label and not n.get("mountpoint"):
+            return n.get("path")
+    return None
+
+
+def mount_drive(path, run=_run):
+    """Mount the drive a model file lives on when it is not mounted yet (Linux, through udisks: the same mount
+    the file manager makes, at /run/media/<user>/<label>). On a desktop this may show the system's password
+    prompt; KimiOS allows administrators to mount internal drives without one. Returns (ok, message)."""
+    label = unmounted_drive(path)
+    if not label:
+        return False, ""
+    if not shutil.which("udisksctl") or not shutil.which("lsblk"):
+        return False, f"the drive {label!r} is not mounted"
+    device = _block_device_with_label(label, run)
+    if not device:
+        return False, f"the drive {label!r} is not connected or could not be found"
+    out = run(["udisksctl", "mount", "-b", device], timeout=90)
+    if out and os.path.exists(str(path)):
+        return True, f"mounted the drive {label!r}"
+    return False, f"the drive {label!r} is not mounted and could not be mounted (open it in Files once)"

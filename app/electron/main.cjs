@@ -15,6 +15,7 @@ let engine = null;
 let enginePort = null;
 let win = null;
 let tray = null;
+const kimiosSession = process.env.KIMIOS_SESSION === "1";   // started by KimiOS's session (kimios-session)
 let quitting = false;
 let restarts = 0;
 let awake = null;     // id of the power-save blocker while tasks are running (2.9.0)
@@ -197,6 +198,9 @@ function createWindow(show = true) {
     if (!url.startsWith(appUrl())) { e.preventDefault(); shell.openExternal(url); }
   });
   win.on("close", (e) => {
+    // In the KimiOS session (2.23.0) KimiLM is the whole desktop and there is no tray to come back from: closing
+    // the window quits, and the session returns to the login screen.
+    if (kimiosSession) { quitting = true; return; }
     if (!quitting && prefs().keepInTray) {
       e.preventDefault();
       win.hide();
@@ -341,12 +345,13 @@ if (!app.requestSingleInstanceLock()) {
         callback(request.audioRequested && process.platform === "win32" ? { video: sources[0], audio: "loopback" } : { video: sources[0] });
       }).catch((err) => { log(`screen recording: ${err.message}`); callback({}); });
     });
-    createTray();
+    if (!kimiosSession) createTray();
     watchWork();
     const hidden = process.argv.includes("--hidden") || prefs().startHidden;
     createWindow(!hidden);
   });
-  app.on("window-all-closed", (e) => { if (!quitting) e.preventDefault(); });
+  // Subscribing to this event keeps the app running when its window closes (the tray); it quits only when asked to
+  app.on("window-all-closed", () => { if (quitting) app.quit(); });
   app.on("before-quit", async (e) => {
     quitting = true;
     if (engine) {

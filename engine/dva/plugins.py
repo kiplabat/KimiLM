@@ -5,7 +5,11 @@ A plugin is a folder with plugin.json. Its MCP servers can be written the way ot
 manifest.json and the server's files) installs as a plugin too: its manifest is turned into plugin.json, its
 user_config into settings. Settings marked "secret" are kept in the OS credential store. A plugin may
 ship a setup script (run with the app's Python) that checks the settings and returns choices or updates, and
-actions (buttons) that run scripts, e.g. "Sync my catalogue"."""
+actions (buttons) that run scripts, e.g. "Sync my catalogue".
+
+Plugins come from three places: built into the app, installed by the user, and (2.23.0) installed by the
+operating system in `system_plugin_dir()` (on Linux /usr/share/kimilm/plugins; KimiOS puts its tool server
+there). System plugins can be switched off, not removed, like built-in ones."""
 import asyncio
 import io
 import json
@@ -24,6 +28,13 @@ from .paths import BUILTIN
 from .procs import end_tree
 
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+def system_plugin_dir():
+    """Plugins the operating system installed for KimiLM (2.23.0). DVA_SYSTEM_PLUGINS overrides (tests)."""
+    if os.environ.get("DVA_SYSTEM_PLUGINS"):
+        return Path(os.environ["DVA_SYSTEM_PLUGINS"])
+    return Path("/usr/share/kimilm/plugins") if os.name == "posix" else None
 SCHEMA = {
     "type": "object", "required": ["id", "name", "version"],
     "properties": {
@@ -51,8 +62,9 @@ class Plugins:
         self.paths, self.db, self.secrets, self.bus = paths, db, secrets, bus
 
     def _dirs(self):
-        for root, source in ((BUILTIN / "plugins", "builtin"), (self.paths.data / "plugins", "user")):
-            if root.exists():
+        for root, source in ((BUILTIN / "plugins", "builtin"), (system_plugin_dir(), "system"),
+                             (self.paths.data / "plugins", "user")):
+            if root and root.exists():
                 for pj in sorted(root.glob("*/plugin.json")):
                     yield source, pj
 
@@ -255,8 +267,8 @@ class Plugins:
             errors = list(VALIDATOR.iter_errors(manifest))
             if errors:
                 raise ValueError(f"plugin.json: {errors[0].message}")
-            if any(p["id"] == manifest["id"] and p["source"] == "builtin" for p in self.all()):
-                raise ValueError("A built-in plugin already uses that id")
+            if any(p["id"] == manifest["id"] and p["source"] in ("builtin", "system") for p in self.all()):
+                raise ValueError("A built-in or system plugin already uses that id")
             dest = self.paths.data / "plugins" / manifest["id"]
             tmp = dest.with_name(dest.name + ".installing")
             shutil.rmtree(tmp, ignore_errors=True)
@@ -280,7 +292,7 @@ class Plugins:
     def uninstall(self, plugin_id):
         plugin = self.get(plugin_id)
         if not plugin or plugin["source"] != "user":
-            raise ValueError("Built-in plugins can be switched off, not removed")
+            raise ValueError("Built-in and system plugins can be switched off, not removed")
         shutil.rmtree(plugin["dir"])
         self.db.delete("plugin_state", plugin_id)
         self.bus.publish("plugins_changed")

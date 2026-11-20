@@ -265,6 +265,9 @@ class Evals:
     async def _run(self, run_id, model, tasks):
         root = self.app.paths.data / "evals" / run_id
         results, status = [], "done"
+        # 2.23.0: start with only the model under test loaded (fair numbers, memory for it), and give the memory
+        # back when the run ends, instead of leaving models loaded until the idle timer
+        await self._release(keep=(model,))
         try:
             for i, task in enumerate(tasks):
                 self.current.update(done=i, task=task["title"])
@@ -281,6 +284,16 @@ class Evals:
             self.app.bus.publish("eval", run_id=run_id, done=len(results), total=len(tasks), finished=True)
             if not self.db.setting("eval_keep_files", False):
                 shutil.rmtree(root, ignore_errors=True)
+            await self._release()
+
+    async def _release(self, keep=()):
+        """Unload idle models (those no chat or task is using), except `keep`. Never fails the run."""
+        try:
+            gone = await self.app.runtime.release(keep=tuple(k for k in keep if k))
+            if gone:
+                self.app.bus.publish("eval_released", models=gone)
+        except Exception:
+            pass
 
     # the settings that change how tasks are done: stored with each run, so two runs can be told apart
     SETTINGS = ("agent_order", "team_mode", "step_rounds", "verify_results", "check_model", "lean_tools",
