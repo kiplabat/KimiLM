@@ -115,6 +115,11 @@ def test_plugins_installed_by_the_system_are_listed_with_their_server(tmp_path, 
     assert len(conn) == 1 and conn[0]["command"] == "/usr/libexec/kimios/kimios-mcp" and conn[0]["ready"]
     with pytest.raises(ValueError):
         p.uninstall("kimios")                  # part of the operating system: switch off, not remove
+    assert conn[0]["system"] is True
+    from dva import mcp
+    connectors = mcp.Connectors.__new__(mcp.Connectors)
+    connectors.plugins = p
+    assert connectors.system_ids() == ["kimios:kimios"]      # every agent chat gets it (2.24.0)
 
 
 def test_no_system_plugin_folder_is_fine(tmp_path, monkeypatch):
@@ -194,8 +199,9 @@ def test_contain_does_nothing_outside_windows():
 
 # ---------------------------------------------------------------------------------------------- exploring while idle
 class ExploreDB:
-    def __init__(self, models, settings=None, active_jobs=0, last_job=None):
+    def __init__(self, models, settings=None, active_jobs=0, last_job=None, evaluated=()):
         self.models, self.settings, self.active_jobs, self.last_job = models, dict(settings or {}), active_jobs, last_job
+        self.evaluated, self.eval_rows = list(evaluated), {}
 
     def setting(self, key, default=None):
         return self.settings.get(key, default)
@@ -209,7 +215,12 @@ class ExploreDB:
         return {"t": self.last_job}
 
     def all(self, sql, params=()):
+        if "eval_runs" in sql:
+            return [{"model": m} for m in self.evaluated]
         return list(self.models)
+
+    def get(self, table, key, **kw):
+        return self.eval_rows.get(key)
 
 
 def explore_app(tmp_path, monkeypatch, **db_kw):
@@ -252,6 +263,7 @@ def explore_app(tmp_path, monkeypatch, **db_kw):
     app.log = lambda msg: None
     monkeypatch.setattr(hardware, "power", lambda: {"on_ac": True})
     monkeypatch.setattr(explore.Explorer, "quiet_processor", staticmethod(lambda: True))
+    monkeypatch.setattr(explore.Explorer, "desktop_idle_minutes", staticmethod(lambda: None))
     return app, explore.Explorer(app)
 
 
@@ -285,7 +297,13 @@ def test_explorer_skips_measured_and_missing_models(tmp_path, monkeypatch):
     app, ex = explore_app(tmp_path, monkeypatch, models=[
         {"id": "fresh", "path": str(tmp_path / "m.gguf"), "bench": {"tune": {"at": now()}}},
         {"id": "gone", "path": "/run/media/u/Unplugged/x.gguf", "bench": {}}])
-    assert ex.check() == (None, "every local model's setup is measured and recent")
+    assert ex.check()[0]["_what"] == "evaluation"          # measured, but never evaluated
+    app, ex = explore_app(tmp_path, monkeypatch, evaluated=["fresh"], models=[
+        {"id": "fresh", "path": str(tmp_path / "m.gguf"), "bench": {"tune": {"at": now()}}}])
+    assert ex.check() == (None, "every local model is measured and evaluated")
+    app, ex = explore_app(tmp_path, monkeypatch, settings={"explore_last_evaluation": now()}, models=[
+        {"id": "fresh", "path": str(tmp_path / "m.gguf"), "bench": {"tune": {"at": now()}}}])
+    assert ex.check() == (None, "every local model is measured and evaluated")      # one a week
 
 
 def test_explorer_stops_when_the_user_starts_something(tmp_path, monkeypatch):
@@ -349,3 +367,36 @@ def test_age_reads_utc_and_zoned_times():
     assert abs(age(hour_ago.isoformat()).total_seconds() - 3600) < 5
     assert abs(age(hour_ago.replace(tzinfo=None).isoformat()).total_seconds() - 3600) < 5      # no zone: UTC
     assert abs(age(hour_ago.astimezone(timezone(timedelta(hours=3))).isoformat()).total_seconds() - 3600) < 5
+
+
+def test_explorer_evaluates_and_stops_when_someone_uses_the_computer(tmp_path, monkeypatch):
+    from dva import explore
+    from dva.db import now
+    app, ex = explore_app(tmp_path, monkeypatch, models=[
+        {"id": "qwen", "path": str(tmp_path / "m.gguf"), "bench": {"tune": {"at": now()}}}])
+    cancelled = []
+    app.jobs = type("J", (), {"cancel": staticmethod(lambda job_id: cancelled.append(job_id))})()
+
+    def start(model=None):
+        app.db.eval_rows["eval_1"] = {"status": "running", "summary": {}}
+        return {"id": "eval_1", "job_id": "job_1"}
+    app.evals.start = start
+    model, why = ex.check()
+    assert why is None and model["_what"] == "evaluation"
+    monkeypatch.setattr(explore.Explorer, "desktop_idle_minutes", staticmethod(lambda: 0.1))   # someone is back
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(explore.asyncio, "sleep", lambda s: real_sleep(0))
+    entry = asyncio.run(ex.explore(model))
+    assert cancelled == ["job_1"] and entry["stopped"] == "someone is using the computer"
+    assert app.db.settings["explore_last_evaluation"]
+
+
+def test_desktop_idle_time_from_gnome(monkeypatch):
+    from dva import hardware
+    if os.name == "nt":
+        return
+    monkeypatch.setattr(hardware.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(hardware.shutil, "which", lambda name: "/usr/bin/gdbus")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+    assert hardware.user_idle_seconds(lambda cmd, timeout=3: "(uint64 90500,)\n") == 90.5
+    assert hardware.user_idle_seconds(lambda cmd, timeout=3: "") is None              # not GNOME (kiosk, KDE)

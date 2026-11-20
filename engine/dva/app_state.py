@@ -36,7 +36,7 @@ STATE = None
 
 DEFAULT_SETTINGS = {
     "default_harness": "agent", "default_compute": "auto", "default_ctx": 8192, "max_reply_tokens": 2048,
-    "unload_after_minutes": 20, "engine_memory_percent": 85, "explore_when_idle": True, "explore_idle_minutes": 30, "suggestions_enabled": False, "memory_enabled": True, "learn_enabled": True, "learn_delay_seconds": 45,
+    "unload_after_minutes": 20, "engine_memory_percent": 85, "explore_when_idle": True, "explore_idle_minutes": 30, "explore_evaluate": True, "suggestions_enabled": False, "memory_enabled": True, "learn_enabled": True, "learn_delay_seconds": 45,
     "allow_python": True, "approval_timeout_minutes": 360, "max_native_tools": 47, "python_timeout_seconds": 180,
     # 2.19.0: the most a tool call may ask for a program's time, and how many programs agents may run at once
     "code_timeout_max_seconds": 900, "code_runs_at_once": 2,

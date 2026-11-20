@@ -313,16 +313,17 @@ function ExploreCard({ s, set }: { s: any; set: (v: any) => void }) {
   return (
     <div className="card stack-s">
       <h3>Finding better ways, on its own</h3>
-      <p className="muted small">When nothing is running, the computer is plugged in and has been idle for a while, KimiLM measures the fastest setup of a model that has not been measured (at most once a day). Anything you start stops it at once. What it finds is offered on the model's card as the suggested configuration; nothing changes on its own.</p>
+      <p className="muted small">When nothing is running, the computer is plugged in and nobody has used it for a while, KimiLM measures the fastest setup of a model that has not been measured (at most once a day), and evaluates a model that never was (at most once a week). Anything you start, or using the computer again, stops it at once. What it finds is offered on the model's card and in the evaluation list; nothing changes on its own.</p>
       <Toggle checked={s.explore_when_idle ?? true} onChange={(v: boolean) => set({ explore_when_idle: v })} label="Measure better setups while idle" />
       <Toggle checked={s.suggestions_enabled ?? false} onChange={(v: boolean) => set({ suggestions_enabled: v })} label="Suggest better ways of working from my own chats (for example, a request I make every day becomes a scheduled task). Looks only at KimiLM's chats on this computer; nothing is sent anywhere; nothing happens without my yes." />
-      <Field label="Idle time first (minutes)" help="No chat, task or model in use for this long.">
+      <Toggle checked={s.explore_evaluate ?? true} onChange={(v: boolean) => set({ explore_evaluate: v })} label="Also run the evaluation (12 tasks) for a model that was never evaluated, at most once a week" />
+      <Field label="Idle time first (minutes)" help="No chat, task or model in use, and no keyboard or mouse input where the desktop can tell, for this long.">
         <input className="input narrow" type="number" min={5} value={s.explore_idle_minutes ?? 30} onChange={(e) => set({ explore_idle_minutes: Number(e.target.value) })} />
       </Field>
       {st && <div className="small muted">
         {st.current ? `Measuring ${st.current.model_id} now.` : `Not measuring now: ${st.reason}.`}
         {st.history?.length > 0 && <ul className="tight">{[...st.history].reverse().slice(0, 5).map((h: any, i: number) =>
-          <li key={i}>{new Date(h.at).toLocaleString()} · {h.model_id} · {h.result || "?"}{h.best ? ` (fastest: ${h.best})` : ""}{h.stopped ? ` · stopped: ${h.stopped}` : ""}</li>)}</ul>}
+          <li key={i}>{new Date(h.at).toLocaleString()} · {h.what || "fastest setup"} · {h.model_id} · {h.result || "?"}{h.best ? ` (fastest: ${h.best})` : ""}{h.of ? ` (${h.passed} of ${h.of})` : ""}{h.stopped ? ` · stopped: ${h.stopped}` : ""}</li>)}</ul>}
       </div>}
     </div>
   );

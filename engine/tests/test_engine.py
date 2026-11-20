@@ -71,7 +71,8 @@ def engine():
     env = {**os.environ, "DVA_TEST_CPU": "6x12", "DVA_TOKEN": token, "DVA_LLAMA_SERVER": str(wrapper), "DVA_SECRETS": "file",
            "DVA_SD_CLI": str(painter), "DVA_SOUND_WORKER": str(TESTS / "fake_sound_worker.py"),
            "DVA_SOUND_LIBRARY": "2.0.1", "DVA_SOUND_LOG": str(tmp / "sound-jobs.log"),
-           "PYTHONPATH": str(ENGINE), "OLLAMA_MODELS": str(tmp / "ollama"), "HF_HOME": str(tmp / "hf")}
+           "PYTHONPATH": str(ENGINE), "OLLAMA_MODELS": str(tmp / "ollama"), "HF_HOME": str(tmp / "hf"),
+           "DVA_SYSTEM_PLUGINS": str(tmp / "system-plugins")}      # 2.24.0: not the computer's (KimiOS installs one)
     # 2.21.0: the engine under test has no internet, on any computer (the tests never need it; a test such as
     # research_without_internet failed where a real search found real sources). Only this computer is reached.
     for k in [k for k in env if k.lower() in ("http_proxy", "https_proxy", "all_proxy", "no_proxy")]:
