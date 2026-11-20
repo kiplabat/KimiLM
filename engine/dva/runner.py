@@ -267,6 +267,47 @@ SAVE_RULE = ("Tool results: any tool call can take one more argument, save_to (a
              "with run_python; do not call the tool again for the same thing.")
 
 
+def describe_settings(app, harness, model_id, limits, auto=False, route_reason="", server=None, run_fit=None):
+    """2.26.0: what a chat runs with, and who set each value: you (the chat's limits), the harness, the app's
+    settings, or KimiLM sizing it for the chat. Shown in the chat's pickers, before and after a reply."""
+    lim, h, db = limits or {}, harness or {}, app.db
+
+    def pick(key, default, setting=None):
+        if lim.get(key) not in (None, ""):
+            return lim[key], "you"
+        if h.get(key) not in (None, ""):
+            return h[key], "harness"
+        if setting and db.setting(setting) not in (None, ""):
+            return db.setting(setting), "settings"
+        return default, "default"
+    local = bool(model_id) and model_id != "auto" and not is_cloud(model_id)
+    out = {"model": model_id, "auto": bool(auto), "route_reason": route_reason or "", "harness": h.get("name"),
+           "harness_id": h.get("id"), "local": local}
+    row = app.models.get_any(model_id) if model_id and model_id != "auto" else None
+    out["model_name"] = (row or {}).get("name") or model_id
+    for key, default, setting in (("max_steps", 10, None), ("max_reply_tokens", 2048, "max_reply_tokens"),
+                                  ("time_limit_minutes", 30, "turn_time_limit_minutes"),
+                                  ("max_tool_calls", 40, None), ("max_searches", 6, None)):
+        out[key], out[key + "_by"] = pick(key, default, setting)
+    out["temperature"], out["temperature_by"] = pick("temperature", 0.4)
+    plan = (getattr(server, "plan", None) or {}) if server is not None else {}
+    if not plan and local:                     # nothing running yet: as it is loaded now, else its own setting
+        loaded = app.runtime.servers.get(model_id)
+        plan = loaded.plan if loaded is not None and loaded.alive else {}
+    ceiling = app.runtime.ceiling(model_id) if local else 0
+    if lim.get("ctx"):
+        out["ctx"], out["ctx_by"] = int(plan.get("ctx") or lim["ctx"]), "you"
+    elif plan.get("ctx"):
+        out["ctx"] = int(plan["ctx"])
+        out["ctx_by"] = "run" if run_fit is not None else "sized" if out["ctx"] != ceiling else "model"
+    elif local:
+        out["ctx"], out["ctx_by"] = ceiling, "model"
+    out["ctx_max"] = (app.runtime.trained_ctx(model_id) or None) if local else None
+    system = set(app.connectors.system_ids()) if h.get("mode") != "chat" and h.get("connectors", True) else set()
+    out["system_connectors"] = [c.get("name") or c["id"] for c in app.connectors.all() if c["id"] in system]
+    return out
+
+
 class Turn:
     def __init__(self, app, chat_id, job):
         self.app, self.db = app, app.db
@@ -311,6 +352,7 @@ class Turn:
         self.fast = bool(team)                    # an agent of a run fails fast (2.20.0): see flag_failure
         self.flagged = None                       # the register entry this agent wrote, once it could not finish
         self.guard = LoopGuard(self)
+        self.ctx_need = 0                         # context this turn found it needs (it ran out once): 2.26.0
 
     # ------------------------------------------------------------------ settings
     @property
@@ -334,7 +376,7 @@ class Turn:
             if self.run_fit is not None and not is_cloud(self.model_id):
                 overrides = self.run_fit.overrides(self.app.runtime, self.model_id)
             elif not is_cloud(self.model_id) and self.model_id:
-                overrides = self.app.runtime.keep(self.model_id, self.rough_need())
+                overrides = self.chat_overrides()
             self._lease = self.app.runtime.lease(self.model_id, on_wait=self.status, overrides=overrides)
             try:
                 self.server = await self._lease.__aenter__()
@@ -347,6 +389,41 @@ class Turn:
                 raise
             if self.ctx is not None:
                 self.ctx.model_id = self.model_id
+            self.record_effective()
+
+    def chat_overrides(self):
+        """2.26.0: how a chat's model is loaded when no planned run sizes it. The context set in the chat's limits
+        wins; otherwise the context is sized for this chat (its history, the tools, its steps and the reply), larger
+        than the model's own setting when it needs it and memory allows. None: the model as set in Models."""
+        rt = self.app.runtime
+        asked = int(self.limits.get("ctx") or 0)
+        if asked:
+            trained = rt.trained_ctx(self.model_id) or asked
+            return {"ctx": max(2048, min(asked, trained)), "parallel": 1}
+        need = self.rough_need()
+        if self.harness.get("mode", "agent") != "chat":
+            steps = int(self.limits.get("max_steps") or self.harness.get("max_steps") or 10)
+            need += min(steps * 900, 6000)
+        need = max(need, self.ctx_need)
+        kept = rt.keep(self.model_id, need)
+        if kept:
+            return kept
+        if self.ctx_need or self.db.setting("fit_context", True):
+            return rt.size_for(self.model_id, need)
+        return None
+
+    def effective(self):
+        return describe_settings(self.app, self.harness, self.model_id, self.limits, auto=self.auto,
+                                 route_reason=self.route_reason, server=self.server, run_fit=self.run_fit)
+
+    def record_effective(self):
+        try:
+            eff = self.effective()
+        except Exception as exc:                 # never fails a reply
+            self.app.log(f"effective settings: {type(exc).__name__}: {exc}")
+            return
+        self.db.set_setting(f"chat_effective:{self.chat['id']}", eff)
+        self.emit("effective", effective=eff)
 
     async def drop_model(self):
         lease, self._lease = self._lease, None
@@ -1123,6 +1200,54 @@ class Turn:
             await self.app.runtime.restart(server)
         await self.hold_model()
 
+    async def make_room(self, exc, messages, reply_tokens):
+        """2.26.0: the conversation outgrew the model's context. Load the model larger (up to what it was trained
+        for and what memory allows) and try again; when it cannot grow, shorten the older tool results instead."""
+        m = re.search(r"n_prompt_tokens\"?\s*:\s*(\d+)", str(exc))
+        prompt = int(m.group(1)) if m else sum(estimate_tokens(x["content"] if isinstance(x.get("content"), str)
+                                                               else json.dumps(x.get("content"), default=str))
+                                               for x in messages)
+        need = int((prompt + reply_tokens) * 1.25) + 2048
+        current = int((self.server.plan or {}).get("ctx") or 0) if self.server is not None else 0
+        bigger = None
+        if self.run_fit is not None:
+            self.run_fit.grow(self.model_id, need)
+            bigger = self.run_fit.overrides(self.app.runtime, self.model_id)
+        else:
+            self.ctx_need = max(self.ctx_need, need)
+            bigger = self.app.runtime.size_for(self.model_id, need)
+        if bigger and int(bigger.get("ctx") or 0) > current:
+            self.note(f"The conversation outgrew the model's context ({current:,} tokens). Loading it with "
+                      f"{int(bigger['ctx']):,} and going on.")
+            await self.drop_model()
+            await self.hold_model()
+            if int((self.server.plan or {}).get("ctx") or 0) > current:
+                return
+        if self.shorten_results(messages):
+            self.note(f"The model's context ({current:,} tokens) is full and memory does not allow a larger one: "
+                      "older tool results were shortened to make room.")
+            return
+        raise self.context_gave_up(exc)
+
+    @staticmethod
+    def shorten_results(messages, keep_last=2, head=400):
+        """Shorten every tool result but the last few. Returns whether anything changed."""
+        idx = [i for i, m in enumerate(messages) if m.get("role") == "tool" and isinstance(m.get("content"), str)]
+        changed = False
+        for i in idx[:-keep_last] if keep_last else idx:
+            text = messages[i]["content"]
+            if len(text) > head + 200:
+                messages[i] = {**messages[i], "content": text[:head] + f"\n[… {len(text) - head:,} more characters "
+                               "left out to fit the model's context; run the tool again if you need them]"}
+                changed = True
+        return changed
+
+    @staticmethod
+    def context_gave_up(exc):
+        return TurnStopped("The conversation does not fit the model's context, even after loading it larger and "
+                           f"shortening older results ({str(exc)[:160]}). Start a new chat for the next part, set a "
+                           "larger Context in this chat's Limits, or use a model with a longer context.")
+
     @staticmethod
     def gave_up(exc):
         return TurnStopped(f"The model stopped responding twice in a row ({str(exc)[:200]}). It was restarted in "
@@ -1165,6 +1290,13 @@ class Turn:
             if buffer:                              # drop the half-written text; it is written again
                 self.emit("text_replace", text="")
             return await self.stream_text(messages, tools, final=final, max_tokens=max_tokens, _retry=True)
+        except LLMContextFull as exc:
+            if is_cloud(self.model_id) or _retry == "context":
+                raise self.context_gave_up(exc) from exc
+            await self.make_room(exc, messages, int(max_tokens or self.max_reply))
+            if buffer:
+                self.emit("text_replace", text="")
+            return await self.stream_text(messages, tools, final=final, max_tokens=max_tokens, _retry="context")
         self._count(end)
         self._last_native = end.get("native")
         text = "".join(buffer)

@@ -2,7 +2,7 @@ import React, { useEffect, useState } from "react";
 import { FolderOpen } from "lucide-react";
 import { api, desktop } from "../api";
 import { go, useApp, useShown } from "../store";
-import { Badge, Button, Field, FolderInput, PageHeader, Toggle } from "../components/ui";
+import { Badge, Button, ConfirmButton, Field, FolderInput, PageHeader, Toggle } from "../components/ui";
 
 // The built-in evaluation: twelve small tasks with answers that code checks. It turns "is this setup good?" into
 // numbers that can be compared between models, settings and versions.
@@ -37,6 +37,7 @@ function EvaluationCard() {
   }, [!!data?.current, shown]);
   const dur = (sec: number) => sec < 90 ? `${Math.round(sec)} s` : sec < 5400 ? `${Math.round(sec / 60)} min` : `${(sec / 3600).toFixed(1)} h`;
   const k = (n: number) => n >= 10000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n || 0);
+  const act = async (path: string, method: "post" | "del" = "post") => { try { await (api as any)[method](path); load(); } catch (e: any) { toast(e.message, "error"); } };
   const run = async () => { try { await api.post("/evals/run", model ? { model } : {}); load(); } catch (e: any) { toast(e.message, "error"); } };
   const two = picked.map((id) => data?.runs?.find((r: any) => r.id === id)).filter(Boolean);
   const [a, b] = two.length === 2 ? [...two].sort((x: any, y: any) => String(x.created).localeCompare(String(y.created))) : [null, null];
@@ -47,8 +48,11 @@ function EvaluationCard() {
       <p className="muted small">Runs {data?.tasks?.length || 12} small tasks (reading and computing, writing and editing files, fixing code, finding things, summarising, one planned run) with your default model and checks each answer in code. No internet, nothing personal, approvals off inside the test folder only. Use it to compare models, settings and versions on this computer. On a slow laptop it can take an hour or more.</p>
       <div className="row gap-m wrap">
         {data?.current
-          ? <><span className="small"><b>Running:</b> task {data.current.done + 1} of {data.current.total} · {data.current.task}</span>
-              <Button small kind="ghost" onClick={async () => { await api.post("/evals/stop"); load(); }}>Stop</Button></>
+          ? <><span className="small"><b>{data.current.paused ? "Paused" : "Running"}:</b> task {data.current.done + 1} of {data.current.total} · {data.current.task}</span>
+              {data.current.paused
+                ? <Button small kind="primary" onClick={() => act("/evals/resume")} title="Go on with the task where it paused">Resume</Button>
+                : <Button small onClick={() => act("/evals/pause")} title="The task stops at its next step and gives its model back; time paused does not count">Pause</Button>}
+              <Button small kind="ghost" onClick={() => act("/evals/stop")} title="End it now. Finished tasks are kept and it can be continued later">Stop</Button></>
           : <>
               <select className="input" style={{ maxWidth: 280 }} value={model} onChange={(e) => setModel(e.target.value)} title="The model to test">
                 <option value="">Default model</option>
@@ -65,9 +69,13 @@ function EvaluationCard() {
           <div key={r.id}>
             <div className="eval-row small" onClick={() => setOpen(open === r.id ? null : r.id)} title="Show each task">
               <span><input type="checkbox" checked={picked.includes(r.id)} onClick={(e) => e.stopPropagation()} onChange={() => pick(r.id)} title="Compare" />{new Date(r.created).toLocaleString()}</span><span>{r.version}</span><span className="ellipsis">{r.model || "default"}</span>
-              <span><b>{r.summary?.passed ?? 0} of {r.summary?.total ?? "?"}</b>{r.status !== "done" ? ` (${r.status})` : ""}</span>
+              <span><b>{r.summary?.passed ?? 0} of {r.summary?.total ?? "?"}</b>{r.status !== "done" ? ` (${r.status === "interrupted" ? "cut off" : r.status})` : ""}{r.can_continue ? " · open to continue" : ""}</span>
               <span>{dur(r.summary?.seconds || 0)}</span><span>{k(r.summary?.read)}</span><span>{r.summary?.cache_percent ?? 0}%</span><span>{k(r.summary?.written)}</span>
             </div>
+            {open === r.id && <div className="row gap-s eval-actions">
+              {r.can_continue && <Button small kind="primary" onClick={() => act(`/evals/${r.id}/continue`)} title="Run the tasks that were not done, with the same model; finished tasks are kept">Continue ({(r.summary?.total ?? 0) - (r.results?.length ?? 0)} left)</Button>}
+              {!(data.current && data.current.id === r.id) && <ConfirmButton small onConfirm={() => act(`/evals/${r.id}`, "del")} title="Take this evaluation off the list, with its task chats">Delete</ConfirmButton>}
+            </div>}
             {open === r.id && <div className="eval-tasks">
               {(r.results || []).map((t: any) => (
                 <div key={t.id} className="eval-task small" onClick={() => t.chat_id && go("chat", t.chat_id)} title="Open the chat of this task">

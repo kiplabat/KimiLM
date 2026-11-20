@@ -151,6 +151,9 @@ def test_evaluation_releases_other_models_first_and_all_idle_models_at_the_end(t
         def update(self, *a, **k):
             pass
 
+        def all(self, *a, **k):
+            return []
+
         def setting(self, key, default=None):
             return default
 
@@ -414,3 +417,62 @@ def test_arm64_linux_gets_its_own_llama_builds(monkeypatch):
     monkeypatch.setattr(images.sys, "platform", "linux")
     monkeypatch.setattr(images.platform, "machine", lambda: "aarch64")
     assert images.os_key() == "linux-arm64" and images.SD_ASSETS.get("linux-arm64") is None   # no image engine build
+
+
+# ---------------------------------------------------------------------------------------------- 2.26.0
+def test_a_value_that_repeats_the_whole_call_is_unwrapped_or_refused():
+    from dva import toolcheck
+    from dva.tools import Tool
+    tool = Tool("run_python", "Run Python", {"type": "object", "properties": {"code": {"type": "string"}},
+                                              "required": ["code"]}, None, "python")
+    tm = {"run_python": tool}
+    whole = json.dumps({"code": "print(37 * 481 + 12)"})
+    out = toolcheck.repair(tm, "run_python", {"code": whole})
+    assert out["error"] is None and out["args"]["code"] == "print(37 * 481 + 12)" and out["notes"]
+    cut = '{"code":"import numpy as np\\nK = 2.0\\nsettled_idx'
+    out = toolcheck.repair(tm, "run_python", {"code": cut})
+    assert out["error"] and "cut off" in out["error"]
+    plain = toolcheck.repair(tm, "run_python", {"code": "x = {'code': 1}"})
+    assert plain["error"] is None and plain["args"]["code"] == "x = {'code': 1}"
+
+
+def test_a_lease_whose_task_ended_does_not_keep_a_model_in_use():
+    from dva.runtime import Server
+
+    async def main():
+        s = Server({"id": "m"}, {"ctx": 8192}, "k")
+
+        async def holder(leak):
+            token = s.hold()
+            if not leak:
+                s.let_go(token)
+        await asyncio.create_task(holder(False))
+        assert s.users == 0
+        await asyncio.create_task(holder(True))       # never gave it back: its task is gone, so it does not count
+        assert s.users == 0 and not s.holder_tasks()
+        token = s.hold()                               # held by this task, which is still running
+        assert s.users == 1 and s.holder_tasks()
+        s.let_go(token)
+        assert s.users == 0
+    asyncio.run(main())
+
+
+def test_older_tool_results_are_shortened_to_fit_the_context():
+    from dva.runner import Turn
+    msgs = [{"role": "system", "content": "s"}] + [{"role": "tool", "content": "x" * 5000} for _ in range(4)]
+    assert Turn.shorten_results(msgs)
+    assert [len(m["content"]) < 1000 for m in msgs[1:]] == [True, True, False, False]   # the last two are kept
+    assert not Turn.shorten_results(msgs[:1])
+
+
+def test_a_run_that_ran_out_of_context_may_load_its_model_larger():
+    from dva.orchestrator import RunFit
+
+    class RT:
+        def fit(self, model_id, need, parallel=1, top=None):
+            return {"ctx": min(need, max(8192, top or 0)), "parallel": parallel}
+    fit = RunFit()
+    fit.want("m", 20000)
+    assert fit.overrides(RT(), "m")["ctx"] == 8192         # the model's own setting is the ceiling…
+    fit.grow("m", 20000)
+    assert fit.overrides(RT(), "m")["ctx"] == 20000        # …until a step ran out of context

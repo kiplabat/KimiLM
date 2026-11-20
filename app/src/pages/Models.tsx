@@ -294,10 +294,19 @@ function Installed() {
           {modelStatus.state === "failed" && <div className="error-line">{modelStatus.error}</div>}
           {(data.loaded || []).map((l: any) => (
             <div key={l.model_id} className="loaded-row">
-              <div><b>{l.model_id}</b> {l.vision && <Eye size={13} className="accent" />} <span className="muted small">· {l.compute?.toUpperCase()} ({l.backend}) · context {l.ctx?.toLocaleString()}{l.parallel > 1 ? ` · ${l.parallel} replies at once` : ""} · about {(l.memory_mb / 1024).toFixed(1)} GB{l.users ? ` · in use (${l.users})` : ""}</span>
+              <div><b>{l.model_id}</b> {l.vision && <Eye size={13} className="accent" />} <span className="muted small">· {l.compute?.toUpperCase()} ({l.backend}) · context {l.ctx?.toLocaleString()}{l.parallel > 1 ? ` · ${l.parallel} replies at once` : ""} · about {(l.memory_mb / 1024).toFixed(1)} GB{l.users ? ` · in use by ${(l.held_by || []).join(", ") || l.users}` : ""}</span>
                 <div className="small">{placementText(l)}</div>
                 {l.note && <div className="warn-line small"><AlertTriangle size={12} /> {l.note}</div>}</div>
-              <Button small disabled={l.users > 0} onClick={async () => { try { await api.post("/runtime/unload", { model_id: l.model_id }); load(); } catch (e: any) { toast(e.message, "error"); } }}>Unload</Button>
+              {(() => {
+                const busy = l.users > 0;
+                const unload = async () => {
+                  try { const r = await api.post("/runtime/unload", { model_id: l.model_id, force: busy }); if (r.stopped?.length) toast(`Stopped ${r.stopped.join(", ")} and unloaded ${l.model_id}`); load(); }
+                  catch (e: any) { toast(e.message, "error"); }
+                };
+                return busy
+                  ? <ConfirmButton small onConfirm={unload} title={`In use by ${(l.held_by || []).join(", ") || "a task"}: unloading stops it first (what it finished is kept)`}>Stop and unload</ConfirmButton>
+                  : <Button small onClick={unload} title="Give its memory back now">Unload</Button>;
+              })()}
             </div>
           ))}
           <p className="muted small">Several models can be loaded at once (up to {boot.settings.max_loaded_models || 3}, if memory allows) so agents can work in parallel. Idle models unload after {boot.settings.unload_after_minutes || 20} minutes.</p>

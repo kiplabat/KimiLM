@@ -373,16 +373,48 @@ class Jobs:
 
     def paused(self, job_id):
         ctl = self.controls.get(job_id)
-        return bool(ctl and ctl.paused)
+        if ctl:
+            return bool(ctl.paused)
+        kind, chat_id = self._pausable(job_id)
+        if kind == "eval":
+            return bool((self.app.evals.current or {}).get("paused"))
+        if kind == "chat":
+            from .orchestrator import is_paused
+            return is_paused(self.app, chat_id)
+        return False
+
+    def _pausable(self, job_id):
+        """2.26.0: besides media work (frozen where it is), a chat reply or agent pauses at its next step and gives
+        its model back, and an evaluation pauses its current task. -> ("media" | "chat" | "eval" | None, chat id)"""
+        if job_id in self.controls:
+            return "media", None
+        if job_id not in self.tasks:
+            return None, None
+        row = self.db.get("jobs", job_id) or {}
+        if row.get("kind") == "eval":
+            return ("eval", None) if (self.app.evals.current or {}).get("job_id") == job_id else (None, None)
+        if row.get("chat_id") and row.get("kind") not in ("images", "sound", "video", "download", "install"):
+            return "chat", row["chat_id"]
+        return None, None
+
+    def can_pause(self, job_id):
+        return self._pausable(job_id)[0] is not None
 
     def _said(self, job_id):
         row = self.db.get("jobs", job_id) or {}
         self.app.bus.publish("job", id=job_id, status=row.get("status"), title=row.get("title"), job_kind=row.get("kind"),
                              chat_id=row.get("chat_id"), progress=self.live.get(job_id), paused=self.paused(job_id),
-                             can_pause=job_id in self.controls)
+                             can_pause=self.can_pause(job_id))
 
     def pause(self, job_id):
         """Freeze a running task where it is. False when this task cannot be paused."""
+        kind, chat_id = self._pausable(job_id)
+        if kind in ("chat", "eval"):
+            from .orchestrator import pause_chat
+            self.app.evals.pause() if kind == "eval" else pause_chat(self.app, chat_id, "paused by you")
+            self.trail(job_id, "Paused: it stops at its next step and gives its model back", "note")
+            self._said(job_id)
+            return True
         ctl = self.controls.get(job_id)
         if not ctl or job_id not in self.tasks:
             return False
@@ -406,6 +438,13 @@ class Jobs:
 
     def resume(self, job_id):
         """Let a paused task go on from where it was."""
+        kind, chat_id = self._pausable(job_id)
+        if kind in ("chat", "eval"):
+            from .orchestrator import resume_chat
+            self.app.evals.resume() if kind == "eval" else resume_chat(self.app, chat_id)
+            self.trail(job_id, "Continued", "note")
+            self._said(job_id)
+            return True
         ctl = self.controls.get(job_id)
         if not ctl or job_id not in self.tasks:
             return False
@@ -418,6 +457,14 @@ class Jobs:
             self.trail(job_id, "Continued", "note")
             self._said(job_id)
             ctl.tell()
+        return True
+
+    def forget(self, job_id):
+        """Take a finished task off the Activity list (2.26.0). A running one has to be stopped first."""
+        if job_id in self.tasks:
+            raise ValueError("Stop it first; a task that is still working stays on the list.")
+        self.db.delete("jobs", job_id)
+        self.app.bus.publish("job", id=job_id, status="forgotten")
         return True
 
     def cancel(self, job_id):
@@ -456,7 +503,7 @@ class Jobs:
             r["fraction"] = self.fraction.get(r["id"])
             r["pace"] = self.pace.get(r["id"])
             r["paused"] = self.paused(r["id"])
-            r["can_pause"] = r["id"] in self.controls
+            r["can_pause"] = self.can_pause(r["id"])
         return rows
 
     def get(self, job_id):
@@ -470,7 +517,7 @@ class Jobs:
             row["fraction"] = self.fraction.get(job_id)
             row["pace"] = self.pace.get(job_id)
             row["paused"] = self.paused(job_id)
-            row["can_pause"] = job_id in self.controls
+            row["can_pause"] = self.can_pause(job_id)
         return row
 
     async def shutdown(self):

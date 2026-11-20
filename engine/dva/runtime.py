@@ -70,7 +70,7 @@ class Server:
         self.api_key = api_key
         self.port = None
         self.proc = None
-        self.users = 0
+        self.holders = {}           # asyncio task -> leases it holds (2.26.0: who is using the model)
         self.last_used = time.monotonic()
         self.loaded_at = None
         self.need_bytes = 0
@@ -81,6 +81,29 @@ class Server:
         self.served = False         # it has answered a request: its slot holds a prompt worth keeping
         self.no_snapshots = False
         self.snapshot = None        # the last snapshot used: {"tokens": n, "restored": bool}
+
+    @property
+    def users(self):
+        """Leases held right now. A lease whose task has ended without giving the model back (a leak) no longer
+        counts, so a model is never "in use" by work that is gone."""
+        for task in [t for t in self.holders if t is not None and t.done()]:
+            self.holders.pop(task, None)
+        return sum(self.holders.values())
+
+    def hold(self):
+        task = asyncio.current_task()
+        self.holders[task] = self.holders.get(task, 0) + 1
+        return task
+
+    def let_go(self, task):
+        n = self.holders.get(task, 0) - 1
+        if n > 0:
+            self.holders[task] = n
+        else:
+            self.holders.pop(task, None)
+
+    def holder_tasks(self):
+        return [t for t in self.holders if t is not None and not t.done()]
 
     @property
     def base_url(self):
@@ -708,14 +731,14 @@ class Runtime:
                     on_wait(f"Waiting for memory: {busy} is busy…")
                     waited = True
                 await self.cond.wait()
-            server.users += 1
+            holder = server.hold()
             self.last_server = server
         token = ACTIVE.set(server)
         try:
             server.last_used = self.last_used = time.monotonic()
             yield server
         finally:
-            server.users -= 1                 # first: nothing below may stop the model being released
+            server.let_go(holder)             # first: nothing below may stop the model being released
             server.last_used = self.last_used = time.monotonic()
             try:
                 ACTIVE.reset(token)
@@ -771,11 +794,47 @@ class Runtime:
         model = self.db.get("models", model_id) or {}
         return int((model.get("settings") or {}).get("ctx") or self.db.setting("default_ctx", 8192))
 
-    def fit(self, model_id, need_tokens, parallel=1):
+    def trained_ctx(self, model_id):
+        """The longest context the model was trained for (from its file), or 0 when unknown."""
+        model = self.db.get("models", model_id) or {}
+        try:
+            meta = self._meta(model) or {}
+        except Exception:
+            meta = model.get("meta") or {}
+        for key, value in (meta or {}).items():
+            if str(key).endswith(".context_length"):
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return 0
+        return 0
+
+    def size_for(self, model_id, need_tokens):
+        """2.26.0: the context a chat is loaded with when it needs more than the model's own setting. The smallest
+        step that holds the need, up to what the model was trained for, and only as large as memory allows now
+        (what is free plus what idle models would give back). None: the model's own setting is enough, or nothing
+        larger fits."""
+        base = self.ceiling(model_id)
+        if need_tokens <= base:
+            return None
+        trained = self.trained_ctx(model_id) or 32768
+        steps = [c for c in CTX_STEPS if base < c <= trained]
+        want = next((c for c in steps if c >= need_tokens), steps[-1] if steps else None)
+        while want:
+            over = {"ctx": want, "parallel": 1}
+            m = self.memory(model_id, over)
+            if m["need"] <= m["free"] + m["reclaimable"]:
+                return over
+            smaller = [c for c in steps if c < want]
+            want = smaller[-1] if smaller else None
+        return None
+
+    def fit(self, model_id, need_tokens, parallel=1, top=None):
         """Settings for loading a model for a run that needs `need_tokens` of context per reply: the smallest
-        step that holds it (never more than the user's own setting), and only as many reply slots as the run
-        uses. A model that is already loaded a little larger is kept as it is, so it is not loaded twice."""
-        top = self.ceiling(model_id)
+        step that holds it (never more than the user's own setting, or `top` when the run had to grow past it),
+        and only as many reply slots as the run uses. A model that is already loaded a little larger is kept as
+        it is, so it is not loaded twice."""
+        top = max(self.ceiling(model_id), int(top or 0))
         want = next((c for c in CTX_STEPS if c >= need_tokens), CTX_STEPS[-1])
         want = max(min(want, top), min(4096, top))
         parallel = max(1, int(parallel or 1))
@@ -836,6 +895,12 @@ class Runtime:
                 self.cond.notify_all()
                 return True
         return False
+
+    def holders_of(self, model_id=None):
+        """The tasks using a model (or any model) right now."""
+        targets = [self.servers[model_id]] if model_id and model_id in self.servers else \
+            list(self.servers.values()) if not model_id else []
+        return [t for s in targets for t in s.holder_tasks()]
 
     async def unload(self, model_id=None):
         async with self.cond:
