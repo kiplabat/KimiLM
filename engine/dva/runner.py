@@ -522,6 +522,8 @@ class Turn:
         if team:                                   # this chat is an agent in a running team
             tools += team_tools(team[0], team[1], self)
         connector_ids = list(self.chat.get("connectors") or []) or list((self.project or {}).get("connectors") or [])
+        # 2.24.0: the operating system's own tools (KimiOS) come with every agent, like the built-in tools
+        connector_ids += [c for c in self.app.connectors.system_ids() if c not in connector_ids]
         connector_tools, connected = [], []
         if self.harness.get("connectors", True) and connector_ids:
             for cid in connector_ids:

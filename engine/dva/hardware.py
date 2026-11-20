@@ -330,3 +330,32 @@ def mount_drive(path, run=_run):
     if out and os.path.exists(str(path)):
         return True, f"mounted the drive {label!r}"
     return False, f"the drive {label!r} is not mounted and could not be mounted (open it in Files once)"
+
+
+# ---------------------------------------------------------------------------------------------- the person (2.24.0)
+def user_idle_seconds(run=_run):
+    """Seconds since the last keyboard or mouse input on this computer's desktop, or None when it cannot be told
+    (no desktop session, an unsupported desktop). GNOME on Linux (Mutter's idle monitor, also used by KimiOS's
+    GNOME session), Windows (GetLastInputInfo)."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class LASTINPUTINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+            info = LASTINPUTINFO()
+            info.cbSize = ctypes.sizeof(info)
+            if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+                return None
+            now_ms = ctypes.windll.kernel32.GetTickCount() & 0xFFFFFFFF
+            return ((now_ms - info.dwTime) & 0xFFFFFFFF) / 1000
+        except Exception:
+            return None
+    if platform.system() == "Linux" and shutil.which("gdbus") and os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        out = run(["gdbus", "call", "--session", "--dest", "org.gnome.Mutter.IdleMonitor",
+                   "--object-path", "/org/gnome/Mutter/IdleMonitor/Core",
+                   "--method", "org.gnome.Mutter.IdleMonitor.GetIdletime"], timeout=3)
+        m = re.search(r"uint64\s+(\d+)", out or "") or re.search(r"\((\d+),", out or "")   # "(uint64 90500,)"
+        return int(m.group(1)) / 1000 if m else None
+    return None

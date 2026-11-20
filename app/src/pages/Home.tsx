@@ -1,6 +1,7 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
-import { go, useApp } from "../store";
+import { go, useApp, useShown } from "../store";
+import { Button } from "../components/ui";
 import { Composer, ConnectorPicker, FolderPicker, HarnessPicker, ModelPicker, ThinkingToggle, uploadAll } from "../components/Pickers";
 
 const SUGGESTIONS = [
@@ -53,12 +54,41 @@ export default function Home({ projectId }: { projectId?: string }) {
             <FolderPicker value={folders} onChange={setFolders} inherited={project?.folders || []} />
             <ThinkingToggle value={thinking} onChange={setThinking} />
           </>} />
+        {!project && <BetterWays />}
         <div className="suggestions">
           {SUGGESTIONS.map((s) => (
             <button key={s.text} className="suggestion" onClick={() => { setHarness(s.harness); setPrefill(s.text); }}>{s.text}</button>
           ))}
         </div>
       </div>
+    </div>
+  );
+}
+
+// Better ways of working found in the user's own chats (2.24.0; opt-in in Settings, nothing leaves the computer)
+function BetterWays() {
+  const { toast } = useApp();
+  const shown = useShown();
+  const [items, setItems] = useState<any[]>([]);
+  const load = () => api.get("/suggestions").then((r: any) => setItems(r.items || [])).catch(() => {});
+  useEffect(() => { if (shown) load(); }, [shown]);
+  if (!items.length) return null;
+  return (
+    <div className="stack-s" style={{ marginTop: 12 }}>
+      {items.map((it) => (
+        <div key={it.id} className="card row gap-m wrap">
+          <div className="grow" style={{ minWidth: 0 }}>
+            <div className="small muted">{it.title}</div>
+            <div className="ellipsis">“{it.prompt}”</div>
+            <div className="small">{it.offer}</div>
+          </div>
+          <Button small onClick={async () => {
+            try { await api.post(`/suggestions/${it.id}/accept`); toast("Scheduled task created"); load(); go("schedules"); }
+            catch (e: any) { toast(e.message, "error"); }
+          }}>Make it a scheduled task</Button>
+          <button className="link small" onClick={async () => { await api.post(`/suggestions/${it.id}/dismiss`); load(); }}>No, never</button>
+        </div>
+      ))}
     </div>
   );
 }

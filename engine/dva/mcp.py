@@ -534,6 +534,12 @@ class Connectors:
         given no connectors gets these, so that what is installed is what it can use."""
         return [c["id"] for c in self.all() if c.get("enabled", True) and c.get("ready", True)]
 
+    def system_ids(self):
+        """Connectors the operating system installed (KimiOS's tool server, 2.24.0): every agent chat gets them,
+        as it gets the built-in tools, unless they are switched off in Plugins & connectors."""
+        return [c["id"] for c in self.plugins.connectors() if c.get("system") and c.get("enabled", True)
+                and c.get("ready", True)]
+
     async def learn(self, ids):
         """Make sure each of these servers has said what it offers (one connection each; kept for ten minutes).
         A server that cannot be reached is remembered with the reason and does not stop the others."""

@@ -212,7 +212,8 @@ class Plugins:
                 if values is None:
                     values = self.settings(plugin, reveal=True)
                 conf = {**c, "id": f"{plugin['id']}:{c['id']}", "source": f"plugin:{plugin['id']}",
-                        "plugin": plugin["id"], "enabled": self.db.item_enabled("connector", f"{plugin['id']}:{c['id']}")}
+                        "plugin": plugin["id"], "system": plugin.get("source") == "system",
+                        "enabled": self.db.item_enabled("connector", f"{plugin['id']}:{c['id']}")}
                 auth = c.get("auth") or {}
                 if auth.get("type") == "bearer":
                     conf["token"] = values.get(auth.get("setting"))
@@ -237,6 +238,7 @@ class Plugins:
                         "name": plugin["name"] if len(servers) == 1 else f"{plugin['name']}: {name}",
                         "description": entry["description"] or plugin.get("description", ""),
                         "source": f"plugin:{plugin['id']}", "plugin": plugin["id"],
+                        "system": plugin.get("source") == "system",
                         "enabled": self.db.item_enabled("connector", f"{plugin['id']}:{cid}"),
                         "command": fill(entry["command"]) if entry["command"] else "",
                         "args": [fill(a) for a in entry["args"]], "url": fill(entry["url"]) if entry["url"] else "",
