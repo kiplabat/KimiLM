@@ -46,7 +46,7 @@ export const canSee = (m: any) => !!(m?.settings?.mmproj && m?.settings?.vision 
 const cloudSees = (m: any) => !!m?.caps?.vision;
 const price = (m: any) => (m?.price?.out !== undefined ? `$${Number(m.price.in).toFixed(2)} / $${Number(m.price.out).toFixed(2)} per 1M` : "price unknown");
 
-export function ModelPicker({ value, onChange, allowDefault, chatId }: any) {
+export function ModelPicker({ value, onChange, allowDefault, chatId, effective }: any) {
   const { boot, toast } = useApp() as any;
   const models = boot?.models || [];
   const online = (boot?.cloud_models || []).filter((m: any) => m.enabled);
@@ -56,10 +56,10 @@ export function ModelPicker({ value, onChange, allowDefault, chatId }: any) {
   const chosen = value || (allowDefault ? "" : boot?.default_model);
   const local = models.find((m: any) => m.id === chosen);
   const cloud = online.find((m: any) => m.id === chosen) || (boot?.cloud_models || []).find((m: any) => m.id === chosen);
-  const label = chosen === "auto" ? "Auto" : local ? local.name : cloud ? cloud.name : (allowDefault ? "Same as the chat" : models.length || online.length ? "Auto" : "No model yet");
+  const label = chosen === "auto" ? (effective?.auto && effective?.model_name ? `Auto · ${effective.model_name}` : "Auto") : local ? local.name : cloud ? cloud.name : (allowDefault ? "Same as the chat" : models.length || online.length ? "Auto" : "No model yet");
   const icon = chosen === "auto" ? <Sparkles size={14} /> : cloud ? <Cloud size={14} /> : canSee(local) ? <Eye size={14} /> : <Cpu size={14} />;
   return (
-    <Popover label={label} icon={icon} title="Model: Auto, one on this computer, or an online one. The eye marks models that can see images and videos.">
+    <Popover label={label} icon={icon} title={effective?.auto && effective?.model_name ? `Auto chose ${effective.model_name}${effective.route_reason ? `: ${effective.route_reason}` : ""}` : "Model: Auto, one on this computer, or an online one. The eye marks models that can see images and videos."}>
       {(close: any) => (
         <div className="menu">
           {allowDefault && <div className={`menu-item${!value ? " selected" : ""}`} onClick={() => { onChange(""); close(); }}><div className="menu-title">Same as the chat</div></div>}
@@ -97,6 +97,7 @@ export function ModelPicker({ value, onChange, allowDefault, chatId }: any) {
 
 // Per-chat limits: reply length, steps, time, temperature, searches. Empty = the harness's own setting.
 const LIMITS = [
+  { key: "ctx", label: "Context (tokens)", help: "How much the model holds at once: the conversation, the tools and the files it read. Larger needs more memory. Empty: sized for this chat.", ph: "auto", step: 1024 },
   { key: "max_reply_tokens", label: "Reply length (tokens)", help: "Longest single reply. About 750 words per 1,000 tokens.", ph: "2048" },
   { key: "max_steps", label: "Steps", help: "Model calls with tools before it must write up.", ph: "harness" },
   { key: "time_limit_minutes", label: "Time limit (minutes)", help: "The agent stops and reports what it found.", ph: "30" },
@@ -105,13 +106,16 @@ const LIMITS = [
   { key: "temperature", label: "Creativity (0–1.5)", help: "Low = precise, high = varied.", ph: "harness", step: 0.1 },
 ];
 
-export function LimitsEditor({ value = {}, onChange, compact }: any) {
+const BY: any = { you: "set by you", harness: "from the harness", settings: "from Settings", default: "default", model: "the model's setting", sized: "sized for this chat", run: "sized for the planned run" };
+const short = (n: number) => n >= 1000 ? `${Math.round(n / 1024)}k` : String(n);
+
+export function LimitsEditor({ value = {}, onChange, compact, effective }: any) {
   return (
     <div className={compact ? "limits-grid compact" : "limits-grid"}>
       {LIMITS.map((l) => (
         <label key={l.key} className="limit" title={l.help}>
-          <span>{l.label}</span>
-          <input className="input narrow" type="number" min={0} step={l.step || 1} placeholder={l.ph} value={value[l.key] ?? ""}
+          <span>{l.label}{effective?.[l.key] != null && value[l.key] == null && <span className="muted small"> · {l.key === "ctx" ? Number(effective[l.key]).toLocaleString() : effective[l.key]} ({BY[effective[`${l.key}_by`]] || effective[`${l.key}_by`] || "in use"})</span>}</span>
+          <input className="input narrow" type="number" min={0} step={l.step || 1} placeholder={effective?.[l.key] != null ? String(effective[l.key]) : l.ph} value={value[l.key] ?? ""}
             onChange={(e) => onChange({ ...value, [l.key]: e.target.value === "" ? undefined : Number(e.target.value) })} />
         </label>
       ))}
@@ -119,16 +123,19 @@ export function LimitsEditor({ value = {}, onChange, compact }: any) {
   );
 }
 
-export function LimitsPicker({ value = {}, onChange }: any) {
+export function LimitsPicker({ value = {}, onChange, effective }: any) {
   const [draft, setDraft] = useState<any>(value || {});
   useEffect(() => setDraft(value || {}), [JSON.stringify(value || {})]);
-  const n = Object.keys(value || {}).length;
+  const n = Object.keys(value || {}).filter((k) => k !== "tools").length;
+  const ctx = (value || {}).ctx || effective?.ctx;
+  const steps = (value || {}).max_steps || effective?.max_steps;
+  const label = [ctx ? `${short(Number(ctx))} context` : "", steps ? `${steps} steps` : ""].filter(Boolean).join(" · ") || "Limits";
   return (
-    <Popover label={n ? `${n} limit${n > 1 ? "s" : ""}` : "Limits"} icon={<Gauge size={14} />} title="Limits for this chat (reply length, steps, time…)">
+    <Popover label={n ? `${label} · ${n} set` : label} icon={<Gauge size={14} />} title="Limits for this chat: context, reply length, steps, time… (what is in use now, and who set it)">
       {(close: any) => (
         <div className="menu pad">
-          <div className="menu-sub">Leave empty to use the harness's own settings.</div>
-          <LimitsEditor value={draft} onChange={setDraft} />
+          <div className="menu-sub">{effective ? <>In use{effective.model_name ? <> for <b>{effective.model_name}</b></> : null}{effective.harness ? <> with the <b>{effective.harness}</b> harness</> : null}. Leave a box empty to keep that value; type one to set it for this chat.{effective.ctx_max ? <> The model can hold up to {Number(effective.ctx_max).toLocaleString()} tokens.</> : null}</> : "Leave empty to use the harness's own settings."}</div>
+          <LimitsEditor value={draft} onChange={setDraft} effective={effective} />
           <div className="row gap-s"><Button small kind="primary" onClick={() => { onChange(draft); close(); }}>Save</Button>
             {n > 0 && <Button small kind="ghost" onClick={() => { onChange({}); close(); }}>Clear</Button>}</div>
         </div>
@@ -183,21 +190,28 @@ export function TeamPicker({ team, onChange }: any) {
   );
 }
 
-export function ConnectorPicker({ value = [], onChange }: any) {
+export function ConnectorPicker({ value = [], onChange, system = true }: any) {
   const [list, setList] = useState<any[]>([]);
   useEffect(() => { api.get("/connectors").then((r) => setList(r.connectors.filter((c: any) => c.enabled))); }, []);
-  const label = value.length ? `${value.length} connector${value.length > 1 ? "s" : ""}` : "No connectors";
+  // connectors of the operating system (KimiOS) are in every agent chat: shown ticked, not to be unticked here
+  const os = system ? list.filter((c: any) => c.system && c.ready !== false) : [];
+  const chosen = value.filter((id: string) => !os.some((c: any) => c.id === id));
+  const names = [...os.map((c: any) => c.name), ...(chosen.length ? [`${chosen.length} more`] : [])];
+  const label = names.length ? (os.length && !chosen.length ? os.map((c: any) => c.name).join(", ") : names.join(" + ")) : "No connectors";
   return (
     <Popover label={label} icon={<Plug size={14} />} title="Connectors (MCP) this chat may use">
       <div className="menu">
         {list.length === 0 && <div className="menu-sub pad">No connectors yet. Add them in Plugins & connectors.</div>}
-        {list.map((c: any) => (
-          <label key={c.id} className="menu-item row gap-s">
-            <input type="checkbox" checked={value.includes(c.id)} disabled={!c.ready}
-              onChange={(e) => onChange(e.target.checked ? [...value, c.id] : value.filter((x: string) => x !== c.id))} />
-            <div><div className="menu-title">{c.name}</div><div className="menu-sub">{c.ready ? (c.description || c.source) : "Needs its key — set it up in Plugins"}</div></div>
-          </label>
-        ))}
+        {list.map((c: any) => {
+          const always = os.some((o: any) => o.id === c.id);
+          return (
+            <label key={c.id} className="menu-item row gap-s" title={always ? "Part of the operating system: every agent chat has it. Switch it off in Plugins & connectors." : undefined}>
+              <input type="checkbox" checked={always || value.includes(c.id)} disabled={always || !c.ready}
+                onChange={(e) => onChange(e.target.checked ? [...value, c.id] : value.filter((x: string) => x !== c.id))} />
+              <div><div className="menu-title">{c.name}</div><div className="menu-sub">{always ? "Part of the operating system — always on" : c.ready ? (c.description || c.source) : "Needs its key — set it up in Plugins"}</div></div>
+            </label>
+          );
+        })}
       </div>
     </Popover>
   );

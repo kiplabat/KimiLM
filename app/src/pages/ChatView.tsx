@@ -610,6 +610,7 @@ export default function ChatView({ chatId }: { chatId: string }) {
       case "orchestra": update((l) => ({ ...l, orchestra: e })); break;
       case "paused": setChat((c: any) => c ? { ...c, paused: true } : c); update((l) => ({ ...l, status: `Paused: ${e.reason}` })); break;
       case "resumed": setChat((c: any) => c ? { ...c, paused: false } : c); break;
+      case "effective": setChat((c: any) => c ? { ...c, effective: e.effective } : c); break;
       case "agent_approval": update((l) => ({ ...l, approvals: [...l.approvals.filter((a: any) => a.approval_id !== e.approval_id), { ...e }], status: `Waiting for your approval (${e.agent})` })); break;
       case "agent_approval_done": update((l) => ({ ...l, approvals: l.approvals.filter((a: any) => a.approval_id !== e.approval_id) })); break;
       case "assistant_start": update((l) => ({ ...l, message_id: e.message_id, status: "Starting…" })); break;
@@ -756,8 +757,8 @@ export default function ChatView({ chatId }: { chatId: string }) {
             onStop={() => api.post(`/chats/${chatId}/stop`)}
             options={<>
               <HarnessPicker value={chat.harness} onChange={(v: string) => patch({ harness: v })} />
-              <ModelPicker value={chat.model} chatId={chat.id} onChange={(v: string) => patch({ model: v })} />
-              <LimitsPicker value={chat.settings || {}} onChange={(v: any) => patch({ settings: v })} />
+              <ModelPicker value={chat.model} chatId={chat.id} effective={chat.effective} onChange={(v: string) => patch({ model: v })} />
+              <LimitsPicker value={chat.settings || {}} effective={chat.effective} onChange={(v: any) => patch({ settings: v })} />
               {!chat.parent_chat_id && <TeamPicker team={team} onChange={setTeam} />}
               <ConnectorPicker value={chat.connectors || []} onChange={(v: string[]) => patch({ connectors: v })} />
               <FolderPicker value={chat.folders || []} onChange={(v: string[]) => patch({ folders: v })} inherited={project?.folders || []} />

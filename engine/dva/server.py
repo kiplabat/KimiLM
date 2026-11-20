@@ -111,7 +111,7 @@ def create_app(data_dir=None, resources_dir=None, token=None):
                            "privacy": a.db.setting("cloud_privacy", "ask"),
                            "ready": any(p["ready"] for p in a.providers.list())},
                 "runtime": {"installed": list(a.runtime.backends()), "status": a.runtime.status, "tag": a.runtime.tag,
-                            "loaded": a.runtime.loaded()},
+                            "loaded": a.loaded_with_holders()},
                 "harnesses": [{k: h.get(k) for k in ("id", "name", "description", "type", "mode", "enabled", "source", "error")}
                               for h in a.harnesses.all()],
                 "has_hf_token": a.secrets.has("hf_token")}
@@ -358,8 +358,19 @@ def create_app(data_dir=None, resources_dir=None, token=None):
 
     @api.post("/api/runtime/unload")
     async def runtime_unload(request: Request):
+        """Unload a model (or all). With force (2.26.0), whatever is using it is stopped first: the chat replies,
+        evaluations or tasks holding it are cancelled (what they finished is kept), then the model unloads."""
         data = await body(request) if request.headers.get("content-length") not in (None, "0") else {}
-        await A().runtime.unload((data or {}).get("model_id"))
+        a, model_id = A(), (data or {}).get("model_id")
+        if (data or {}).get("force"):
+            stopped = a.stop_holders(model_id)
+            for _ in range(60):                    # up to 15 s for them to give the model back
+                if not a.runtime.holders_of(model_id):
+                    break
+                await asyncio.sleep(0.25)
+            await a.runtime.unload(model_id)
+            return {"ok": True, "stopped": stopped}
+        await a.runtime.unload(model_id)
         return {"ok": True}
 
     # ------------------------------------------------------------------ pictures (2.11.0)
@@ -848,6 +859,24 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         data = await body(request)
         return A().evals.start(model=data.get("model"), only=data.get("only"))
 
+    @api.post("/api/evals/{run_id}/continue")
+    async def evals_continue(run_id: str):
+        return A().evals.continue_run(run_id)
+
+    @api.delete("/api/evals/{run_id}")
+    async def evals_delete(run_id: str):
+        out = A().evals.delete(run_id)
+        A().bus.publish("chats_changed")
+        return out
+
+    @api.post("/api/evals/pause")
+    async def evals_pause():
+        return A().evals.pause()
+
+    @api.post("/api/evals/resume")
+    async def evals_resume():
+        return A().evals.resume()
+
     @api.post("/api/evals/stop")
     async def evals_stop():
         a = A()
@@ -880,7 +909,7 @@ def create_app(data_dir=None, resources_dir=None, token=None):
                 except Exception as exc:          # a suggestion must never break the page
                     a.log(f"suggestion for {r['id']}: {type(exc).__name__}: {exc}")
         return {"models": rows, "default": a.models.default_model(), "status": a.runtime.status,
-                "loaded": a.runtime.loaded(),
+                "loaded": a.loaded_with_holders(),
                 "downloads": a.models.list_downloads()}
 
     @api.get("/api/models/catalog")
@@ -1191,6 +1220,11 @@ def create_app(data_dir=None, resources_dir=None, token=None):
                                       for k, v in a.approvals.items() if v.get("parent_chat_id") == chat_id]
         chat["memories"] = a.memory.list("chat", chat_id)
         chat["open_run"] = a.open_run(chat_id)       # a run that can be continued (2.7.0)
+        try:
+            chat["effective"] = a.effective_settings(chat)   # what the pickers show (2.26.0)
+        except Exception as exc:
+            a.log(f"effective settings for {chat_id}: {type(exc).__name__}: {exc}")
+            chat["effective"] = None
         chat["workspace"] = str(a.paths.workspace(chat_id))
         chat["agents"] = a.db.all("SELECT id, title, agent_name, model, harness, updated FROM chats "
                                   "WHERE parent_chat_id=? ORDER BY created", (chat_id,))
@@ -1691,6 +1725,11 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         a = A()
         rows = a.jobs.list(limit=max(1, min(500, limit)), status=status or None,
                            kinds=[k for k in kinds.split(",") if k] or None)
+        open_evals = {r["id"] for r in a.evals.list(limit=50) if r.get("can_continue")}
+        for r in rows:                       # 2.26.0: a stopped evaluation can be continued from Activity too
+            if r.get("kind") == "eval" and r["id"] not in a.jobs.tasks:
+                r["eval_id"] = (r.get("payload") or {}).get("eval")
+                r["can_continue"] = r["eval_id"] in open_evals
         return {"jobs": rows, "running": len(a.jobs.tasks)}
 
     @api.get("/api/jobs/{job_id}")
@@ -1699,6 +1738,10 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         if not row:
             raise KeyError(job_id)
         return row
+
+    @api.delete("/api/jobs/{job_id}")
+    async def job_forget(job_id: str):
+        return {"forgotten": A().jobs.forget(job_id)}
 
     @api.post("/api/jobs/{job_id}/cancel")
     async def job_cancel(job_id: str):

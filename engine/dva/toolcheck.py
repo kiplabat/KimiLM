@@ -213,6 +213,27 @@ def repair(tool_map, name, args):
         elif not open_schema:
             args.pop(key)
             out["notes"].append(f"`{key}` is not a parameter of {real} and was left out.")
+    # ---- a value that is the whole call again: {"code": "{\"code\": \"…\"}"} (2.26.0, seen on a 9B model)
+    for key in list(args):
+        value = args[key]
+        if not (isinstance(value, str) and re.match(r'\s*\{\s*"' + re.escape(key) + r'"\s*:', value)):
+            continue
+        try:
+            inner = loose_json(value)
+        except ValueError:
+            inner = None
+        if isinstance(inner, dict) and key in inner:
+            args[key] = inner[key]
+            for k, v in inner.items():
+                if k != key and k in props and k not in args:
+                    args[k] = v
+            out["notes"].append(f"`{key}` held the whole call written as JSON: its own value was used.")
+        else:
+            out["args"] = args
+            out["error"] = (f"Error: {real} was not run. The value of `{key}` is the whole call written as JSON "
+                            "again, and it is cut off (probably the reply reached its length limit). Send only the "
+                            f"value itself as `{key}`. If it is long, write it to a file in parts first.")
+            return out
     # ---- values
     for key in list(args):
         spec = props.get(key) if isinstance(props.get(key), dict) else None

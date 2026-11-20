@@ -194,6 +194,31 @@ function createWindow(show = true) {
   });
   win.once("ready-to-show", () => { if (show) win.show(); });
   win.webContents.setWindowOpenHandler(({ url }) => { shell.openExternal(url); return { action: "deny" }; });
+  // 2.26.0: a right click anywhere offers what Ctrl+C, Ctrl+X and Ctrl+V do: Copy for selected text (also in a
+  // reply, a log or a table), Cut and Paste in a text box, Copy link for links, Copy image for pictures.
+  win.webContents.on("context-menu", (_e, p) => {
+    const items = [];
+    const sel = (p.selectionText || "").trim().length > 0;
+    if (p.isEditable) {
+      items.push({ role: "cut", label: "Cut", enabled: sel && p.editFlags.canCut });
+      items.push({ role: "copy", label: "Copy", enabled: sel && p.editFlags.canCopy });
+      items.push({ role: "paste", label: "Paste", enabled: p.editFlags.canPaste });
+      items.push({ type: "separator" }, { role: "selectAll", label: "Select all" });
+    } else if (sel) {
+      items.push({ role: "copy", label: "Copy" });
+    }
+    if (p.linkURL && /^https?:|^mailto:/.test(p.linkURL)) {
+      if (items.length) items.push({ type: "separator" });
+      items.push({ label: "Copy link", click: () => require("electron").clipboard.writeText(p.linkURL) });
+      items.push({ label: "Open link", click: () => shell.openExternal(p.linkURL) });
+    }
+    if (p.mediaType === "image" && p.hasImageContents) {
+      if (items.length) items.push({ type: "separator" });
+      items.push({ label: "Copy image", click: () => win.webContents.copyImageAt(p.x, p.y) });
+    }
+    if (!p.isEditable && !items.length) items.push({ role: "selectAll", label: "Select all" });
+    Menu.buildFromTemplate(items).popup({ window: win });
+  });
   win.webContents.on("will-navigate", (e, url) => {
     if (!url.startsWith(appUrl())) { e.preventDefault(); shell.openExternal(url); }
   });

@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
-import { Activity as ActivityIcon, Ban, CheckCircle2, ChevronDown, ChevronRight, Clock, Cpu, Eye, Loader2, Play, Square, Workflow, XCircle } from "lucide-react";
+import { Activity as ActivityIcon, Ban, CheckCircle2, ChevronDown, ChevronRight, Clock, Cpu, Eye, Loader2, Play, Square, Workflow, X, XCircle } from "lucide-react";
 import { api, fmtTime } from "../api";
-import { go, useEvent, useShown } from "../store";
+import { go, useApp, useEvent, useShown } from "../store";
 import { Badge, Button, Empty, PageHeader, Spinner, Tabs } from "../components/ui";
 import { ACTIVE, KIND_NAME, PauseButton, PausedMark, Pulse, STATUS_ICON, WorkDetail, span, useTick } from "../components/Work";
 
@@ -142,6 +142,7 @@ const GROUPS: { id: string; label: string; kinds?: string[] }[] = [
 ];
 
 function TaskRow({ j, live, onOpen }: { j: any; live: any; onOpen: () => void }) {
+  const { toast } = useApp();
   const running = ACTIVE.includes(j.status);
   useTick(running);
   const began = j.started || j.created;
@@ -166,6 +167,9 @@ function TaskRow({ j, live, onOpen }: { j: any; live: any; onOpen: () => void })
         {j.chat_id && <Button small onClick={() => go("chat", j.chat_id)}>Open chat</Button>}
         <PauseButton job={j} small />
         {running && <Button small kind="danger" onClick={() => api.post(`/jobs/${j.id}/cancel`)}>Stop</Button>}
+        {!running && j.can_continue && <Button small kind="primary" icon={<Play size={13} />} title="Run the tasks that were not done; finished ones are kept"
+          onClick={() => api.post(`/evals/${j.eval_id}/continue`).catch((e: any) => toast(e.message, "error"))}>Continue</Button>}
+        {!running && <button className="icon-btn" title="Take it off the list" onClick={() => api.del(`/jobs/${j.id}`).catch((e: any) => toast(e.message, "error"))}><X size={13} /></button>}
       </div>
     </div>
   );

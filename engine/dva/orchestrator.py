@@ -116,6 +116,7 @@ class RunFit:
     def __init__(self, sequence=True):
         self.need = {}            # model id -> tokens of context one reply needs
         self.cap = {}             # model id -> upper limit after the model ran out of memory
+        self.top = {}             # model id -> context it may grow to past its own setting (2.26.0: it ran out)
         self.sequence = sequence
 
     def want(self, model_id, tokens):
@@ -126,8 +127,13 @@ class RunFit:
         n = self.need.get(model_id, self.BASE)
         return min(n, self.cap[model_id]) if model_id in self.cap else n
 
+    def grow(self, model_id, tokens):
+        """A step ran out of context: the run may load this model larger than its own setting from now on."""
+        self.want(model_id, tokens)
+        self.top[model_id] = max(int(tokens), self.top.get(model_id, 0))
+
     def overrides(self, runtime, model_id):
-        out = runtime.fit(model_id, self.tokens(model_id), 1)
+        out = runtime.fit(model_id, self.tokens(model_id), 1, top=self.top.get(model_id))
         if not self.sequence:
             out.pop("parallel")   # steps side by side: keep the model's own number of reply slots
         return out

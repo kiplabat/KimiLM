@@ -88,7 +88,7 @@ DEFAULT_SETTINGS = {
     "browser_consent": "necessary", "browser_save_mb": 300,
 }
 CHAT_LIMIT_KEYS = ("max_reply_tokens", "max_steps", "time_limit_minutes", "temperature", "max_searches",
-                   "max_tool_calls")
+                   "max_tool_calls", "ctx")
 
 
 class App:
@@ -281,6 +281,60 @@ class App:
         return {**self._run_summary(row, chat.get("title")), "steps": steps, "log": state.get("log") or [],
                 "folder": state.get("dir"), "can_continue": bool(self.open_run(row["chat_id"]))
                 and (self.open_run(row["chat_id"]) or {}).get("id") == run_id}
+
+    def effective_settings(self, chat):
+        """What a chat runs with (its pickers show it): as the last reply ran, else what the next one would use."""
+        from .runner import describe_settings
+        project = self.db.get("projects", chat["project_id"]) if chat.get("project_id") else None
+        hid = chat.get("harness") or (project or {}).get("default_harness") or self.harnesses.default_id()
+        harness = self.harnesses.get(hid) or self.harnesses.get("agent") or {}
+        model = chat.get("model") or (project or {}).get("default_model") or self.models.default_model()
+        last = self.db.setting(f"chat_effective:{chat['id']}")
+        if last and last.get("harness_id") == harness.get("id") and \
+                (last.get("auto") if model in (None, "", "auto") else last.get("model") == model):
+            fresh = describe_settings(self, harness, last.get("model"), chat.get("settings") or {},
+                                      auto=last.get("auto"), route_reason=last.get("route_reason"))
+            return {**fresh, "ctx": last.get("ctx", fresh.get("ctx")), "ctx_by": last.get("ctx_by", fresh.get("ctx_by"))} \
+                if not (chat.get("settings") or {}).get("ctx") else fresh
+        return describe_settings(self, harness, None if model in (None, "", "auto") else model,
+                                 chat.get("settings") or {}, auto=model in (None, "", "auto"))
+
+    # ------------------------------------------------------------------ who is using a model (2.26.0)
+    def holder_jobs(self, model_id=None):
+        """The tasks (Activity rows) using a model right now: [(job id or None, asyncio task)]."""
+        by_task = {t: jid for jid, t in self.jobs.tasks.items()}
+        return [(by_task.get(t), t) for t in self.runtime.holders_of(model_id)]
+
+    def loaded_with_holders(self):
+        out = []
+        for row in self.runtime.loaded():
+            names = []
+            for jid, _task in self.holder_jobs(row["model_id"]):
+                job = self.db.get("jobs", jid) if jid else None
+                names.append((job or {}).get("title") or "background work")
+            out.append({**row, "held_by": names})
+        return out
+
+    def stop_holders(self, model_id=None):
+        """Stop whatever is using a model so it can be unloaded. Returns what was stopped."""
+        stopped = []
+        for jid, task in self.holder_jobs(model_id):
+            if jid:
+                job = self.db.get("jobs", jid) or {}
+                if job.get("chat_id"):
+                    resume_paused = self.pauses.get(job["chat_id"])
+                    if resume_paused:                  # a paused reply must wake to see that it was stopped
+                        resume_paused["event"].set()
+                chat = self.db.get("chats", job["chat_id"]) if job.get("chat_id") else None
+                if (chat or {}).get("origin") == "eval" and (self.evals.current or {}).get("job_id"):
+                    self.jobs.cancel(self.evals.current["job_id"])   # else the evaluation loads it for its next task
+                    stopped.append("Evaluation")
+                self.jobs.cancel(jid)
+                stopped.append(job.get("title") or jid)
+            else:
+                task.cancel()
+                stopped.append("background work")
+        return stopped
 
     def open_run(self, chat_id):
         """The chat's latest run if it can be continued (stopped, or cut off by a crash or restart)."""

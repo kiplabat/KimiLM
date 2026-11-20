@@ -604,8 +604,10 @@ class Connectors:
             ordered = sorted(rows, key=lambda t: not t.get("readonly"))
             shown = "; ".join(t["name"] + (f" ({first(t['description'], width)})" if t.get("description") else "")
                               for t in ordered[:tools])
-            more = len(rows) - tools
-            lines.append(f"{head}. Tools: {shown}" + (f"; and {more} more" if more > 0 else ""))
+            # 2.26.0: the rest by name, so an agent knows they exist (a 9B model wrote its own controller
+            # tuning in Python because `control_tune` was hidden behind "and 9 more")
+            rest = [t["name"] for t in ordered[tools:]]
+            lines.append(f"{head}. Tools: {shown}" + (f"; also {', '.join(rest[:30])}" if rest else ""))
         return "\n".join(lines)
 
     async def resources(self, connector_id):

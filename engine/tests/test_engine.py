@@ -1923,7 +1923,7 @@ def test_what_connected_services_promise_is_put_into_words():
     assert lines[1] == "- Mail. Tools: list_mail (List the inbox); send_mail (Send a message)"
     assert lines[2] == "- Far away: A remote service (it could not be reached: ConnectionError: no route to host)"
     assert cn.names(["a", "b", "c", "gone"]) == ["Datasets", "Mail"] and cn.down("d") and not cn.down("a")
-    assert cn.digest(["a"], tools=1).endswith("; and 1 more")
+    assert cn.digest(["a"], tools=1).endswith("; also publish")                # the rest by name (2.26.0)
 
 
 SHOP = """<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Test shop</title>
@@ -3855,11 +3855,13 @@ def test_pictures_are_paused_stopped_and_continued_with_what_they_made(engine):
     assert c.post(f"/api/images/jobs/{full['id']}/forget").json() == {"ok": True}
     assert full["id"] not in {j["id"] for j in c.get("/api/images").json()["jobs"]} and Path(full["images"][0]["path"]).exists()
     assert c.post(f"/api/images/jobs/{full['id']}/forget").status_code == 404
-    # work that is not a picture or a video on this computer cannot be paused
+    # 2.26.0: a chat reply pauses too (at its next step, giving its model back) and resumes; a finished task cannot
     chat = c.post("/api/chats", json={}).json()
     reply = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "hello"}).json()
+    if c.post(f"/api/jobs/{reply['job_id']}/pause").json() == {"paused": True}:
+        assert c.post(f"/api/jobs/{reply['job_id']}/resume").json() == {"resumed": True}
+    assert wait_job(c, reply["job_id"])["status"] == "done"
     assert c.post(f"/api/jobs/{reply['job_id']}/pause").json() == {"paused": False}
-    wait_job(c, reply["job_id"])
 
 
 def test_a_video_is_paused_stopped_and_continued_without_redoing_its_parts(engine):
@@ -4762,3 +4764,55 @@ def test_an_agent_that_names_its_own_folder_means_that_folder(tmp_path):
     assert ctx.resolve("other/fizz.py") == (root / "other" / "fizz.py").resolve()
     (root / "fizz").mkdir()                       # a real sub-folder of that name is used as it is
     assert ctx.resolve("fizz/fizz.py") == (root / "fizz" / "fizz.py").resolve()
+
+
+def test_an_evaluation_can_be_stopped_continued_and_deleted(engine):
+    c = engine["client"]
+    started = c.post("/api/evals/run", json={"only": ["calc", "summary"]}).json()
+    for _ in range(100):                                 # stop it once its first task is under way
+        cur = c.get("/api/evals").json()["current"]
+        if cur and cur.get("chat_id"):
+            break
+        time.sleep(0.1)
+    assert c.post("/api/evals/pause").status_code == 200
+    assert c.get("/api/evals").json()["current"]["paused"] is True
+    assert c.post("/api/evals/resume").status_code == 200
+    c.post("/api/evals/stop")
+    wait_job(c, started["job_id"], timeout=60)
+    run = next(r for r in c.get("/api/evals").json()["runs"] if r["id"] == started["id"])
+    assert run["status"] == "stopped" and run["can_continue"], run
+    jobs = c.get("/api/jobs").json()["jobs"]
+    assert next(j for j in jobs if j["id"] == started["job_id"])["can_continue"]      # also from Activity
+    again = c.post(f"/api/evals/{started['id']}/continue").json()
+    assert again["id"] == started["id"] and again["total"] == 2
+    assert wait_job(c, again["job_id"], timeout=120)["status"] == "done"
+    run = next(r for r in c.get("/api/evals").json()["runs"] if r["id"] == started["id"])
+    assert run["status"] == "done" and sorted(r["id"] for r in run["results"]) == ["calc", "summary"]
+    assert not run["can_continue"]
+    assert c.post(f"/api/evals/{started['id']}/continue").status_code == 400
+    assert c.delete(f"/api/evals/{started['id']}").status_code == 200
+    assert started["id"] not in {r["id"] for r in c.get("/api/evals").json()["runs"]}
+    for r in run["results"]:
+        assert c.get(f"/api/chats/{r['chat_id']}").status_code == 404                  # its chats went with it
+    assert c.delete(f"/api/jobs/{again['job_id']}").status_code == 200                   # off the Activity list
+    assert again["job_id"] not in {j["id"] for j in c.get("/api/jobs").json()["jobs"]}
+
+
+def test_a_chat_shows_what_it_runs_with_and_a_busy_model_can_be_unloaded(engine):
+    c = engine["client"]
+    chat = c.post("/api/chats", json={"title": "settings"}).json()
+    eff = c.get(f"/api/chats/{chat['id']}").json()["effective"]
+    assert eff and eff["harness"] and eff["max_steps"] and eff["max_steps_by"] in ("harness", "default")
+    assert eff["max_reply_tokens"] and "ctx" in eff
+    upd = c.put(f"/api/chats/{chat['id']}", json={"settings": {"ctx": 12288, "max_steps": 7}}).json()
+    assert upd["settings"]["ctx"] == 12288
+    assert upd["effective"]["ctx"] == 12288 and upd["effective"]["ctx_by"] == "you"
+    assert upd["effective"]["max_steps"] == 7 and upd["effective"]["max_steps_by"] == "you"
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "Say hello."}).json()
+    wait_job(c, job["job_id"] if "job_id" in job else job["id"], timeout=60)
+    after = c.get(f"/api/chats/{chat['id']}").json()["effective"]
+    assert after["model"] and after["ctx"] == 12288 and after["ctx_by"] == "you"
+    loaded = c.get("/api/models").json().get("loaded") or []
+    assert all("held_by" in l for l in loaded)
+    for l in loaded:                                     # force works when nothing uses it, too
+        assert c.post("/api/runtime/unload", json={"model_id": l["model_id"], "force": True}).status_code == 200

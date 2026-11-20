@@ -186,13 +186,20 @@ TASKS = [
 class Evals:
     def __init__(self, app):
         self.app, self.db = app, app.db
-        self.current = None           # the run in progress: {"id", "done", "total", "task"}
+        self.current = None           # the run in progress: {"id", "done", "total", "task", "chat_id", "job_id"}
+        # 2.26.0: a run that was going when the app closed is cut off, not forever "running": it can be continued
+        for row in self.db.all("SELECT id FROM eval_runs WHERE status='running'"):
+            self.db.update("eval_runs", row["id"], {"status": "interrupted"})
 
     def tasks(self):
         return [{"id": t["id"], "title": t["title"], "harness": t["harness"]} for t in TASKS]
 
     def list(self, limit=12):
-        return self.db.all("SELECT * FROM eval_runs ORDER BY created DESC LIMIT ?", (limit,))
+        rows = self.db.all("SELECT * FROM eval_runs ORDER BY created DESC LIMIT ?", (limit,))
+        for r in rows:
+            r["can_continue"] = r.get("status") in ("stopped", "interrupted") and bool(self._left(r)) \
+                and not self.current
+        return rows
 
     def start(self, model=None, only=None, tasks=None):
         if self.current:
@@ -203,12 +210,74 @@ class Evals:
         model = model or self.db.setting("default_model")
         run_id = new_id("eval_")
         self.db.insert("eval_runs", {"id": run_id, "created": now(), "version": VERSION, "model": model,
-                                     "status": "running", "results": [], "summary": {}, "settings": self.settings()})
-        self.current = {"id": run_id, "done": 0, "total": len(chosen), "task": chosen[0]["title"]}
-        job = self.app.jobs.create("eval", "Evaluation", lambda row: self._run(run_id, model, chosen),
+                                     "status": "running", "results": [], "summary": {}, "settings": self.settings(),
+                                     "tasks": [t["id"] for t in chosen]})
+        return self._launch(run_id, model, chosen, [], len(chosen))
+
+    def _left(self, row):
+        done = {r.get("id") for r in row.get("results") or []}
+        wanted = row.get("tasks") or [t["id"] for t in TASKS]
+        return [t for t in TASKS if t["id"] in wanted and t["id"] not in done]
+
+    def continue_run(self, run_id):
+        """2.26.0: go on with a stopped or cut-off evaluation. Finished tasks are kept; the task that was cut off
+        and the ones after it run now, with the same model, into the same row."""
+        if self.current:
+            raise ValueError("An evaluation is already running.")
+        row = self.db.get("eval_runs", run_id)
+        if not row:
+            raise KeyError(run_id)
+        if row.get("status") not in ("stopped", "interrupted"):
+            raise ValueError("Only a stopped or cut-off evaluation can be continued.")
+        left = self._left(row)
+        if not left:
+            raise ValueError("Every task of this evaluation has run.")
+        results = list(row.get("results") or [])
+        self.db.update("eval_runs", run_id, {"status": "running"})
+        return self._launch(run_id, row.get("model"), left, results, len(results) + len(left))
+
+    def delete(self, run_id):
+        """Take an evaluation off the list, with its task chats and files. A running one is stopped first."""
+        row = self.db.get("eval_runs", run_id)
+        if not row:
+            raise KeyError(run_id)
+        if self.current and self.current.get("id") == run_id:
+            raise ValueError("Stop the evaluation before deleting it.")
+        for r in row.get("results") or []:
+            cid = r.get("chat_id")
+            if cid:
+                self.db.run("DELETE FROM messages WHERE chat_id=?", (cid,))
+                self.db.run("DELETE FROM memories WHERE scope='chat' AND scope_id=?", (cid,))
+                self.db.delete("chats", cid)
+        shutil.rmtree(self.app.paths.data / "evals" / run_id, ignore_errors=True)
+        self.db.delete("eval_runs", run_id)
+        return {"ok": True}
+
+    def pause(self):
+        """Pause the task being done: its agent stops at its next step and gives its model back."""
+        from .orchestrator import pause_chat
+        cur = self.current or {}
+        if not cur.get("chat_id"):
+            raise ValueError("No evaluation task is running.")
+        pause_chat(self.app, cur["chat_id"], "evaluation paused")
+        cur["paused"] = True
+        return {"ok": True}
+
+    def resume(self):
+        from .orchestrator import resume_chat
+        cur = self.current or {}
+        if cur.get("chat_id"):
+            resume_chat(self.app, cur["chat_id"])
+        cur["paused"] = False
+        return {"ok": True}
+
+    def _launch(self, run_id, model, chosen, results, total):
+        self.current = {"id": run_id, "done": len(results), "total": total, "task": chosen[0]["title"],
+                        "paused": False}
+        job = self.app.jobs.create("eval", "Evaluation", lambda row: self._run(run_id, model, chosen, results, total),
                                    model=model, payload={"eval": run_id})
         self.current["job_id"] = job["id"]
-        return {"id": run_id, "job_id": job["id"], "total": len(chosen)}
+        return {"id": run_id, "job_id": job["id"], "total": total}
 
     async def _one(self, run_id, model, task, root):
         folder = root / task["id"]
@@ -222,22 +291,32 @@ class Evals:
         self.db.set_setting(f"chat_auto_approve:{chat['id']}", True)
         started = time.monotonic()
         result = {"id": task["id"], "title": task["title"], "chat_id": chat["id"], "passed": False}
+        if self.current:
+            self.current["chat_id"] = chat["id"]
         try:
             job = self.app.start_turn(chat["id"], task["prompt"], kind="agent",
                                       payload={"auto_approve": True})
             handle = self.app.jobs.tasks.get(job["id"])
             if handle:
+                from .orchestrator import is_paused
+                allowed = float(self.db.setting("eval_task_minutes", 45)) * 60
+                worked, last = 0.0, time.monotonic()
                 try:
-                    await asyncio.wait_for(asyncio.shield(handle),
-                                           float(self.db.setting("eval_task_minutes", 45)) * 60)
-                except asyncio.TimeoutError:
-                    self.app.jobs.cancel(job["id"])
-                    result["error"] = "took too long and was stopped"
+                    while not handle.done():
+                        await asyncio.wait({asyncio.shield(handle)}, timeout=2)
+                        t = time.monotonic()
+                        if not is_paused(self.app, chat["id"]):   # time paused does not count against the limit
+                            worked += t - last
+                        last = t
+                        if worked > allowed and not handle.done():
+                            self.app.jobs.cancel(job["id"])
+                            result["error"] = "took too long and was stopped"
+                            break
                 except asyncio.CancelledError:
+                    from .orchestrator import resume_chat
+                    resume_chat(self.app, chat["id"])           # a paused task must wake to see the stop
                     self.app.jobs.cancel(job["id"])
                     raise
-                except Exception:
-                    pass
             msg = self.db.one("SELECT content, meta_json FROM messages WHERE chat_id=? AND role='assistant' "
                               "ORDER BY created DESC, rowid DESC LIMIT 1", (chat["id"],)) or {}
             meta = msg.get("meta") or {}
@@ -262,26 +341,28 @@ class Evals:
         result["seconds"] = round(time.monotonic() - started, 1)
         return result
 
-    async def _run(self, run_id, model, tasks):
+    async def _run(self, run_id, model, tasks, results=None, total=None):
         root = self.app.paths.data / "evals" / run_id
-        results, status = [], "done"
+        results, status = list(results or []), "done"
+        total = total or len(tasks)
+        before = len(results)
         # 2.23.0: start with only the model under test loaded (fair numbers, memory for it), and give the memory
         # back when the run ends, instead of leaving models loaded until the idle timer
         await self._release(keep=(model,))
         try:
             for i, task in enumerate(tasks):
-                self.current.update(done=i, task=task["title"])
-                self.app.bus.publish("eval", run_id=run_id, done=i, total=len(tasks), task=task["title"])
+                self.current.update(done=before + i, task=task["title"])
+                self.app.bus.publish("eval", run_id=run_id, done=before + i, total=total, task=task["title"])
                 results.append(await self._one(run_id, model, task, root))
-                self.db.update("eval_runs", run_id, {"results": results, "summary": self.summary(results, len(tasks))})
+                self.db.update("eval_runs", run_id, {"results": results, "summary": self.summary(results, total)})
         except asyncio.CancelledError:
             status = "stopped"
             raise
         finally:
             self.db.update("eval_runs", run_id, {"status": status, "results": results,
-                                                 "summary": self.summary(results, len(tasks))})
+                                                 "summary": self.summary(results, total)})
             self.current = None
-            self.app.bus.publish("eval", run_id=run_id, done=len(results), total=len(tasks), finished=True)
+            self.app.bus.publish("eval", run_id=run_id, done=len(results), total=total, finished=True)
             if not self.db.setting("eval_keep_files", False):
                 shutil.rmtree(root, ignore_errors=True)
             await self._release()
