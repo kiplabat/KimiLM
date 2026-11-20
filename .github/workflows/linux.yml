@@ -59,7 +59,7 @@ jobs:
           kill $PID
           "$RES/llama/cpu/llama-server" --version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: KimiLM-linux-${{ matrix.arch }}
           path: app/release/KimiLM-linux-${{ matrix.arch }}.tar.gz
