@@ -68,7 +68,7 @@ function PluginCard({ p, onChange }: any) {
     <div className="card plugin-card">
       <div className="row between">
         <div className="row gap-s"><Package size={18} className="accent" /><div><h3>{p.name} <span className="muted small">v{p.version}</span></h3>
-          <div className="muted small">{p.source === "builtin" ? "Built in" : "Installed by you"}{p.author ? ` · ${p.author}` : ""}</div></div></div>
+          <div className="muted small">{p.source === "builtin" ? "Built in" : p.source === "system" ? "Part of the operating system" : "Installed by you"}{p.author ? ` · ${p.author}` : ""}</div></div></div>
         <div className="row gap-s">
           {p.enabled && (p.configured ? <Badge kind="ok">Ready</Badge> : <Badge kind="warn">Needs setup</Badge>)}
           <Toggle checked={p.enabled} onChange={async (v: boolean) => { await api.put(`/plugins/${p.id}/enabled`, { enabled: v }); onChange(); refreshBoot(); }} />

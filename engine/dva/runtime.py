@@ -498,7 +498,10 @@ class Runtime:
 
     async def _start(self, model, plan):
         if not Path(model["path"]).exists():
-            raise RuntimeError_(f"The model file is missing: {model['path']}")
+            from .hardware import mount_drive                  # on a drive that is not mounted yet (2.23.0)
+            ok, why = await asyncio.to_thread(mount_drive, model["path"])
+            if not ok:
+                raise RuntimeError_(f"The model file is missing: {model['path']}" + (f" ({why})" if why else ""))
         server = Server(model, plan, self.api_key)
         server.port = free_port()
         server.need_bytes = self._need_bytes(model, plan)

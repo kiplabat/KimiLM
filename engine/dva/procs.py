@@ -83,10 +83,15 @@ def lower(pid):
         pass
 
 
-def contain():
+def contain(memory_limit=0):
     """Windows: put the engine in a job object that ends all of its processes when the engine ends, however it
     ends. Processes started later belong to the job too. Returns the job's handle (kept for the engine's life),
-    or None where this is not possible."""
+    or None where this is not possible.
+
+    memory_limit (2.23.0): bytes of committed memory the engine and everything it starts may use together (0: no
+    limit). Past it, an allocation fails inside that program (normally the model server, which stops with an
+    error the engine reports) instead of the whole computer running out of memory, as on 19 Nov 2026. Model files
+    mapped from disk are not committed memory and do not count. Linux does the same with kimilm.slice."""
     if os.name != "nt":
         return None
     try:
@@ -118,6 +123,9 @@ def contain():
         # kill on job close | die on unhandled exception | breakaway allowed (a browser's sandbox asks for it; a
         # program that breaks away is one its own parent ends)
         info.BasicLimitInformation.LimitFlags = 0x2000 | 0x400 | 0x800
+        if memory_limit and memory_limit > 0:
+            info.BasicLimitInformation.LimitFlags |= 0x200          # JOB_OBJECT_LIMIT_JOB_MEMORY
+            info.JobMemoryLimit = int(memory_limit)
         if not k32.SetInformationJobObject(wintypes.HANDLE(job), 9, ctypes.byref(info), ctypes.sizeof(info)):
             k32.CloseHandle(wintypes.HANDLE(job))
             return None
