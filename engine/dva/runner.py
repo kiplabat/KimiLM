@@ -994,9 +994,10 @@ class Turn:
 
     async def _run(self):
         started = time.monotonic()
-        USAGE.set({"chat_id": self.chat["id"], "job_id": self.job["id"],
+        USAGE.set({"chat_id": self.chat["id"], "job_id": self.job["id"], "harness": self.harness.get("id"),
                    "purpose": "agent" if self.chat.get("parent_chat_id") else
-                   ("schedule" if self.chat.get("origin") == "schedule" else "chat")})
+                   ("schedule" if self.chat.get("origin") == "schedule" else
+                    "eval" if self.chat.get("origin") == "eval" else "chat")})
         if self.harness.get("type") != "pipeline" and self.auto:
             self.resolve_auto()
         self.emit("assistant_start", harness=self.harness["name"], model=self.model_id,

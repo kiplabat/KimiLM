@@ -14,6 +14,7 @@ Before a local call, LLM.prepare gives a freshly loaded model its prompt snapsho
 system prompt and tool list are read from a file in about a second instead of being read again by the model."""
 import asyncio
 import json
+import time
 
 import httpx
 from jsonschema import ValidationError, validate
@@ -138,7 +139,7 @@ class LLM:
                 try:
                     async for _ in self._events(server, self._body(
                             [{"role": "system", "content": "-"}, {"role": "user", "content": "."}],
-                            max_tokens=1, temperature=0.0, stream=True)):
+                            max_tokens=1, temperature=0.0, stream=True), purpose="snapshot"):
                         pass
                 except LLMError:
                     pass
@@ -158,7 +159,7 @@ class LLM:
         body = self._body(self._local([messages[0], {"role": "user", "content": "."}]), tools=tools, max_tokens=1,
                           temperature=0.0, stream=True)
         try:
-            async for _ in self._events(server, body):
+            async for _ in self._events(server, body, purpose="snapshot"):
                 pass
         except LLMError:
             return                                 # the real call follows and reports any real problem
@@ -170,7 +171,38 @@ class LLM:
         else:
             server.no_snapshots = True             # this model or build cannot save its state: stop trying
 
-    async def _events(self, server, body):
+    async def _events(self, server, body, purpose=None):
+        """Stream one local call (see _stream) and count it: usage statistics (meter.py) when it ends or fails,
+        and what the model is doing right now for Performance (telemetry.py): reading, then writing, token by
+        token (2.27.0)."""
+        meter = getattr(self.runtime, "meter", None)
+        tele = getattr(self.runtime, "telemetry", None)
+        call = tele.call_started(server) if tele else None
+        t0 = time.monotonic()
+        ended = failed = False
+        try:
+            async for kind, value in self._stream(server, body):
+                if kind == "end":
+                    ended = True
+                    if meter:
+                        meter.record_local(server, value.get("timings"), time.monotonic() - t0, purpose=purpose)
+                elif call is not None:
+                    tele.call_token(call)
+                yield kind, value
+        except LLMError as exc:
+            failed = True
+            if meter:
+                meter.record_local(server, {}, time.monotonic() - t0,
+                                   status="timeout" if isinstance(exc, LLMTimeout) else "failed", error=exc,
+                                   purpose=purpose)
+            raise
+        finally:
+            if call is not None:
+                tele.call_ended(call)
+            if not ended and not failed and meter:          # stopped by the user, or the caller went away
+                meter.record_local(server, {}, time.monotonic() - t0, status="stopped", purpose=purpose)
+
+    async def _stream(self, server, body):
         """Stream one local call. Yields ('reasoning', text), ('token', text) and finally ('end', {...})."""
         first, stall = self.limits(server, body)
         calls = {}

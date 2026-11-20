@@ -36,6 +36,7 @@ import re
 import time
 
 from . import recovery
+from .meter import purpose as usage_purpose
 from .db import now
 from .forecast import pretty_seconds, pretty_tokens
 from .orchestrator import SETTLED, Orchestra, _clip, same_objection
@@ -804,8 +805,9 @@ class Mission(Orchestra):
             turn.status("The planner is reading the handoff and deciding the next step…" if self.handoffs
                         else "The planner is working out how to start…")
             schema = move_schema(self.harness_ids, self.roles())
-            return (await turn.complete(messages + [{"role": "user", "content": self.move_prompt()}],
-                                        schema=schema, max_tokens=1800, temperature=0.2))["json"]
+            with usage_purpose("planner"):           # counted as the planner's work in Usage (2.27.0)
+                return (await turn.complete(messages + [{"role": "user", "content": self.move_prompt()}],
+                                            schema=schema, max_tokens=1800, temperature=0.2))["json"]
         except asyncio.CancelledError:
             raise
         except Exception as exc:            # one bad call must not end hours of work: fall back, then pause

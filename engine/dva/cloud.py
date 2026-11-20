@@ -33,6 +33,7 @@ from .providers import ProviderError
 from .runtime import ACTIVE, RuntimeError_
 
 USAGE = contextvars.ContextVar("dva_usage", default=None)    # {"chat_id", "job_id", "purpose"} for metering
+CALL_START = contextvars.ContextVar("dva_call_start", default=None)   # when the current online call began (2.27.0)
 RETRY_STATUS = (408, 409, 425, 429, 500, 502, 503, 504, 520, 522, 524, 529)
 
 
@@ -186,6 +187,11 @@ class Adapter:
 
     def meter(self, input_tokens, output_tokens):
         cost, estimated = self.providers.record(self.s.model_id, input_tokens, output_tokens, USAGE.get())
+        stats = getattr(self.s.cloud, "meter", None)          # usage statistics (meter.py, 2.27.0)
+        if stats is not None:
+            began = CALL_START.get()
+            stats.record(self.s.model_id, online=True, read=input_tokens, written=output_tokens, cost=cost,
+                         total_ms=(time.monotonic() - began) * 1000 if began else 0)
         return {"prompt_n": int(input_tokens or 0), "predicted_n": int(output_tokens or 0), "cost": cost,
                 "cost_estimated": estimated, "online": True}
 
@@ -193,6 +199,7 @@ class Adapter:
     async def request(self, path, body, timeout=1800, stream=True):
         """POST with retries; yields an open (streaming) response with status 200."""
         url = self.s.base_url + path
+        CALL_START.set(time.monotonic())
         async with self.s.cloud.sem(self.s.provider):
             async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=20), trust_env=True) as http:
                 fixed = False

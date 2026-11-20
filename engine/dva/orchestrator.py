@@ -41,6 +41,7 @@ import time
 from pathlib import Path
 
 from . import recovery
+from .meter import purpose as usage_purpose
 from .db import new_id, now
 from .forecast import pretty_seconds, pretty_tokens
 from .llm import LLMError, estimate_tokens
@@ -551,8 +552,9 @@ class Orchestra:
             "- 'final' says what the final answer must contain." + roster + " JSON only.")
         schema = plan_schema(self.harness_ids, self.roles(), limit, allow_direct, self.agents())
         try:
-            out = (await turn.complete(messages + [{"role": "user", "content": prompt}], schema=schema,
-                                       max_tokens=1400, temperature=0.2))["json"]
+            with usage_purpose("planner"):           # counted as the planner's work in Usage (2.27.0)
+                out = (await turn.complete(messages + [{"role": "user", "content": prompt}], schema=schema,
+                                           max_tokens=1400, temperature=0.2))["json"]
         except LLMError as exc:
             if allow_direct:
                 turn.app.log(f"planning failed, one agent does the work: {exc}")
@@ -1028,14 +1030,16 @@ class Orchestra:
                     overrides = self.fit.overrides(self.app.runtime, checker)
                 self.used.add(checker)
                 async with self.app.runtime.lease(checker, on_wait=turn.status, overrides=overrides) as server:
-                    out = await self.app.llm.json([{"role": "system", "content": VERIFY_SYSTEM},
-                                                   {"role": "user", "content": user}], VERIFY_SCHEMA,
-                                                  max_tokens=220, server=server)
+                    with usage_purpose("check"):
+                        out = await self.app.llm.json([{"role": "system", "content": VERIFY_SYSTEM},
+                                                       {"role": "user", "content": user}], VERIFY_SCHEMA,
+                                                      max_tokens=220, server=server)
             else:
                 await turn.hold_model()
-                out = (await turn.complete([{"role": "system", "content": VERIFY_SYSTEM},
-                                            {"role": "user", "content": user}], schema=VERIFY_SCHEMA,
-                                           max_tokens=220, temperature=0.1))["json"]
+                with usage_purpose("check"):
+                    out = (await turn.complete([{"role": "system", "content": VERIFY_SYSTEM},
+                                                {"role": "user", "content": user}], schema=VERIFY_SCHEMA,
+                                               max_tokens=220, temperature=0.1))["json"]
         except Exception as exc:               # the check itself failed: code checks passed, so accept and say so
             if isinstance(exc, asyncio.CancelledError):
                 raise
@@ -1495,9 +1499,10 @@ class Orchestra:
                 "name, goal, done_when, depends_on) — for example a different way to get what a failed task could "
                 "not — or 'finish' when nothing more can usefully be done. Only give actions that are needed. "
                 "JSON only.")
-            out = (await turn.complete(messages + [{"role": "user", "content": prompt}],
-                                       schema=check_schema(self.harness_ids, self.roles(), self.agents()),
-                                       max_tokens=900, temperature=0.2))["json"]
+            with usage_purpose("planner"):
+                out = (await turn.complete(messages + [{"role": "user", "content": prompt}],
+                                           schema=check_schema(self.harness_ids, self.roles(), self.agents()),
+                                           max_tokens=900, temperature=0.2))["json"]
         except Exception as exc:
             if isinstance(exc, asyncio.CancelledError):
                 raise

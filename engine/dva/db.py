@@ -100,6 +100,13 @@ CREATE TABLE IF NOT EXISTS step_stats (
   key TEXT PRIMARY KEY, harness TEXT, model_id TEXT, runs INTEGER DEFAULT 0, ok INTEGER DEFAULT 0,
   calls REAL DEFAULT 0, fixed REAL DEFAULT 0, growth REAL DEFAULT 0, output REAL DEFAULT 0, seconds REAL DEFAULT 0,
   read_tps REAL DEFAULT 0, write_tps REAL DEFAULT 0, updated TEXT);
+CREATE TABLE IF NOT EXISTS model_calls (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, day TEXT, hour INTEGER, weekday INTEGER, model_id TEXT,
+  online INTEGER DEFAULT 0, chat_id TEXT, job_id TEXT, purpose TEXT, harness TEXT, read_tokens INTEGER DEFAULT 0,
+  cached_tokens INTEGER DEFAULT 0, written_tokens INTEGER DEFAULT 0, read_ms REAL DEFAULT 0, write_ms REAL DEFAULT 0,
+  total_ms REAL DEFAULT 0, cost REAL DEFAULT 0, status TEXT DEFAULT 'ok', error TEXT, calls INTEGER DEFAULT 1);
+CREATE INDEX IF NOT EXISTS model_calls_ts ON model_calls(ts);
+CREATE INDEX IF NOT EXISTS model_calls_chat ON model_calls(chat_id);
 """
 
 # Full-text search (SQLite FTS5) over messages and knowledge passages, kept in step by triggers. If this SQLite has
