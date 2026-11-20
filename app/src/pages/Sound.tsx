@@ -5,6 +5,7 @@ import { AudioLines, Cloud, Copy, Cpu, Download, ExternalLink, FileText, FolderO
 import { api, desktop, fileUrl, fmtBytes, fmtTime } from "../api";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, ConfirmButton, Empty, Field, Modal, PageHeader, Progress, Spinner, Tabs } from "../components/ui";
+import { SplitPane } from "../components/Resizable";
 import { AudioClip, RecordButton, composerTracks, newTrack, saveComposer, soundJob } from "../components/Audio";
 import { WorkLine } from "../components/Work";
 import { MyVoices } from "../components/Voices";
@@ -96,7 +97,7 @@ function Podcast({ state, jobs, toModels }: any) {
   const ready = state.can.tts && state.text_model;
   const active = getting && ["starting", "downloading", "unpacking"].includes(getting.state);
   return (
-    <div className="grid-2 image-studio">
+    <SplitPane id="sound" className="grid-2 image-studio" initial={0.465}>
       <div className="card stack-s">
         <p>Give KimiLM a document and get a podcast about it: it reads the document, writes a conversation between two hosts from what the document says, and records it. Everything happens on this computer.</p>
         {!ready && <div className="note stack-s" style={{ alignItems: "flex-start" }}>
@@ -142,7 +143,7 @@ function Podcast({ state, jobs, toModels }: any) {
             {desktop && <a onClick={() => desktop.showItem(r.params.script)}>Show the script</a>}</div>
           {r.lines && <details><summary className="small">Read the script</summary><div className="transcript">{r.lines.map((l: any, i: number) => <div key={i}><b>{l.speaker}:</b> {l.text}</div>)}</div></details>}
         </div>)} /></div>
-    </div>
+    </SplitPane>
   );
 }
 
@@ -162,7 +163,7 @@ function Speak({ state, jobs, toModels }: any) {
     catch (e: any) { toast(e.message, "error"); }
   };
   return (
-    <div className="grid-2 image-studio">
+    <SplitPane id="sound" className="grid-2 image-studio" initial={0.465}>
       <div className="card stack-s">
         <Field label="What should be said?" help={'For a podcast or a dialogue, write one line per turn with the speaker\'s name first: "Host: Welcome…" then "Guest: Thank you…". Each speaker gets a voice.'}>
           <textarea className="input" rows={9} autoFocus value={text} onChange={(e) => setText(e.target.value)}
@@ -186,7 +187,7 @@ function Speak({ state, jobs, toModels }: any) {
         <div><Button kind="primary" icon={<AudioLines size={14} />} disabled={!text.trim()} onClick={start}>{speakers.length ? "Record the script" : "Speak"}</Button></div>
       </div>
       <div className="stack-s"><Jobs jobs={jobs} kinds={["speak", "mix"]} render={(r: any) => <AudioClip item={r} />} /></div>
-    </div>
+    </SplitPane>
   );
 }
 
@@ -201,7 +202,7 @@ function Transcribe({ state, jobs, toModels }: any) {
   };
   const pick = async (f?: File) => { if (f) try { run(await api.upload("/sound/upload", f)); } catch (e: any) { toast(e.message, "error"); } };
   return (
-    <div className="grid-2 image-studio">
+    <SplitPane id="sound" className="grid-2 image-studio" initial={0.465}>
       <div className="card stack-s">
         <p>Turn a recording, or the sound of a video, into text with times: a meeting, an interview, a voice note.</p>
         <div className="row gap-s wrap">
@@ -223,7 +224,7 @@ function Transcribe({ state, jobs, toModels }: any) {
             {desktop && r.file && <a onClick={() => desktop.showItem(r.file)}>Show the text{r.subtitles ? " and subtitle" : ""} file</a>}
           </div>
         </div>)} /></div>
-    </div>
+    </SplitPane>
   );
 }
 
@@ -242,7 +243,7 @@ function MusicTab({ state, jobs, toModels }: any) {
   );
   const model = state.models.find((m: any) => m.id === state.defaults.music);
   return (
-    <div className="grid-2 image-studio">
+    <SplitPane id="sound" className="grid-2 image-studio" initial={0.465}>
       <div className="card stack-s">
         <Field label="Describe the music" help="The style, the instruments, the mood and the tempo.">
           <textarea className="input" rows={4} autoFocus value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="e.g. Warm acoustic guitar and soft percussion, hopeful, 90 beats a minute: a bed for a podcast intro." />
@@ -259,7 +260,7 @@ function MusicTab({ state, jobs, toModels }: any) {
         <div><Button kind="primary" icon={<Music size={14} />} disabled={!prompt.trim()} onClick={() => api.post("/sound/jobs", { kind: "music", prompt, seconds, instrumental, lyrics }).catch((e) => toast(e.message, "error"))}>Make the music</Button></div>
       </div>
       <div className="stack-s"><Jobs jobs={jobs} kinds={["music"]} render={(r: any) => <><AudioClip item={r} />{r.params?.words && <div className="small muted">{r.params.words}</div>}</>} /></div>
-    </div>
+    </SplitPane>
   );
 }
 

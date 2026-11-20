@@ -93,15 +93,17 @@ class _NvidiaReader:
 WIN_GPU_SCRIPT = r"""
 $ErrorActionPreference = 'SilentlyContinue'
 while ($true) {
-  $e = (Get-Counter '\GPU Engine(*engtype_3D)\Utilization Percentage').CounterSamples
-  $util = ($e | Measure-Object -Property CookedValue -Sum).Sum
-  $mine = @{}
-  foreach ($s in $e) { if ($s.InstanceName -match 'pid_(\d+)_') { $p = [int]$Matches[1]; $mine[$p] = $mine[$p] + $s.CookedValue } }
-  $sh = ((Get-Counter '\GPU Adapter Memory(*)\Shared Usage').CounterSamples | Measure-Object -Property CookedValue -Sum).Sum
-  $de = ((Get-Counter '\GPU Adapter Memory(*)\Dedicated Usage').CounterSamples | Measure-Object -Property CookedValue -Sum).Sum
+  $all = (Get-Counter -Counter @('\GPU Engine(*engtype_3D)\Utilization Percentage', '\GPU Adapter Memory(*)\Shared Usage', '\GPU Adapter Memory(*)\Dedicated Usage')).CounterSamples
+  $util = 0; $sh = 0; $de = 0; $mine = @{}
+  foreach ($s in $all) {
+    if ($s.Path -like '*utilization percentage') {
+      $util += $s.CookedValue
+      if ($s.InstanceName -match 'pid_(\d+)_') { $p = [string]$Matches[1]; $mine[$p] = $mine[$p] + $s.CookedValue }
+    } elseif ($s.Path -like '*shared usage') { $sh += $s.CookedValue } else { $de += $s.CookedValue }
+  }
   $o = @{ util = $util; shared = $sh; dedicated = $de; pids = $mine } | ConvertTo-Json -Compress
   [Console]::Out.WriteLine($o); [Console]::Out.Flush()
-  Start-Sleep -Milliseconds 1500
+  Start-Sleep -Milliseconds 2000
 }
 """
 
@@ -146,6 +148,8 @@ class Telemetry:
         self.fine = collections.deque(maxlen=FINE_SECONDS)
         self.coarse = collections.deque(maxlen=COARSE_MINUTES)
         self.marks = collections.deque(maxlen=400)
+        self._mark_n = 0                # marks are numbered; each sample carries the ones made since the last
+        self._mark_sent = 0
         self.latest = None
         self.lock = threading.Lock()
         self.listeners = set()          # (loop, asyncio.Queue)
@@ -205,11 +209,11 @@ class Telemetry:
                 self._nvidia = _NvidiaReader(self.interval * 1000)
                 self._nvidia.cards = max(1, sum(1 for g in cards if g.get("vendor") == "nvidia"))
             elif os.name == "nt" and cards and (shutil.which("powershell") or shutil.which("pwsh")):
-                self._wingpu = _WindowsGpuReader()
+                self._wingpu_possible = True          # started while Performance is open (see _windows_gpu)
         except Exception as exc:
             self.log(f"telemetry: no GPU reader ({type(exc).__name__}: {exc})")
         psutil.cpu_percent(percpu=True)
-        self._thread = threading.Thread(target=self._loop, daemon=True, name="telemetry")
+        self._thread = threading.Thread(target=self._loop, args=(self._stop,), daemon=True, name="telemetry")
         self._thread.start()
 
     def stop(self):
@@ -217,10 +221,20 @@ class Telemetry:
         for r in (self._nvidia, self._wingpu):
             if r:
                 r.stop()
+        self._nvidia = self._wingpu = None
+        self._thread = None
 
-    def _loop(self):
+    def set_enabled(self, on):
+        """Settings → Performance and usage: readings on or off, at once."""
+        if on and not self._thread:
+            self._stop = threading.Event()
+            self.start()
+        elif not on and self._thread:
+            self.stop()
+
+    def _loop(self, stop):
         next_at = time.monotonic()
-        while not self._stop.is_set():
+        while not stop.is_set():
             try:
                 sample = self.sample()
                 self._keep(sample)
@@ -231,7 +245,7 @@ class Telemetry:
             if delay < 0:                                  # fell behind (a suspended laptop): start afresh
                 next_at = time.monotonic()
                 delay = self.interval
-            self._stop.wait(delay)
+            stop.wait(delay)
 
     # ------------------------------------------------------------------ one sample
     def _ours(self):
@@ -267,12 +281,17 @@ class Telemetry:
             return None
         total, seen, now_keys = 0, False, {}
         for pid in pids:
-            base = Path(f"/proc/{pid}/fdinfo")
             try:
-                entries = list(base.iterdir())
+                fds = os.listdir(f"/proc/{pid}/fd")
             except OSError:
                 continue
-            for e in entries:
+            for fd in fds:
+                try:                                   # only the graphics device's files, not every file and socket
+                    if "/dev/dri/" not in os.readlink(f"/proc/{pid}/fd/{fd}"):
+                        continue
+                except OSError:
+                    continue
+                e = Path(f"/proc/{pid}/fdinfo/{fd}")
                 text = _read(e, "")
                 if not text or "drm-engine-" not in text:
                     continue
@@ -297,6 +316,26 @@ class Telemetry:
         if not seen:
             return None
         return min(100.0, 100.0 * total / (elapsed * 1e9)) if elapsed > 0 else 0.0
+
+    def _windows_gpu(self):
+        """Windows without nvidia-smi: Task Manager's GPU counters, read by a PowerShell loop that runs only while
+        the Performance window is open (and two minutes after), since reading them costs processor time."""
+        if not getattr(self, "_wingpu_possible", False):
+            return None
+        now = time.monotonic()
+        if self.listeners:
+            self._watched = now
+            if self._wingpu is None:
+                try:
+                    self._wingpu = _WindowsGpuReader()
+                except Exception as exc:
+                    self._wingpu_possible = False
+                    self.log(f"telemetry: no Windows GPU counters ({type(exc).__name__}: {exc})")
+                    return None
+        elif self._wingpu is not None and now - getattr(self, "_watched", now) > 120:
+            self._wingpu.stop()
+            self._wingpu = None
+        return self._wingpu
 
     @staticmethod
     def _linux_gpus():
@@ -406,7 +445,7 @@ class Telemetry:
         cards = []
         if self._nvidia:
             cards = self._nvidia.read()
-        elif self._wingpu:
+        elif self._windows_gpu():
             w = self._wingpu.read()
             if w:
                 gpu_mem = ((w.get("dedicated") or 0) + (w.get("shared") or 0)) / 2**20
@@ -547,6 +586,8 @@ class Telemetry:
         row = {k: s.get(k) for k in SCALARS}
         row["t"] = s["t"]
         with self.lock:
+            s["new_marks"] = [m for m in self.marks if m["n"] > self._mark_sent]
+            self._mark_sent = self._mark_n
             self.latest = s
             self.fine.append(row)
             self._minute.append(row)
@@ -629,7 +670,8 @@ class Telemetry:
     # ------------------------------------------------------------------ marks on the charts (what happened when)
     def mark(self, text, kind="info", t=None):
         with self.lock:
-            self.marks.append({"t": round(t or time.time(), 3), "text": text, "kind": kind})
+            self._mark_n += 1
+            self.marks.append({"t": round(t or time.time(), 3), "text": text, "kind": kind, "n": self._mark_n})
 
     async def watch(self, bus, name_of=lambda mid: mid):
         """Mark models loading and unloading and tasks starting and ending, so a rise on a chart has a cause."""

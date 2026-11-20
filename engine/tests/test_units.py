@@ -476,3 +476,178 @@ def test_a_run_that_ran_out_of_context_may_load_its_model_larger():
     assert fit.overrides(RT(), "m")["ctx"] == 8192         # the model's own setting is the ceiling…
     fit.grow("m", 20000)
     assert fit.overrides(RT(), "m")["ctx"] == 20000        # …until a step ran out of context
+
+
+# ---------------------------------------------------------------------------------------------- usage and telemetry (2.27.0)
+def _meter(tmp_path):
+    from dva.cloud import USAGE
+    from dva.db import DB
+    from dva.meter import Meter
+    db = DB(tmp_path / "u.db")
+    return db, Meter(db, USAGE), USAGE
+
+
+class _Srv:
+    model_id = "qwen-9b"
+    read_tps = 14.0
+
+
+def test_usage_counts_calls_by_model_purpose_and_hour(tmp_path):
+    import time as _t
+    from dva.meter import purpose
+    db, m, usage = _meter(tmp_path)
+    db.insert("models", {"id": "qwen-9b", "name": "Qwen 9B"})
+    db.insert("chats", {"id": "c1", "title": "Prices", "origin": "user"})
+    usage.set({"chat_id": "c1", "purpose": "chat", "harness": "agent"})
+    for _ in range(3):
+        m.record_local(_Srv(), {"prompt_n": 200, "cache_n": 800, "predicted_n": 40, "prompt_ms": 14000, "predicted_ms": 10000}, 25)
+    with purpose("planner"):
+        m.record_local(_Srv(), {"prompt_n": 100, "predicted_n": 20, "prompt_ms": 7000, "predicted_ms": 5000}, 12)
+    m.record_local(_Srv(), {}, 180, status="timeout", error="no token")
+    s = m.summary(7)
+    t = s["totals"]
+    assert t["calls"] == 5 and t["failed"] == 1
+    assert t["read"] == 700 and t["cached"] == 2400 and t["written"] == 140
+    assert t["cache_percent"] == round(100 * 2400 / 3100)
+    assert t["read_tps"] == round(700 / 49, 1) and t["write_tps"] == round(140 / 35, 1)
+    assert s["by_model"][0]["name"] == "Qwen 9B" and s["by_model"][0]["share"] == 100
+    assert {p["key"]: p["calls"] for p in s["by_purpose"]} == {"chat": 4, "planner": 1}
+    now = _t.localtime()
+    assert s["heat"][now.tm_wday][now.tm_hour] == t["tokens"]
+    assert s["daily"][-1]["tokens"] == t["tokens"] and len(s["daily"]) == 7
+    assert s["top_chats"][0]["title"] == "Prices"
+    assert s["highlights"]["streak_days"] == 1
+    assert s["highlights"]["cache_saved_seconds"] == round(2400 / t["read_tps"])
+    assert s["latency"]["first_p50"] == 14.0
+
+
+def test_usage_adds_older_replies_once_and_can_be_switched_off(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    db, m, usage = _meter(tmp_path)
+    db.insert("chats", {"id": "c2", "title": "Old", "origin": "schedule"})
+    when = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    db.insert("messages", {"id": "m1", "chat_id": "c2", "role": "assistant", "content": "x", "created": when,
+                           "meta": {"model": "qwen-9b", "harness": "agent", "stats": {"model_calls": 3, "prompt_tokens": 500,
+                                    "cached_tokens": 100, "output_tokens": 60, "seconds": 90}}})
+    s = m.summary(7)
+    assert s["totals"]["calls"] == 3 and s["totals"]["written"] == 60 and s["has_history"]
+    assert s["by_purpose"][0]["key"] == "schedule"
+    assert Meter_rows(db) == 1
+    m._backfilled = False
+    m.summary(7)                                   # once only
+    assert Meter_rows(db) == 1
+    db.set_setting("usage_enabled", False)
+    m.record_local(_Srv(), {"prompt_n": 1}, 1)
+    assert Meter_rows(db) == 1
+    m.clear()
+    assert m.summary(7)["totals"]["calls"] == 0
+
+
+def Meter_rows(db):
+    return db.one("SELECT COUNT(*) AS n FROM model_calls")["n"]
+
+
+def test_online_calls_are_counted_with_their_time_and_cost(tmp_path):
+    import time as _t
+    from dva import cloud
+    db, m, usage = _meter(tmp_path)
+
+    class Prov:
+        def record(self, *a):
+            return 0.0123, False
+    srv = type("S", (), {"model_id": "cloud:openai:gpt", "cloud": type("C", (), {"meter": m})(), "providers": Prov()})()
+    a = cloud.Adapter.__new__(cloud.Adapter)
+    a.s, a.providers = srv, Prov()
+    cloud.CALL_START.set(_t.monotonic() - 2)
+    out = a.meter(1000, 200)
+    assert out["online"] and out["prompt_n"] == 1000
+    row = db.one("SELECT * FROM model_calls")
+    assert row["online"] == 1 and row["cost"] == 0.0123 and 1500 < row["total_ms"] < 10000
+
+
+def test_the_llm_stream_is_metered_and_shown_as_reading_then_writing(tmp_path):
+    from dva.llm import LLM, LLMTimeout
+    from dva.telemetry import Telemetry
+    db, m, usage = _meter(tmp_path)
+
+    class RT:
+        servers = {}
+    rt = RT()
+    rt.db, rt.meter = db, m
+    rt.telemetry = Telemetry(rt, db)
+    llm = LLM(rt)
+    phases = []
+
+    async def fake(server, body):
+        phases.append([c["phase"] for c in rt.telemetry.calls.values()])
+        yield "token", "a"
+        phases.append([c["phase"] for c in rt.telemetry.calls.values()])
+        yield "token", "b"
+        yield "end", {"timings": {"prompt_n": 50, "predicted_n": 2, "prompt_ms": 1000, "predicted_ms": 500}}
+
+    async def broken(server, body):
+        yield "token", "a"
+        raise LLMTimeout("stuck", "stall")
+
+    async def go():
+        llm._stream = fake
+        async for _ in llm._events(_Srv(), {}):
+            pass
+        llm._stream = broken
+        with pytest.raises(LLMTimeout):
+            async for _ in llm._events(_Srv(), {}, purpose="snapshot"):
+                pass
+    asyncio.run(go())
+    assert phases == [["reading"], ["writing"]]
+    assert rt.telemetry.calls == {} and rt.telemetry._written == 3
+    rows = db.all("SELECT status, purpose, read_tokens FROM model_calls ORDER BY id")
+    assert [r["status"] for r in rows] == ["ok", "timeout"] and rows[0]["read_tokens"] == 50
+    assert rows[1]["purpose"] == "snapshot"
+
+
+def test_telemetry_samples_keeps_history_marks_and_kimios_readings(tmp_path, monkeypatch):
+    import time as _t
+    from dva import telemetry
+    from dva.db import DB
+    db = DB(tmp_path / "t.db")
+    kos = tmp_path / "telemetry.json"
+    kos.write_text(json.dumps({"gpus": [{"card": "card0", "util": 37.5}], "power_cpu_w": 9.2, "fan_rpm": 2400,
+                               "throttled": False, "slice_mem_mb": 6000, "slice_max_mb": 27000}))
+    monkeypatch.setattr(telemetry, "KIMIOS_FILE", str(kos))
+
+    class RT:
+        servers = {}
+    t = telemetry.Telemetry(RT(), db, interval=0.2)
+    t.mark("Loaded Qwen", "load")
+    t.start()
+    try:
+        _t.sleep(1.1)
+        h = t.history(60)
+        assert len(h["samples"]) >= 3 and h["running"]
+        s = h["latest"]
+        assert 0 <= s["cpu"] <= 100 and s["mem_used_mb"] > 0 and s["kimilm_mem_mb"] > 0
+        assert s["kimios"] and s["gpu"] == 37.5 and s["power_cpu_w"] == 9.2 and s["slice_max_mb"] == 27000
+        assert h["marks"][0]["text"] == "Loaded Qwen"
+        assert set(h["samples"][-1]) <= set(telemetry.SCALARS) | {"t"}
+        top = t.processes()
+        assert top["cpu"] and any(p["kimilm"] for p in top["memory"] + top["cpu"]) or top["memory"]
+        t.set_enabled(False)
+        assert t._thread is None
+        n = len(t.fine)
+        _t.sleep(0.5)
+        assert len(t.fine) == n                          # stopped
+        t.set_enabled(True)
+        _t.sleep(0.5)
+        assert len(t.fine) > n
+    finally:
+        t.stop()
+    kos.write_text("{}")
+    os.utime(kos, (0, 0))                                # an old file: the service is not running
+    assert t._kimios() is None
+
+
+def test_telemetry_minute_averages_keep_peaks():
+    from dva.telemetry import Telemetry
+    rows = [{"t": i, "cpu": v, "gpu": None} for i, v in enumerate([10, 90, 20])]
+    agg = Telemetry._aggregate(rows)
+    assert agg["cpu"] == 40 and agg["cpu_max"] == 90 and agg["gpu"] is None

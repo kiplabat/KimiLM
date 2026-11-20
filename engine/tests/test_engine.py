@@ -4816,3 +4816,39 @@ def test_a_chat_shows_what_it_runs_with_and_a_busy_model_can_be_unloaded(engine)
     assert all("held_by" in l for l in loaded)
     for l in loaded:                                     # force works when nothing uses it, too
         assert c.post("/api/runtime/unload", json={"model_id": l["model_id"], "force": True}).status_code == 200
+
+
+def test_performance_readings_and_usage_statistics(engine):
+    """2.27.0: the computer's readings (history, the live stream, programs, switching off) and every model call
+    counted (by model, purpose and chat), with a CSV of the calls."""
+    c = engine["client"]
+    chat = c.post("/api/chats", json={"harness": "chat"}).json()
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "hello again"}).json()
+    assert wait_job(c, job["job_id"])["status"] == "done"
+    time.sleep(2.5)
+    h = c.get("/api/telemetry?seconds=120").json()
+    assert h["running"] and len(h["samples"]) >= 2 and h["info"]["threads"] >= 1
+    assert h["latest"]["mem_total_mb"] > 0 and "tok_write" in h["samples"][-1]
+    assert any(m["text"].startswith(("Started", "Finished", "Loaded", "Loading")) for m in h["marks"])
+    with httpx.Client(base_url=f"http://127.0.0.1:{engine['port']}", timeout=10, trust_env=False) as raw:
+        with raw.stream("GET", f"/api/telemetry/stream?token={engine['token']}") as r:
+            assert r.status_code == 200
+            for line in r.iter_lines():
+                if line.startswith("data:"):
+                    sample = json.loads(line[5:])
+                    assert "cpu" in sample and "new_marks" in sample
+                    break
+    top = c.get("/api/telemetry/processes").json()
+    assert top["memory"]
+    assert "cpu" in c.get("/api/telemetry/summary?seconds=60").json()
+    u = c.get("/api/usage?days=7").json()
+    assert u["totals"]["calls"] >= 1 and u["totals"]["written"] > 0
+    assert any(p["key"] == "chat" for p in u["by_purpose"])
+    assert u["top_chats"] and all(t["tokens"] > 0 for t in u["top_chats"])
+    assert len(u["daily"]) == 7 and len(u["heat"]) == 7
+    csv = c.get("/api/usage/export?days=7")
+    assert csv.status_code == 200 and csv.text.startswith("when,model_name") and chat["id"] in csv.text
+    c.put("/api/settings", json={"telemetry_enabled": False})
+    assert c.get("/api/telemetry?seconds=60").json()["running"] is False
+    c.put("/api/settings", json={"telemetry_enabled": True})
+    assert c.get("/api/telemetry?seconds=60").json()["running"] is True

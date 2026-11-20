@@ -64,7 +64,8 @@ KimiLM was called **Datavera Agent** up to 2.1.x. Version 2.2.0 renamed it; see 
 app/                Electron shell (window, tray, start with Windows) + React UI (Vite)
   electron/         main.cjs (starts the engine, window, tray), preload.cjs (safe bridge),
                     migrate.cjs (first start: moves the data from Datavera Agent)
-  src/              the UI: pages/ (Chat, Projects, Models, Plugins, Skills, Harnesses, Schedules, Activity, Memory, Settings)
+  src/              the UI: pages/ (Chat, Projects, Models, Plugins, Skills, Harnesses, Schedules, Activity, Performance,
+                    Usage, Memory, Settings); components/Charts.tsx (charts), components/Resizable.tsx (resizable parts)
   scripts/          dev.mjs (development), prepare-resources.mjs (gathers what the installer ships)
   build/            icons, installer.nsh (installer messages; offers to remove Datavera Agent)
 engine/             Python engine (FastAPI on 127.0.0.1 + a per-launch token) — see engine/README.md

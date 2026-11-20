@@ -61,6 +61,8 @@ class Meter:
                total_ms=0.0, cost=0.0, status="ok", error=None, ctx=None, ts=None, calls=1):
         """One finished (or failed) model call. Never raises: statistics must not break a reply."""
         try:
+            if status != "history" and self.db.setting("usage_enabled", True) is False:
+                return
             ctx = ctx if ctx is not None else self.context()
             ts = ts or time.time()
             when = _local(ts)

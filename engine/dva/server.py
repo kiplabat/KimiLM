@@ -133,6 +133,8 @@ def create_app(data_dir=None, resources_dir=None, token=None):
             if key == "models_dir" and value:
                 Path(value).mkdir(parents=True, exist_ok=True)
             a.db.set_setting(key, value)
+            if key == "telemetry_enabled":
+                await asyncio.to_thread(a.telemetry.set_enabled, bool(value))
         a.bus.publish("settings_changed")
         return {"ok": True}
 

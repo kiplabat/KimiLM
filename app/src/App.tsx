@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
   Activity as ActivityIcon, BookOpen, Brain, CalendarClock, Cpu, AudioLines, FolderKanban, Image as ImageIcon, MessageSquarePlus, Plug, Search,
-  Settings as SettingsIcon, Workflow, Loader2, Pin, Rocket, WifiOff, Film, ChevronDown, ChevronRight,
+  Settings as SettingsIcon, Workflow, Loader2, Pin, Rocket, WifiOff, Film, ChevronDown, ChevronRight, Gauge, ChartColumn,
 } from "lucide-react";
 import { api } from "./api";
 import { go, Shown, useApp } from "./store";
@@ -22,9 +22,14 @@ import Video from "./pages/Video";
 import Memory from "./pages/Memory";
 import Settings from "./pages/Settings";
 import Onboarding from "./pages/Onboarding";
+import Performance from "./pages/Performance";
+import Usage from "./pages/Usage";
+import { Handle, useSize } from "./components/Resizable";
 
 const NAV = [
   { page: "activity", label: "Activity", icon: ActivityIcon },
+  { page: "performance", label: "Performance", icon: Gauge },
+  { page: "usage", label: "Usage", icon: ChartColumn },
   { page: "tasks", label: "Long-running tasks", icon: Rocket },
   { page: "schedules", label: "Schedules", icon: CalendarClock },
   { page: "images", label: "Images", icon: ImageIcon },
@@ -151,6 +156,7 @@ function Sidebar() {
 // screens stay in the order they were first opened (moving one would reset it) and are hidden; the least recently
 // seen go when there are more than KEEP (chats: KEEP_CHATS, they can be long).
 const KEEP = 12, KEEP_CHATS = 6;
+const SIDE_MIN = 200, SIDE_MAX = 560;
 const PER_ID = ["chat", "project", "home"];       // one kept screen per chat or project; the others one per page
 
 function slotKey(page: string, id?: string) {
@@ -189,18 +195,24 @@ export default function App() {
     case "sound": page = <Sound />; break;
     case "video": page = <Video tab={route.id} />; break;
     case "memory": page = <Memory />; break;
-    case "settings": page = <Settings />; break;
+    case "settings": page = <Settings section={route.id} />; break;
+    case "performance": page = <Performance />; break;
+    case "usage": page = <Usage />; break;
     default: page = <Home projectId={route.page === "home" ? route.id : undefined} />;
   }
   const key = onboarding ? "onboarding" : slotKey(route.page, route.id);
   const slots = useKept(boot ? key : "", page);
+  const [sideW, setSideW, resetSide] = useSize("sidebar", 268, SIDE_MIN, SIDE_MAX);   // 2.27.0
   if (bootError && !boot) {
     return <div className="center-screen"><h2>Can't reach the engine</h2><p>{bootError}</p><p className="muted">If this persists, restart KimiLM. Logs are in the app's data folder.</p></div>;
   }
   if (!boot) return <div className="center-screen"><Spinner size={28} /><p className="muted">Starting…</p></div>;
   return (
-    <div className="shell">
+    <div className="shell" style={{ ["--side-w" as any]: `${sideW}px` }}>
       <Sidebar />
+      <Handle axis="x" className="shell-handle" value={sideW} min={SIDE_MIN} max={SIDE_MAX} onReset={resetSide}
+        onDrag={(d, start) => setSideW(start + d)} onStep={(d) => setSideW(sideW + d)}
+        label="Drag to make the sidebar wider or narrower" />
       <main className="main">
         {slots.map(([k, el]) => (
           <Shown.Provider key={k} value={k === key}>

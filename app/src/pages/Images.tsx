@@ -5,6 +5,7 @@ import { Cloud, Cpu, Download, ExternalLink, Image as ImageIcon, Plus, Star, Tra
 import { api, desktop, fileUrl, fmtBytes, fmtTime } from "../api";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, ConfirmButton, Empty, Field, Modal, PageHeader, Progress, Spinner, Tabs } from "../components/ui";
+import { SplitPane } from "../components/Resizable";
 import { EDIT_KEY, PictureGrid } from "../components/Pictures";
 import { WorkButtons, WorkLine, WorkNote } from "../components/Work";
 
@@ -79,7 +80,7 @@ function Create({ state, toModels }: any) {
   );
   const online = chosen?.kind === "online";
   return (
-    <div className="grid-2 image-studio">
+    <SplitPane id="images" className="grid-2 image-studio" initial={0.465}>
       <div className="card stack-s">
         <Field label={source ? "What should change?" : "What should the picture show?"}
           help={source ? "Say what should be different, or describe the picture as it should look afterwards." : "The subject, the setting, the style (photo, drawing, logo…), the light and the colours. Put words that must appear in the picture in quotes."}>
@@ -152,7 +153,7 @@ function Create({ state, toModels }: any) {
           </div>
         ))}
       </div>
-    </div>
+    </SplitPane>
   );
 }
 

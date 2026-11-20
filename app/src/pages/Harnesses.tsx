@@ -3,6 +3,7 @@ import { Copy, MessageSquarePlus, Plus, Trash2, Upload, Workflow, X } from "luci
 import { api, enc } from "../api";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, ConfirmButton, Field, PageHeader, Spinner, Toggle } from "../components/ui";
+import { SplitPane } from "../components/Resizable";
 import { startAgentChat } from "./Skills";
 
 const GROUPS = [
@@ -105,7 +106,7 @@ export default function Harnesses({ selected }: { selected?: string }) {
         <input className="input" value={ask} onChange={(e) => setAsk(e.target.value)} placeholder="Or describe the assistant you want, e.g. 'a proofreader for my reports'" />
         <Button kind="primary" disabled={!ask} onClick={() => startAgentChat(`Create a harness for me: ${ask}. Load the harness-creator skill first, propose the design, then save it with save_harness.`)}>Ask the agent</Button>
       </div>
-      <div className="split">
+      <SplitPane id="harnesses" className="split" initial={0.3} min={0.15} max={0.6}>
         <div className="list-col">
           {list.map((h) => (
             <div key={h.id} className={`pick-row${selected === h.id ? " active" : ""}`} onClick={() => go("harnesses", h.id)}>
@@ -150,7 +151,7 @@ export default function Harnesses({ selected }: { selected?: string }) {
             </div>
           )}
         </div>
-      </div>
+      </SplitPane>
     </div>
   );
 }
