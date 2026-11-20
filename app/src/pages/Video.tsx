@@ -7,6 +7,7 @@ import { Camera, Clapperboard, Cloud, Cpu, Download, ExternalLink, FileText, Fil
 import { api, desktop, fileUrl, fmtBytes, fmtTime } from "../api";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, ConfirmButton, Empty, Field, PageHeader, Progress, Spinner, Tabs, Toggle } from "../components/ui";
+import { SplitPane } from "../components/Resizable";
 import { VideoClip } from "../components/Audio";
 import { WorkButtons, WorkLine, WorkNote } from "../components/Work";
 
@@ -80,7 +81,7 @@ function Make({ state, jobs, voices, forget }: any) {
   };
   const writingJob = jobs.find((j: any) => j.id === writing);
   return (
-    <div className="grid-2 image-studio">
+    <SplitPane id="video" className="grid-2 image-studio" initial={0.465}>
       <div className="stack-s">
         <div className="card stack-s">
           <p>A video built on this computer: each scene is a picture with a voice over it, captions in step with the voice, and music underneath if you like. No video model is needed.</p>
@@ -134,7 +135,7 @@ function Make({ state, jobs, voices, forget }: any) {
         </div>
       </div>
       <div className="stack-s"><Jobs jobs={jobs} kinds={["make"]} pauseStop={state.pause_stop_minutes} onForget={forget} render={(r: any) => <VideoClip item={r} large />} /></div>
-    </div>
+    </SplitPane>
   );
 }
 
@@ -170,7 +171,7 @@ function Change({ state, jobs, library, forget }: any) {
     } catch (e: any) { toast(e.message, "error"); }
   };
   return (
-    <div className="grid-2 image-studio">
+    <SplitPane id="video" className="grid-2 image-studio" initial={0.465}>
       <div className="card stack-s">
         <p>Keep a part of a video, join several, give it another sound, and burn subtitles in. The result is a new .mp4; your file is not changed.</p>
         <div className="drop" onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); add(e.dataTransfer.files); }} onClick={() => file.current?.click()}>
@@ -203,7 +204,7 @@ function Change({ state, jobs, library, forget }: any) {
         <div><Button kind="primary" icon={<Scissors size={14} />} disabled={!clips.length} onClick={run}>{clips.length > 1 ? `Join ${clips.length} videos` : "Make the new video"}{total ? ` (${mmss(total)})` : ""}</Button></div>
       </div>
       <div className="stack-s"><Jobs jobs={jobs} kinds={["edit"]} pauseStop={state.pause_stop_minutes} onForget={forget} render={(r: any) => <VideoClip item={r} large />} /></div>
-    </div>
+    </SplitPane>
   );
 }
 
@@ -226,7 +227,7 @@ function Clip({ state, jobs, toModels, forget }: any) {
   };
   const online = !local.length || model === "google";
   return (
-    <div className="grid-2 image-studio">
+    <SplitPane id="video" className="grid-2 image-studio" initial={0.465}>
       <div className="card stack-s">
         <Field label="Describe the clip"><textarea className="input" rows={4} value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="What is seen, how it moves, the light, the style. e.g. a paper boat drifting down a rain gutter, close up, soft evening light" /></Field>
         <div className="row gap-m wrap">
@@ -240,7 +241,7 @@ function Clip({ state, jobs, toModels, forget }: any) {
         <div><Button kind="primary" icon={<Wand2 size={14} />} disabled={!prompt.trim()} onClick={start}>Make the clip</Button></div>
       </div>
       <div className="stack-s"><Jobs jobs={jobs} kinds={["clip"]} pauseStop={state.pause_stop_minutes} onForget={forget} render={(r: any) => <VideoClip item={r} large />} /></div>
-    </div>
+    </SplitPane>
   );
 }
 

@@ -3,6 +3,7 @@ import { AlertTriangle, BookOpen, Brain, FileText, FolderOpen, MessageSquarePlus
 import { api, desktop, fmtBytes, fmtTime } from "../api";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, ConfirmButton, Field, FolderInput, Markdown, PageHeader, Spinner, Toggle } from "../components/ui";
+import { SplitPane } from "../components/Resizable";
 
 const KNOWLEDGE_TYPES = ".pdf,.docx,.pptx,.xlsx,.xlsm,.xls,.ods,.odt,.rtf,.txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.xml,.html,.htm,.py,.r,.js,.ts,.tsx,.jsx,.sql,.java,.c,.cpp,.h,.cs,.go,.rs,.rb,.php,.sh,.ps1,.ini,.toml,.cfg,.log,.tex,.rst,.ipynb";
 
@@ -101,7 +102,7 @@ export default function ProjectView({ projectId }: { projectId?: string }) {
       <PageHeader title={isNew ? "New project" : p.name}
         subtitle="A project keeps related chats together with shared instructions, folders, defaults and memory."
         actions={!isNew && <Button kind="primary" icon={<MessageSquarePlus size={15} />} onClick={() => go("home", projectId)}>New chat in project</Button>} />
-      <div className="grid-2">
+      <SplitPane id="project" className="grid-2" initial={0.545}>
         <div className="card">
           <Field label="Name"><input className="input" value={p.name} onChange={(e) => setP({ ...p, name: e.target.value })} placeholder="e.g. Monthly energy report" /></Field>
           <Field label="Instructions" help="Always given to the agent in this project: goals, tone, conventions, what to avoid.">
@@ -161,7 +162,7 @@ export default function ProjectView({ projectId }: { projectId?: string }) {
             </div>
           </div>
         )}
-      </div>
+      </SplitPane>
     </div>
   );
 }

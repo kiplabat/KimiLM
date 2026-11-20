@@ -9,6 +9,7 @@ import { MediaStrip, ReadAloud } from "../components/Audio";
 import { Pulse, span, useTick } from "../components/Work";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, Markdown, Spinner, Toggle } from "../components/ui";
+import { Handle, useSize } from "../components/Resizable";
 import { Composer, ConnectorPicker, FolderPicker, HarnessPicker, LimitsPicker, ModelPicker, TeamPicker, ThinkingToggle, uploadAll } from "../components/Pickers";
 
 const clock = (iso?: string) => { const d = iso ? new Date(iso) : null; return d && !isNaN(+d) ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : ""; };
@@ -568,6 +569,7 @@ export default function ChatView({ chatId }: { chatId: string }) {
   const [learned, setLearned] = useState<any[]>([]);
   const [showFiles, setShowFiles] = useState(false);
   const [showProgress, setShowProgressRaw] = useState<boolean>(progressPref);
+  const [panelW, setPanelW, resetPanel] = useSize("chat.panel", 320, 240, 820);    // 2.27.0: drag its edge
   const setShowProgress = (v: boolean) => { setShowProgressRaw(v); try { window.localStorage.setItem("kimilm.progress", v ? "1" : "0"); } catch { /* private mode */ } };
   const [menu, setMenu] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
@@ -691,7 +693,7 @@ export default function ChatView({ chatId }: { chatId: string }) {
   const settled = chat.messages.filter((m: any) => !m.meta?.pending);
 
   return (
-    <div className="chat-layout">
+    <div className="chat-layout" style={{ ["--panel-w" as any]: `${panelW}px` }}>
       <div className="chat-col">
         <div className="chat-head">
           <div className="chat-title">
@@ -766,6 +768,9 @@ export default function ChatView({ chatId }: { chatId: string }) {
             </>} />
         </div>
       </div>
+      {(showProgress || showFiles) && <Handle axis="x" value={panelW} min={240} max={820} onReset={resetPanel}
+        onDrag={(d, start) => setPanelW(start - d)} onStep={(d) => setPanelW(panelW - d)}
+        label="Drag to make the side panel wider or narrower" />}
       {showProgress && !showFiles && <ProgressPanel progress={progress} openRun={!running ? chat.open_run : null} onResume={resumeRun} onMore={moreRun} onDismiss={dismissRun} onClose={() => setShowProgress(false)} />}
       {showFiles && <FilesPanel chatId={chatId} onClose={() => setShowFiles(false)} />}
     </div>

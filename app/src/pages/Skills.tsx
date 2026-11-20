@@ -3,6 +3,7 @@ import { BookOpen, Copy, Lightbulb, MessageSquarePlus, Plus, Trash2, Upload } fr
 import { api, enc } from "../api";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, ConfirmButton, Field, Markdown, Modal, PageHeader, Spinner, Toggle } from "../components/ui";
+import { SplitPane } from "../components/Resizable";
 
 export async function startAgentChat(text: string, harness = "agent") {
   const chat = await api.post("/chats", { harness });
@@ -68,7 +69,7 @@ export default function Skills({ selected }: { selected?: string }) {
           ))}
         </div>
       )}
-      <div className="split">
+      <SplitPane id="skills" className="split" initial={0.3} min={0.15} max={0.6}>
         <div className="list-col">
           {groups.map(([src, title]) => {
             const items = data.skills.filter((s: any) => s.source === src);
@@ -112,7 +113,7 @@ export default function Skills({ selected }: { selected?: string }) {
             </div>
           )}
         </div>
-      </div>
+      </SplitPane>
       {creating && <NewSkill onClose={() => setCreating(false)} onDone={load} />}
     </div>
   );

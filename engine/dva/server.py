@@ -2,6 +2,7 @@
 generates (header `Authorization: Bearer …`, or `?token=` for event streams and file links)."""
 import asyncio
 import hmac
+import json
 import mimetypes
 import os
 import re
@@ -132,6 +133,8 @@ def create_app(data_dir=None, resources_dir=None, token=None):
             if key == "models_dir" and value:
                 Path(value).mkdir(parents=True, exist_ok=True)
             a.db.set_setting(key, value)
+            if key == "telemetry_enabled":
+                await asyncio.to_thread(a.telemetry.set_enabled, bool(value))
         a.bus.publish("settings_changed")
         return {"ok": True}
 
@@ -168,6 +171,50 @@ def create_app(data_dir=None, resources_dir=None, token=None):
                 yield sse(event)
         return StreamingResponse(gen(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    # ------------------------------------------------------------------ Performance and Usage (2.27.0)
+    @api.get("/api/telemetry")
+    async def telemetry(seconds: int = 300):
+        """The last `seconds` of samples (second by second up to an hour, then minute by minute), the marks
+        (models loaded, tasks started) in that time, and the machine the samples describe."""
+        return await asyncio.to_thread(A().telemetry.history, seconds)
+
+    @api.get("/api/telemetry/stream")
+    async def telemetry_stream(request: Request):
+        async def gen():
+            async for sample in A().telemetry.subscribe():
+                if await request.is_disconnected():
+                    break
+                yield ": ping\n\n" if sample is None else f"data: {json.dumps(sample, default=str)}\n\n"
+        return StreamingResponse(gen(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    @api.get("/api/telemetry/processes")
+    async def telemetry_processes():
+        return await asyncio.to_thread(A().telemetry.processes)
+
+    @api.get("/api/telemetry/summary")
+    async def telemetry_summary(seconds: int = 300):
+        return await asyncio.to_thread(A().telemetry.summary, seconds)
+
+    @api.get("/api/usage")
+    async def usage(days: int = 30):
+        return await asyncio.to_thread(A().meter.summary, days)
+
+    @api.get("/api/usage/export")
+    async def usage_export(days: int = 30):
+        rows = await asyncio.to_thread(A().meter.export_rows, days)
+        cols = ["when", "model_name", "model_id", "online", "purpose", "harness", "chat_id", "read_tokens",
+                "cached_tokens", "written_tokens", "read_ms", "write_ms", "total_ms", "cost", "status", "error", "calls"]
+        q = lambda v: '"' + str("" if v is None else v).replace('"', '""') + '"'
+        text = "\n".join([",".join(cols)] + [",".join(q(r.get(c)) for c in cols) for r in rows]) + "\n"
+        return StreamingResponse(iter([text]), media_type="text/csv",
+                                 headers={"Content-Disposition": f'attachment; filename="kimilm-usage-{days}d.csv"'})
+
+    @api.delete("/api/usage")
+    async def usage_clear():
+        await asyncio.to_thread(A().meter.clear)
+        return {"ok": True}
 
     # ------------------------------------------------------------------ code → connected services (2.19.0)
     @api.post("/api/bridge/call")

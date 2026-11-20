@@ -5,6 +5,7 @@ import { Cloud, Cpu, ExternalLink, Eye, KeyRound, Plus, RefreshCw, Search, Shiel
 import { api, desktop, enc } from "../api";
 import { useApp, useEvent } from "../store";
 import { Badge, Button, ConfirmButton, Field, Modal, Progress, Spinner, Toggle } from "../components/ui";
+import { SplitPane } from "../components/Resizable";
 
 export const money = (n: any, digits = 2) => (n === null || n === undefined || isNaN(Number(n)) ? "—" : `$${Number(n).toFixed(digits)}`);
 const per1m = (p: any) => (p && p.in !== undefined && p.out !== undefined ? `${money(p.in)} in · ${money(p.out)} out per 1M tokens` : "price unknown");
@@ -274,10 +275,10 @@ export default function Online() {
           </select>
         </Field>
       </div>
-      <div className="grid-2">
+      <SplitPane id="online" className="grid-2" initial={0.5}>
         <Budget data={data} reload={reload} />
         <div className="stack"><AutoPreview data={data} /><Privacy data={data} reload={reload} /></div>
-      </div>
+      </SplitPane>
       {data.models.length > 0 && <h3 className="mt">Online models in use</h3>}
       {data.models.map((m: any) => <ModelRow key={m.id} m={m} reload={reload} isDefault={m.id === defaultModel} />)}
       <h3 className="mt">Providers</h3>

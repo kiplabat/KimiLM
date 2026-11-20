@@ -4,7 +4,7 @@ import time
 from datetime import datetime
 
 from .bridge import Bridge
-from .cloud import Cloud
+from .cloud import USAGE, Cloud
 from .db import DB, new_id, now
 from .embed import Embedder
 from .events import EventBus
@@ -16,6 +16,7 @@ from .knowledge import Knowledge
 from .llm import LLM
 from .mcp import Connectors
 from .memory import Memory
+from .meter import Meter
 from .migration import rewrite_moved_paths
 from .models import Models
 from .procs import Procs, contain
@@ -29,6 +30,7 @@ from .secrets import Secrets
 from .services import Services
 from .skills import Skills
 from .sound import Sound
+from .telemetry import Telemetry
 from .video import Video
 from .voices import Voices
 
@@ -114,6 +116,11 @@ class App:
         self.models = Models(self.paths, self.db, self.bus, self.runtime)
         self.providers = Providers(self.db, self.secrets, self.bus, self.log)
         self.runtime.cloud = Cloud(self.providers, self.db)
+        # 2.27.0: every model call is counted (Usage), and the computer is watched second by second (Performance)
+        self.meter = Meter(self.db, USAGE, self.log)
+        self.runtime.meter = self.runtime.cloud.meter = self.meter
+        self.telemetry = Telemetry(self.runtime, self.db, self.log)
+        self.runtime.telemetry = self.telemetry
         self.models.providers = self.providers
         self.router = Router(self)
         self.memory = Memory(self)
@@ -206,6 +213,9 @@ class App:
         await asyncio.to_thread(self.procs.end_leftovers)
         self._bg = [asyncio.create_task(self.scheduler.loop()), asyncio.create_task(self.runtime.idle_watch()),
                     asyncio.create_task(self.knowledge.loop()), asyncio.create_task(self.explorer.loop())]
+        await asyncio.to_thread(self.telemetry.start)
+        self._bg.append(asyncio.create_task(self.telemetry.watch(
+            self.bus, lambda mid: (self.models.get_any(mid) or {}).get("name") or str(mid).split(":")[-1])))
         self.log(f"engine started; data {self.paths.data}; secrets backend {self.secrets.backend}")
         # runs that were going when the app closed or crashed can be continued (2.7.0)
         cut = self.db.all("SELECT id, chat_id, resumes, kind FROM runs WHERE status='running'")
@@ -433,6 +443,7 @@ class App:
     async def stop(self):
         for t in self._bg:
             t.cancel()
+        self.telemetry.stop()
         await self.jobs.shutdown()
         await asyncio.to_thread(self.procs.end_all)
         await self.connectors.shutdown()
