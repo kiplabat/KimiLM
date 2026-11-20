@@ -36,7 +36,7 @@ STATE = None
 
 DEFAULT_SETTINGS = {
     "default_harness": "agent", "default_compute": "auto", "default_ctx": 8192, "max_reply_tokens": 2048,
-    "unload_after_minutes": 20, "engine_memory_percent": 85, "memory_enabled": True, "learn_enabled": True, "learn_delay_seconds": 45,
+    "unload_after_minutes": 20, "engine_memory_percent": 85, "explore_when_idle": True, "explore_idle_minutes": 30, "suggestions_enabled": False, "memory_enabled": True, "learn_enabled": True, "learn_delay_seconds": 45,
     "allow_python": True, "approval_timeout_minutes": 360, "max_native_tools": 47, "python_timeout_seconds": 180,
     # 2.19.0: the most a tool call may ask for a program's time, and how many programs agents may run at once
     "code_timeout_max_seconds": 900, "code_runs_at_once": 2,
@@ -138,6 +138,10 @@ class App:
         self.forecaster = Forecaster(self)
         from .evals import Evals
         self.evals = Evals(self)
+        from .explore import Explorer
+        self.explorer = Explorer(self)          # measuring better setups while idle (2.24.0)
+        from .suggest import Suggestions
+        self.suggestions = Suggestions(self)    # better ways of working, opt-in (2.24.0)
         self._bg = []
         for key, value in DEFAULT_SETTINGS.items():
             if self.db.setting(key) is None:
@@ -201,7 +205,7 @@ class App:
         self.procs.job = contain(self.memory_limit())
         await asyncio.to_thread(self.procs.end_leftovers)
         self._bg = [asyncio.create_task(self.scheduler.loop()), asyncio.create_task(self.runtime.idle_watch()),
-                    asyncio.create_task(self.knowledge.loop())]
+                    asyncio.create_task(self.knowledge.loop()), asyncio.create_task(self.explorer.loop())]
         self.log(f"engine started; data {self.paths.data}; secrets backend {self.secrets.backend}")
         # runs that were going when the app closed or crashed can be continued (2.7.0)
         cut = self.db.all("SELECT id, chat_id, resumes, kind FROM runs WHERE status='running'")

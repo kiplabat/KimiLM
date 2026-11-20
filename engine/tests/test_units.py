@@ -190,3 +190,162 @@ def test_contain_does_nothing_outside_windows():
     from dva import procs
     if os.name != "nt":
         assert procs.contain(10 ** 9) is None
+
+
+# ---------------------------------------------------------------------------------------------- exploring while idle
+class ExploreDB:
+    def __init__(self, models, settings=None, active_jobs=0, last_job=None):
+        self.models, self.settings, self.active_jobs, self.last_job = models, dict(settings or {}), active_jobs, last_job
+
+    def setting(self, key, default=None):
+        return self.settings.get(key, default)
+
+    def set_setting(self, key, value):
+        self.settings[key] = value
+
+    def one(self, sql, params=()):
+        if "COUNT(*)" in sql:
+            return {"n": self.active_jobs}
+        return {"t": self.last_job}
+
+    def all(self, sql, params=()):
+        return list(self.models)
+
+
+def explore_app(tmp_path, monkeypatch, **db_kw):
+    import time as _time
+    from dva import explore, hardware
+    model_file = tmp_path / "m.gguf"
+    model_file.write_text("x")
+    models = db_kw.pop("models", [{"id": "qwen", "path": str(model_file), "bench": {}},
+                                  {"id": "cloud:x", "path": "", "bench": {}}])
+    db = ExploreDB(models, **db_kw)
+
+    class Tunes:
+        def __init__(self):
+            self.tunes, self.started, self.stopped = {}, [], []
+
+        def tune(self, model_id, llm):
+            self.started.append(model_id)
+            self.tunes[model_id] = {"state": "done", "best": "CPU only"}
+
+        def stop_tune(self, model_id):
+            self.stopped.append(model_id)
+            self.tunes[model_id]["state"] = "stopped"
+
+    class Runtime:
+        servers = {}
+        last_used = _time.monotonic() - 3600          # idle for an hour
+
+    class Bus:
+        def __init__(self):
+            self.events = []
+
+        def publish(self, name, **kw):
+            self.events.append((name, kw))
+
+    class App:
+        pass
+    app = App()
+    app.db, app.models, app.runtime, app.bus, app.llm = db, Tunes(), Runtime(), Bus(), None
+    app.evals = type("E", (), {"current": None})()
+    app.log = lambda msg: None
+    monkeypatch.setattr(hardware, "power", lambda: {"on_ac": True})
+    monkeypatch.setattr(explore.Explorer, "quiet_processor", staticmethod(lambda: True))
+    return app, explore.Explorer(app)
+
+
+def test_explorer_measures_an_unmeasured_local_model_when_idle(tmp_path, monkeypatch):
+    app, ex = explore_app(tmp_path, monkeypatch)
+    model, why = ex.check()
+    assert why is None and model["id"] == "qwen"
+    entry = asyncio.run(ex.explore(model))
+    assert app.models.started == ["qwen"] and entry["result"] == "done" and entry["best"] == "CPU only"
+    assert app.db.settings["explore_history"][-1]["model_id"] == "qwen"
+    assert ex.check() == (None, "already explored in the last day")
+
+
+def test_explorer_waits_for_quiet(tmp_path, monkeypatch):
+    from dva import hardware
+    app, ex = explore_app(tmp_path, monkeypatch, active_jobs=1)
+    assert ex.check()[1] == "1 chat or task running"
+    app, ex = explore_app(tmp_path, monkeypatch, settings={"explore_when_idle": False})
+    assert ex.check()[1] == "switched off"
+    app, ex = explore_app(tmp_path, monkeypatch)
+    monkeypatch.setattr(hardware, "power", lambda: {"on_ac": False})
+    assert ex.check()[1] == "on battery"
+    app, ex = explore_app(tmp_path, monkeypatch)
+    import time as _time
+    app.runtime.last_used = _time.monotonic() - 60
+    assert ex.check()[1].startswith("waiting for 30 idle minutes")
+
+
+def test_explorer_skips_measured_and_missing_models(tmp_path, monkeypatch):
+    from dva.db import now
+    app, ex = explore_app(tmp_path, monkeypatch, models=[
+        {"id": "fresh", "path": str(tmp_path / "m.gguf"), "bench": {"tune": {"at": now()}}},
+        {"id": "gone", "path": "/run/media/u/Unplugged/x.gguf", "bench": {}}])
+    assert ex.check() == (None, "every local model's setup is measured and recent")
+
+
+def test_explorer_stops_when_the_user_starts_something(tmp_path, monkeypatch):
+    app, ex = explore_app(tmp_path, monkeypatch)
+
+    def tune(model_id, llm):
+        app.models.started.append(model_id)
+        app.models.tunes[model_id] = {"state": "running"}
+        app.db.active_jobs = 1                       # the user starts a chat right away
+    app.models.tune = tune
+    from dva import explore
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(explore.asyncio, "sleep", lambda s: real_sleep(0))
+    entry = asyncio.run(ex.explore(app.db.models[0]))
+    assert app.models.stopped == ["qwen"] and entry["stopped"] == "a chat or task started"
+
+
+# ---------------------------------------------------------------------------------------------- suggestions
+def _at(day, hour):
+    from datetime import datetime
+    return datetime(2026, 11, day, hour, 5).astimezone().isoformat()     # local time, stored with its zone
+
+
+def test_a_request_made_on_three_weekdays_becomes_a_schedule_suggestion():
+    from dva import suggest
+    rows = [{"content": "Summarise the new files in my reports folder", "created": _at(16, 8)},   # Monday
+            {"content": "summarise the NEW files in my reports folder please", "created": _at(17, 8)},
+            {"content": "Summarise new files in my reports folder (3 of them)", "created": _at(18, 9)},
+            {"content": "Write a poem about rain", "created": _at(18, 10)},
+            {"content": "hi", "created": _at(19, 8)}]
+    found = suggest.repeated_requests(rows)
+    assert len(found) == 1
+    s = found[0]
+    assert (s["days"], s["weekdays_only"], s["hour"], s["cron"]) == (3, True, 8, "0 8 * * 1-5")
+    assert "reports folder" in s["prompt"]
+    assert suggest.suggestion_id(s["prompt"]) == suggest.suggestion_id(rows[0]["content"] + " (3 of them)")
+
+
+def test_the_same_day_twice_is_not_a_habit():
+    from dva import suggest
+    rows = [{"content": "Check the server logs for errors", "created": _at(16, 8)},
+            {"content": "Check the server logs for errors", "created": _at(16, 15)},
+            {"content": "Check the server logs for errors", "created": _at(17, 8)}]
+    assert suggest.repeated_requests(rows) == []
+
+
+def test_suggestions_are_off_until_switched_on():
+    from dva import suggest
+
+    class DB:
+        def setting(self, key, default=None):
+            return default
+    app = type("A", (), {"db": DB()})()
+    assert suggest.Suggestions(app).list() == {"enabled": False, "items": []}
+
+
+def test_age_reads_utc_and_zoned_times():
+    from datetime import datetime, timedelta, timezone
+    from dva.explore import age
+    hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
+    assert abs(age(hour_ago.isoformat()).total_seconds() - 3600) < 5
+    assert abs(age(hour_ago.replace(tzinfo=None).isoformat()).total_seconds() - 3600) < 5      # no zone: UTC
+    assert abs(age(hour_ago.astimezone(timezone(timedelta(hours=3))).isoformat()).total_seconds() - 3600) < 5

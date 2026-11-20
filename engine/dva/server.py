@@ -317,6 +317,27 @@ def create_app(data_dir=None, resources_dir=None, token=None):
                 "privacy": a.db.setting("cloud_privacy", "ask")}
 
     # ------------------------------------------------------------------ runtime + models
+    @api.get("/api/suggestions")
+    async def suggestions_list():
+        """Better ways of working found in the user's own chats (2.24.0); empty unless switched on."""
+        return await asyncio.to_thread(A().suggestions.list)
+
+    @api.post("/api/suggestions/{sid}/dismiss")
+    async def suggestions_dismiss(sid: str):
+        return A().suggestions.dismiss(sid)
+
+    @api.post("/api/suggestions/{sid}/accept")
+    async def suggestions_accept(sid: str):
+        try:
+            return A().suggestions.accept(sid)
+        except KeyError:
+            raise KeyError("That suggestion is no longer there") from None
+
+    @api.get("/api/explore")
+    async def explore_status():
+        """Measuring better setups while idle (2.24.0): on or off, why it is not running now, what was tried."""
+        return A().explorer.status()
+
     @api.get("/api/runtime")
     async def runtime_info():
         return await asyncio.to_thread(A().runtime.info)
