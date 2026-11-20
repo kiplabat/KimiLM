@@ -400,3 +400,17 @@ def test_desktop_idle_time_from_gnome(monkeypatch):
     monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
     assert hardware.user_idle_seconds(lambda cmd, timeout=3: "(uint64 90500,)\n") == 90.5
     assert hardware.user_idle_seconds(lambda cmd, timeout=3: "") is None              # not GNOME (kiosk, KDE)
+
+
+# ---------------------------------------------------------------------------------------------- ARM64 Linux (2.25.0)
+def test_arm64_linux_gets_its_own_llama_builds(monkeypatch):
+    from dva import images, runtime
+    monkeypatch.setattr(runtime.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(runtime.platform, "machine", lambda: "aarch64")
+    assert runtime.os_key() == "linux-arm64"
+    assert set(runtime.VERSIONS["backend_assets"]["linux-arm64"]) == {"cpu", "vulkan"}
+    monkeypatch.setattr(runtime.platform, "machine", lambda: "x86_64")
+    assert runtime.os_key() == "linux"
+    monkeypatch.setattr(images.sys, "platform", "linux")
+    monkeypatch.setattr(images.platform, "machine", lambda: "aarch64")
+    assert images.os_key() == "linux-arm64" and images.SD_ASSETS.get("linux-arm64") is None   # no image engine build

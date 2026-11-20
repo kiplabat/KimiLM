@@ -117,7 +117,8 @@ async function python() {
 
 async function llama() {
   step(`llama.cpp ${versions.llama_cpp_tag} (CPU build)`);
-  const key = platform === "win" ? "windows" : (platform === "darwin" ? "darwin" : "linux");
+  // Linux on ARM64 has its own builds (2.25.0); a Linux build is made on Linux of the same architecture
+  const key = platform === "win" ? "windows" : (platform === "darwin" ? "darwin" : (process.arch === "arm64" ? "linux-arm64" : "linux"));
   const backend = key === "darwin" ? "metal" : "cpu";
   const pats = versions.backend_assets[key][backend];
   const api = `https://api.github.com/repos/${versions.llama_cpp_repo}/releases`;
@@ -130,7 +131,7 @@ async function llama() {
     return body;
   };
   // Windows and macOS builds are .zip; Linux builds are .tar.gz.
-  const ext = key === "linux" ? ".tar.gz" : ".zip";
+  const ext = key.startsWith("linux") ? ".tar.gz" : ".zip";
   const match = (rel) => (rel.assets || []).find((a) => pats.every((p) => a.name.includes(p)) && a.name.endsWith(ext) && !a.name.startsWith("cudart"));
   // The archive of the pinned release, once downloaded, is used again without asking GitHub: its API allows 60
   // questions an hour per internet address without a token (addresses are often shared), and a build that stops

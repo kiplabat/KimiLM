@@ -1,8 +1,9 @@
 name: Linux build
 
-# Builds KimiLM for Linux (KimiLM-linux-x64.tar.gz) and checks that the bundled engine starts.
-# On main, a version that has no release yet (v<version> from app/package.json) is published as a GitHub
-# release; KimiOS installs it from releases/latest. Windows installers are still built on Windows.
+# Builds KimiLM for Linux (KimiLM-linux-x64.tar.gz and, 2.25.0, KimiLM-linux-arm64.tar.gz, each on a runner of its
+# own architecture) and checks that the bundled engine starts. On main, a version that has no release yet
+# (v<version> from app/package.json) is published as a GitHub release with both archives; KimiOS installs the one
+# for its architecture from releases/latest. Windows installers are still built on Windows.
 
 on:
   push:
@@ -13,7 +14,15 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
     steps:
@@ -31,39 +40,46 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           npm ci --no-audit --no-fund
-          npm run dist:linux
+          if [ "${{ matrix.arch }}" = "arm64" ]; then npm run dist:linux:arm64; else npm run dist:linux; fi
 
       - name: Check the bundled engine starts
         run: |
-          RES="$PWD/app/release/linux-unpacked/resources"
+          RES="$(ls -d "$PWD"/app/release/linux-*unpacked | head -1)/resources"
           DATA="$(mktemp -d)"
           cd "$RES/engine"
           DVA_TOKEN=ci PYTHONNOUSERSITE=1 DVA_SECRETS=file \
             "$RES/python/bin/python3" -m dva serve --port 0 --data-dir "$DATA" --resources "$RES" > "$DATA/engine.out" 2>&1 &
           PID=$!
-          for i in $(seq 1 90); do
-            if grep -q "DVA_READY" "$DATA/engine.out"; then echo "engine ready after ${i}s"; kill $PID; exit 0; fi
-            kill -0 $PID 2>/dev/null || break
+          for i in $(seq 1 120); do
+            if grep -q "DVA_READY" "$DATA/engine.out"; then echo "engine ready after ${i}s"; break; fi
+            kill -0 $PID 2>/dev/null || { cat "$DATA/engine.out"; exit 1; }
             sleep 1
           done
-          cat "$DATA/engine.out"; kill $PID 2>/dev/null; exit 1
+          grep -q "DVA_READY" "$DATA/engine.out" || { cat "$DATA/engine.out"; kill $PID; exit 1; }
+          kill $PID
+          "$RES/llama/cpu/llama-server" --version
 
       - uses: actions/upload-artifact@v4
         with:
-          name: KimiLM-linux-x64
-          path: app/release/KimiLM-linux-x64.tar.gz
+          name: KimiLM-linux-${{ matrix.arch }}
+          path: app/release/KimiLM-linux-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
-      - name: Publish a release for a new version
+      - name: Publish with the release of a new version
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="$(node -p "require('./app/package.json').version")"
-          if gh release view "v$VERSION" >/dev/null 2>&1; then
-            echo "v$VERSION is already released; nothing to publish"
+          ASSET="app/release/KimiLM-linux-${{ matrix.arch }}.tar.gz"
+          if ! gh release view "v$VERSION" >/dev/null 2>&1; then
+            # both architectures may get here at once: whichever creates it, the other uploads to it
+            gh release create "v$VERSION" --target "$GITHUB_SHA" --latest --title "KimiLM $VERSION" \
+              --notes "Linux builds of KimiLM $VERSION (x64 and arm64). Unpack and run ./kimilm, or use KimiOS, which installs it." \
+              || sleep 10
+          fi
+          if gh release view "v$VERSION" --json assets --jq '.assets[].name' | grep -qx "KimiLM-linux-${{ matrix.arch }}.tar.gz"; then
+            echo "v$VERSION already has the ${{ matrix.arch }} build"
           else
-            gh release create "v$VERSION" app/release/KimiLM-linux-x64.tar.gz \
-              --target "$GITHUB_SHA" --title "KimiLM $VERSION" \
-              --notes "Linux build of KimiLM $VERSION (x64). Unpack and run ./kimilm, or use KimiOS, which installs it."
+            gh release upload "v$VERSION" "$ASSET"
           fi

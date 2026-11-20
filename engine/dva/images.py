@@ -23,6 +23,7 @@ import asyncio
 import base64
 import json
 import os
+import platform
 import random
 import re
 import shlex
@@ -172,7 +173,12 @@ async def fetch(url, dest, *, state, tries=8, **kw):
 
 
 def os_key():
-    return {"win32": "windows", "darwin": "darwin"}.get(sys.platform, "linux")
+    """stable-diffusion.cpp publishes no Linux ARM64 build (2.25.0): there the image engine says it has no build for
+    this computer instead of installing an x86_64 one."""
+    key = {"win32": "windows", "darwin": "darwin"}.get(sys.platform, "linux")
+    if key == "linux" and platform.machine().lower() in ("aarch64", "arm64"):
+        return "linux-arm64"
+    return key
 
 
 def slug(text):

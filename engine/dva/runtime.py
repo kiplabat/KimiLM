@@ -40,7 +40,12 @@ BACKEND_LABELS = {"cpu": "CPU", "vulkan": "GPU (Vulkan: AMD, Intel, NVIDIA)", "c
 
 
 def os_key():
-    return {"Windows": "windows", "Darwin": "darwin"}.get(platform.system(), "linux")
+    """Which llama.cpp builds fit this computer (versions.json backend_assets). 2.25.0: Linux on ARM64 (a Raspberry
+    Pi, an ARM laptop or server) has its own builds."""
+    key = {"Windows": "windows", "Darwin": "darwin"}.get(platform.system(), "linux")
+    if key == "linux" and platform.machine().lower() in ("aarch64", "arm64"):
+        return "linux-arm64"
+    return key
 
 
 def free_port():
