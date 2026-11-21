@@ -232,6 +232,42 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         a.db.set_setting(f"device_trust:{d.get('key') or d['id']}", bool(data.get("trusted")))
         return {"trusted": bool(data.get("trusted"))}
 
+    # ------------------------------------------------------------------ KimiOS's bench (2.30.0)
+    @api.get("/api/bench")
+    async def bench_list():
+        from . import bench
+        if not bench.available():
+            return {"available": False, "devices": []}
+        return {"available": True, "devices": (await bench.envelope({"op": "devices"}))["devices"]}
+
+    @api.get("/api/bench/device")
+    async def bench_device(id: str):
+        from . import bench
+        return await bench.envelope({"op": "device", "device": id})
+
+    @api.get("/api/bench/history")
+    async def bench_history(id: str, since: float = -1e12, limit: int = 2400):
+        from . import bench
+        try:
+            return await bench.envelope({"op": "history", "device": id, "since": since, "limit": limit})
+        except bench.BenchError as exc:
+            if "no driver" in str(exc):
+                return {"rows": [], "time": None, "no_driver": True}
+            raise
+
+    @api.post("/api/bench/event")
+    async def bench_event(request: Request):
+        from . import bench
+        data = await body(request)
+        return await bench.simulator({"device": data.get("id"), "event": data.get("event"),
+                                      "args": data.get("args") or {}})
+
+    @api.post("/api/bench/stop")
+    async def bench_stop(request: Request):
+        from . import bench
+        data = await body(request)
+        return await bench.envelope({"op": "controller_stop", "device": data.get("id")})
+
     @api.get("/api/programs")
     async def programs():
         from . import installer

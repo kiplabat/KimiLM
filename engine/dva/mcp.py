@@ -503,9 +503,13 @@ class Connectors:
                 getattr(t, "inputSchema", None)
             # the server's own hint decides; without one, the tool's name is the guide
             readonly = bool(hint) if hint is not None else bool(READONLY_NAME.match(t.name))
+            # 2.30.0: KimiOS marks tools that move, heat, cool or switch something (in the tool's _meta)
+            meta = getattr(t, "meta", None) or getattr(t, "_meta", None) or {}
+            physical = bool(isinstance(meta, dict) and meta.get("kimios/physical"))
             rows.append({"name": t.name, "title": title or "", "description": (t.description or "")[:600],
                          "parameters": schema or {"type": "object", "properties": {}},
-                         "readonly": readonly, "destructive": bool(destructive) and not readonly})
+                         "readonly": readonly and not physical, "destructive": bool(destructive) and not readonly,
+                         "physical": physical})
         self.tool_cache[connector_id] = (time.time(), rows)
         self.unreachable.pop(connector_id, None)
         info = self.info[connector_id] = dict(session.info)

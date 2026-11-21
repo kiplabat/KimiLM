@@ -55,7 +55,7 @@ PI_GADGETS = {("0525", "a4a2"): "Raspberry Pi (USB network gadget)", ("1d6b", "0
 SENSOR_WORDS = re.compile(r"sensor|thermo|temp|humid|co2|weather|meter|gauge|lux|light sensor|accelero|gyro|"
                           r"barometer|pressure|air quality|particulate|geiger|radiation|scale", re.I)
 PHONE_WORDS = re.compile(r"android|pixel|galaxy|iphone|ipad|phone|redmi|oneplus|huawei|xperia|moto ", re.I)
-KINDS = ("phone", "board", "sensor", "display", "keyboard", "mouse", "input", "audio", "bluetooth", "camera",
+KINDS = ("appliance", "heater", "phone", "board", "sensor", "display", "keyboard", "mouse", "input", "audio", "bluetooth", "camera",
          "storage", "serial", "printer", "network", "other")
 
 
@@ -377,6 +377,8 @@ class Devices:
         parts = sorted(p.name for p in (self.root / "sys/bus/usb/devices").glob("*") if ":" not in p.name)
         parts += sorted(f"{c.name}={read(c / 'status', '')}" for c in (self.root / "sys/class/drm").glob("card*-*"))
         parts.append(str(len(read(self.root / "proc/bus/input/devices", "") or "")))
+        sim = Path(os.environ.get("KIMIOS_SIM_DIR", "/run/kimios-sim"))
+        parts += sorted(p.name for p in sim.glob("sim-*.json")) if sim.is_dir() else []
         return "|".join(parts)
 
     async def look(self, announce=False, fresh=False):
@@ -435,6 +437,8 @@ class Devices:
                     sinks.remove(mine)
                     d.update({k: mine[k] for k in ("sink", "volume", "muted", "default")})
             found += bt + sinks
+            from . import bench                      # 2.30.0: KimiOS's guarded (and simulated) devices
+            found += [bench.as_device(r) for r in await asyncio.to_thread(bench.listing_sync)]
         await self._adb_states(found)
         return found
 
@@ -642,6 +646,9 @@ class Devices:
 
     def next_step(self, d):
         kind, state = d["kind"], d.get("state") or ""
+        if d.get("bench"):
+            return ("Run by KimiOS's guard: agents use the KimiOS tools bench, driver, bench_experiment, controller"
+                    + (" and bench_event" if d.get("simulated") else "") + "; Devices shows it live.")
         if kind == "phone" and "Apple" not in (d.get("what") or ""):
             if "not installed" in state:
                 return "adb is installed by the first phone action (or install_program name='adb')."
@@ -669,6 +676,8 @@ class Devices:
             "name": name, "about": about, "args": args or {}, "changes": changes, "physical": physical}
         kind, what = d["kind"], d.get("what") or ""
         out = [A("info", "what it is, what drives it, its state")]
+        if d.get("bench"):          # driven only through KimiOS's guard: its tools, not here
+            return out
         if kind == "phone" and "Apple" in what:
             out.append(A("phone_info", "model, iOS version, battery (ideviceinfo)"))
         elif kind == "phone":
