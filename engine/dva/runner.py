@@ -582,9 +582,15 @@ class Turn:
 
     # ------------------------------------------------------------------ approvals
     async def approve(self, tool, args, description, ignore_auto=False):
-        if not tool.changes:
+        # 2.30.0: a tool that can move, heat, cool or switch something (KimiOS physicalHint) asks a person every
+        # time for a real device, whatever the approval settings; a simulated one (sim-…) is like any other change
+        physical = bool(getattr(tool, "physical", False)) and \
+            not str((args or {}).get("device") or "").startswith("sim-")
+        if physical:
+            ignore_auto = True
+        elif not tool.changes:
             return True
-        if (self.auto_approve and not ignore_auto) or tool.name in self.allowed_always:
+        if (self.auto_approve and not ignore_auto) or (tool.name in self.allowed_always and not physical):
             return True
         group = "browser" if tool.group == "browsing" else tool.group      # a specialist's browser tools too
         if self.policy and not ignore_auto and group in (self.policy.get("allow") or []):
@@ -757,7 +763,8 @@ class Turn:
         shown = t.get("title") or t["name"]
         warn = " (it deletes or overwrites)" if t.get("destructive") else ""
         return Tool(tool_key(cid, t["name"]), f"[{conf['name']}] {t['description']}", t["parameters"], call,
-                    "connector", changes=changes, label=f"{conf['name']}: {shown}", source=f"connector:{cid}",
+                    "connector", changes=changes or bool(t.get("physical")), label=f"{conf['name']}: {shown}",
+                    source=f"connector:{cid}", physical=bool(t.get("physical")),
                     summary=lambda a, n=shown, c=conf["name"]: f"{c} → {n}{warn} {json.dumps(a, ensure_ascii=False)[:300]}")
 
     def _resource_tools(self, connector_ids):

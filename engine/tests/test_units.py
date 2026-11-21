@@ -990,3 +990,64 @@ def test_a_chat_reply_that_took_a_while_tells_you_when_it_is_done(tmp_path):
     assert not jobs.worth_telling({**row, "payload": {"mission": {}}}, "done")
     db.set_setting("notify_done_seconds", 0)
     assert not jobs.worth_telling(row, "done")
+
+
+# ---------------------------------------------------------------------------------------------- 2.30.0
+def test_a_physical_tool_asks_a_person_for_a_real_device_and_not_for_a_simulated_one(tmp_path):
+    from types import SimpleNamespace
+    from dva.runner import Turn
+    from dva.tools import Tool
+    app = _fake_app(tmp_path)
+    app.approvals = {}
+    app.jobs = SimpleNamespace(set_status=lambda *a, **k: None)
+    t = Turn.__new__(Turn)
+    t.app, t.db, t.emit = app, app.db, (lambda *a, **k: None)
+    t.chat, t.parent_chat, t.job = {"id": "c1", "title": "x"}, None, {"id": "j"}
+    t._auto_payload, t.policy, t.allowed_always = True, None, {"kimios__controller"}   # auto-approve and "always"
+    tool = Tool("kimios__controller", "", {}, None, "connector", changes=False, physical=True)
+
+    async def go():
+        assert await t.approve(tool, {"device": "sim-fridge", "action": "start"}, "start") is True
+        real = asyncio.create_task(t.approve(tool, {"device": "fridge-kitchen", "action": "start"}, "start"))
+        await asyncio.sleep(0.2)
+        assert not real.done() and len(app.approvals) == 1           # neither auto nor "always" let it through
+        assert next(iter(app.approvals.values()))["always_asks"]
+        real.cancel()
+    asyncio.run(go())
+
+
+def test_kimios_bench_devices_join_the_device_list(tmp_path, monkeypatch):
+    import socketserver
+    import threading
+    from dva import bench
+    from dva.devices import Devices
+    sock = tmp_path / "envelope.sock"
+    rows = [{"id": "sim-fridge", "model": "simulated two-compartment refrigerator", "kind": "appliance",
+             "simulated": True, "driver": 2, "mode": "custom"},
+            {"id": "sim-air", "model": "simulated air sensor", "kind": "sensor", "simulated": True, "driver": None,
+             "mode": "no driver"}]
+
+    class H(socketserver.StreamRequestHandler):
+        def handle(self):
+            req = json.loads(self.rfile.readline())
+            out = {"ok": True, "devices": rows} if req["op"] == "devices" else {"ok": False, "error": "no driver"}
+            self.wfile.write((json.dumps(out) + "\n").encode())
+    srv = socketserver.ThreadingUnixStreamServer(str(sock), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setenv("KIMIOS_ENVELOPE_SOCKET", str(sock))
+    assert bench.available()
+    got = {d["id"]: d for d in bench.listing_sync() and [bench.as_device(r) for r in bench.listing_sync()]}
+    fridge = got["bench:sim-fridge"]
+    assert fridge["kind"] == "appliance" and fridge["state"] == "driver v2 · custom" and fridge["simulated"]
+    assert got["bench:sim-air"]["state"] == "no driver yet"
+    dv = Devices(_fake_app(tmp_path), root=tmp_path)
+    assert [a["name"] for a in dv.actions(fridge)] == ["info"]        # driven through KimiOS's tools only
+    assert "bench_event" in dv.next_step(fridge)
+    try:
+        asyncio.run(bench.envelope({"op": "history", "device": "sim-air"}))
+        raise AssertionError("expected a refusal")
+    except bench.BenchError as exc:
+        assert "no driver" in str(exc)
+    srv.shutdown()
+    monkeypatch.setenv("KIMIOS_ENVELOPE_SOCKET", str(tmp_path / "none.sock"))
+    assert not bench.available() and bench.listing_sync() == []
