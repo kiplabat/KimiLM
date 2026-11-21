@@ -43,12 +43,12 @@ DEFAULT_SETTINGS = {
     "allow_python": True, "approval_timeout_minutes": 360, "max_native_tools": 49, "python_timeout_seconds": 180,
     # 2.19.0: the most a tool call may ask for a program's time, and how many programs agents may run at once
     "code_timeout_max_seconds": 900, "code_runs_at_once": 2,
-    "max_loaded_models": 3, "browser_search": True, "max_parallel_agents": 4, "turn_time_limit_minutes": 30,
+    "max_loaded_models": 3, "browser_search": True, "max_parallel_agents": 4, "max_team_depth": 2, "turn_time_limit_minutes": 30,
     "cloud_privacy": "ask", "cloud_budget_monthly": 10.0, "cloud_max_parallel": 4,
     "team_mode": "auto", "max_team_tasks": 8, "team_time_limit_minutes": 120,
     # 2.5.0: sequenced, looped runs. agent_order: sequence | parallel; step_rounds: tries per step before the best
     # attempt is kept; fit_context: load a run's models with the context its steps need
-    "agent_order": "sequence", "step_rounds": 3, "verify_results": True, "plan_approval": False,
+    "agent_order": "auto", "step_rounds": 3, "verify_results": True, "plan_approval": False,
     "fit_context": True, "unload_after_run": False, "stall_timeout_seconds": 180, "first_token_timeout_seconds": 0,
     # 2.6.0: doing less work. prompt_snapshots: keep what a model read of its instructions and tools on disk;
     # prompt_cache_mb: memory per loaded model for prompts already read (None = about 5% of memory);
@@ -179,6 +179,11 @@ class App:
         if self.db.setting("max_native_tools") == 44 and not self.db.setting("native_tools_2_14"):
             self.db.set_setting("max_native_tools", 47)
         self.db.set_setting("native_tools_2_14", True)
+        # 2.31.0: steps that do not need each other run at the same time (the operator asked for it): a stored
+        # "sequence" from before becomes "auto" once; choosing "sequence" again later is kept
+        if self.db.setting("agent_order") == "sequence" and not self.db.setting("agent_order_2_31"):
+            self.db.set_setting("agent_order", "auto")
+        self.db.set_setting("agent_order_2_31", True)
         # 2.29.0 adds two tools every agent has (install_program, devices)
         if self.db.setting("max_native_tools") == 47 and not self.db.setting("native_tools_2_29"):
             self.db.set_setting("max_native_tools", 49)

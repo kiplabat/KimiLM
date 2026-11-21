@@ -274,8 +274,9 @@ def parse_handoff(text):
     return out
 
 
-def move_schema(harness_ids, roles):
+def move_schema(harness_ids, roles, most=2):
     step = {"type": "object", "required": ["name", "goal", "done_when"], "properties": {
+        "together": {"type": "boolean"}, "team": {"type": "boolean"},
         "name": {"type": "string", "maxLength": 40}, "goal": {"type": "string", "maxLength": 1000},
         "done_when": {"type": "string", "maxLength": 240}, "agent": {"type": "string", "maxLength": 30},
         "harness": {"enum": list(harness_ids)}, "role": {"enum": list(roles)}, "loop": {"type": "boolean"},
@@ -286,7 +287,7 @@ def move_schema(harness_ids, roles):
         "understanding": {"type": "string", "maxLength": 1400}, "changed": {"type": "boolean"},
         "reason": {"type": "string", "maxLength": 300},
         "decision": {"enum": ["continue", "finish", "ask"]}, "question": {"type": "string", "maxLength": 400},
-        "steps": {"type": "array", "maxItems": 2, "items": step},
+        "steps": {"type": "array", "maxItems": max(2, int(most)), "items": step},
         "outline": {"type": "array", "maxItems": 6, "items": {"type": "string", "maxLength": 140}}}}
 
 
@@ -297,8 +298,12 @@ class Mission(Orchestra):
     def __init__(self, turn, roster=None, overall=None, fit=None, setup=None):
         super().__init__(turn, roster=None, overall=overall, fit=fit)
         setup = clean_setup(setup or self.db.setting(f"chat_mission:{turn.chat['id']}", None), self.app)
-        self.sequence, self.max_parallel, self.chain = True, 1, False
-        self.step["mode"] = "sequence"
+        # 2.31.0: a move may give steps that run at the same time (independent parts); in sequence order one
+        # step at a time as before
+        self.sequence = self.order == "sequence"
+        self.max_parallel = 1 if self.sequence else int(self.db.setting("max_parallel_agents", 4) or 4)
+        self.chain = False
+        self.wave = []                         # the handoffs of the steps the last move gave (they ran together)
         self.name = setup["name"]
         self.done_when = setup["done_when"]
         self.team = setup["team"]
@@ -456,7 +461,8 @@ class Mission(Orchestra):
     def add_steps(self, raw):
         """Turn the planner's next step(s) into steps of the run. Returns the new step ids."""
         items = []
-        for r in raw[:2]:
+        most = 2 if self.sequence else max(2, self.max_parallel)
+        for r in raw[:most]:
             goal = str(r.get("goal") or "").strip()
             if not goal:
                 continue
@@ -474,7 +480,11 @@ class Mission(Orchestra):
                 self.logline(f"Not run again: {why}.")
                 continue
             n = len(self.tasks) + len(items) + 1
+            # 2.31.0: a step marked 'together' runs at the same time as the others of this move; otherwise it
+            # waits for the step before it in the move (the old meaning of a second step)
+            after = [] if (r.get("together") or not items) else [items[-1]["id"]]
             items.append({"id": f"s{n}", "name": str(r.get("name") or f"Step {n}")[:40], "goal": goal,
+                          "depends_on": after, "team": bool(r.get("team")),
                           "done_when": r.get("done_when") or "", "loop": bool(r.get("loop")),
                           "expects": r.get("expects") or [], "agent": who["name"], "harness": who["harness"],
                           "role": who.get("role"), "model": who.get("model"),
@@ -568,8 +578,20 @@ class Mission(Orchestra):
                                   "flag": {k: flag.get(k) for k in ("by", "reason", "need", "detail", "rule",
                                                                     "decision")} if flag else None})
 
-    def ledger(self, skip_last=False, last=8):
-        rows = self.handoffs[:-1] if skip_last else self.handoffs
+    def builds_on(self, t):
+        """The handoffs a step builds on: the step it waits for in its move, else every step of the last move
+        (2.31.0: those may have run at the same time), else the latest one."""
+        by_id = {h["id"]: h for h in self.handoffs}
+        mine = [by_id[d] for d in t.get("depends_on") or [] if d in by_id]
+        if mine:
+            return mine
+        if self.wave:
+            return list(self.wave)
+        return self.handoffs[-1:]
+
+    def ledger(self, skip_last=False, last=8, rows=None):
+        if rows is None:
+            rows = self.handoffs[:-1] if skip_last else self.handoffs
         lines = []
         for h in rows[-last:]:
             found = "" if not h.get("found") or NOTHING.match(h["found"]) else f" Found: {_clip(h['found'], 160)}"
@@ -600,12 +622,16 @@ class Mission(Orchestra):
             parts.append("Connected services you have tools for: " + ", ".join(names) + ". When one of them offers "
                          "what your step needs, use its tools: they are made for it. Search or browse the web only "
                          "for what they do not offer.")
-        if self.handoffs and not planned:
-            earlier = self.ledger(skip_last=True, last=6)
+        before = self.builds_on(t) if not planned else []
+        if before:
+            shown = {h["id"] for h in before}
+            earlier = self.ledger(rows=[h for h in self.handoffs if h["id"] not in shown], last=6)
             if earlier:
                 parts.append("Earlier steps:\n" + earlier)
-            parts.append("Handoff from the step before yours:\n\n"
-                         + self.handoff_text(self.handoffs[-1], self.dep_budget(t)))
+            budget = max(600, self.dep_budget(t) // len(before))
+            parts.append(("Handoff from the step before yours:\n\n" if len(before) == 1 else
+                          "Handoffs from the steps before yours (they ran at the same time):\n\n")
+                         + "\n\n".join(self.handoff_text(h, budget) for h in before))
         parts.append(f"Your step ({t['id']} “{t['name']}”): {t['goal']}")
         if t.get("done_when"):
             parts.append(f"Done when: {t['done_when']}")
@@ -661,10 +687,14 @@ class Mission(Orchestra):
         facts = crew_facts(self.turn)
         if facts:
             parts.append(facts)
-        parts.append(f"Steps done so far: {len(self.handoffs)}"
-                     + ("\n" + self.ledger(skip_last=True) if len(self.handoffs) > 1 else ""))
-        if self.handoffs:
-            parts.append("The latest handoff:\n\n" + self.handoff_text(self.handoffs[-1], 2400))
+        latest = self.wave or self.handoffs[-1:]
+        shown = {h["id"] for h in latest}
+        older = [h for h in self.handoffs if h["id"] not in shown]
+        parts.append(f"Steps done so far: {len(self.handoffs)}" + ("\n" + self.ledger(rows=older) if older else ""))
+        if latest:
+            parts.append(("The latest handoff:\n\n" if len(latest) == 1 else
+                          f"The latest handoffs ({len(latest)} steps that ran at the same time):\n\n")
+                         + "\n\n".join(self.handoff_text(h, max(700, 2400 // len(latest))) for h in latest))
         failing = self.failing()
         if failing:
             last = self.handoffs[-1]
@@ -700,7 +730,15 @@ class Mission(Orchestra):
             "- reason: one or two sentences on why this is the right next move (and, if the plan changed, why).\n"
             "- decision: 'continue' to give the next step; 'finish' when the task is done or nothing useful is "
             "left to try; 'ask' only when I must decide or provide something (put it in 'question').\n"
-            "- steps: for 'continue', the next step — one, or two when the second is certain to follow. goal: "
+            + ("- steps: for 'continue', the next step — one, or two when the second is certain to follow. goal: "
+               if self.sequence else
+               f"- steps: for 'continue', the next step, or up to {max(2, self.max_parallel)} steps when the task "
+               "has parts that do not need each other's results right now (two sources to check, several files, "
+               "separate sections): mark each of those together: true and they run at the same time on separate "
+               "agents — that is much faster. A step without together waits for the step before it in your list. "
+               + ("team: true for a step that is itself a job of several parts: a sub-planner splits it and runs "
+                  "agents of its own, and hands back one result. " if self.can_nest() else "") +
+               "goal: ") +
             "everything its agent needs to know (it sees only the goal, your understanding and the latest "
             "handoff): paths, sources, formats, what to avoid. done_when: a test the result can be checked "
             f"against. harness: {options}" + (" (use 'browser' for a step that has to use a website: clicking "
@@ -724,7 +762,10 @@ class Mission(Orchestra):
     async def advance(self, messages):
         """Every step given so far is settled: read the handoffs and decide the next move. True when the task
         goes on with new steps."""
+        before = len(self.handoffs)
         self.note_handoffs()
+        if len(self.handoffs) > before:
+            self.wave = self.handoffs[before:]       # what the last move's steps handed back (2.31.0)
         if self.finished:
             return False
         why = self.limit_reached()
@@ -796,8 +837,13 @@ class Mission(Orchestra):
         self.refused = []
         for tid in new:
             await self.forecast(self.tasks[tid])
+        slots = self.size_slots()                    # 2.31.0: room for the steps that run together
+        if slots:
+            self.logline(f"Side by side: {slots}.")
+        together = [tid for tid in new if not self.tasks[tid]["depends_on"]]
         names = ", ".join(f"{tid} “{self.tasks[tid]['name']}” → {self.tasks[tid].get('agent')}" for tid in new)
-        self.logline(f"Next: {names}" + (f" — {reason}" if reason else ""))
+        self.logline(("Next, at the same time: " if len(together) > 1 else "Next: ") + names
+                     + (f" — {reason}" if reason else ""))
         self.save()
         return True
 
@@ -808,7 +854,7 @@ class Mission(Orchestra):
             await turn.hold_model()
             turn.status("The planner is reading the handoff and deciding the next step…" if self.handoffs
                         else "The planner is working out how to start…")
-            schema = move_schema(self.harness_ids, self.roles())
+            schema = move_schema(self.harness_ids, self.roles(), 2 if self.sequence else self.max_parallel)
             with usage_purpose("planner"):           # counted as the planner's work in Usage (2.27.0)
                 return (await turn.complete(messages + [{"role": "user", "content": self.move_prompt()}],
                                             schema=schema, max_tokens=1800, temperature=0.2))["json"]

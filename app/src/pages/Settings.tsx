@@ -297,10 +297,14 @@ export default function Settings({ section }: { section?: string }) {
               <option value="off">Only when I ask (team harness or team builder)</option>
             </select>
           </Field>
-          <Field label="Order of steps" help={(s.agent_order || "sequence") === "parallel" ? "Steps that do not need each other run together, as far as each model's Simultaneous replies allow. Uses more memory; worth it with online models or a dedicated graphics card." : "One step at a time, in plan order: the least memory, and no agent works before its input exists. Best on a laptop."}>
-            <select className="input" value={s.agent_order || "sequence"} onChange={(e) => set({ agent_order: e.target.value })}>
-              <option value="sequence">One after another (recommended)</option>
-              <option value="parallel">Side by side when steps are independent</option>
+          <Field label="Order of steps" help={(s.agent_order || "auto") === "auto"
+            ? "Parts of a request that do not need each other run at the same time, each on its own agent. They share one loaded model (its weights load once; each agent gets its own reply slot), as many as memory allows; steps on another local model wait their turn. Long-running tasks can give several steps at once too."
+            : (s.agent_order === "parallel" ? "Steps that do not need each other run together, as far as each model's own Simultaneous replies allow, and several local models may be loaded at once. Uses the most memory."
+              : "One step at a time, in plan order: the least memory, and the slowest.")}>
+            <select className="input" value={s.agent_order || "auto"} onChange={(e) => set({ agent_order: e.target.value })}>
+              <option value="auto">Together when they are independent, as memory allows (recommended)</option>
+              <option value="sequence">One after another</option>
+              <option value="parallel">Side by side, by each model's own settings</option>
             </select>
           </Field>
           <Toggle checked={s.fit_context ?? true} onChange={(v: boolean) => set({ fit_context: v })} label="Load models for a run with the context its steps need (forecast), not each model's full context setting" />
@@ -335,8 +339,11 @@ export default function Settings({ section }: { section?: string }) {
             <Field label="Writing time per result (seconds)" help="Steps are asked for a result this long at the computer's writing speed; longer material goes to a file. 0 = no hint.">
               <input className="input narrow" type="number" min={0} step={30} value={s.writing_budget_seconds ?? 180} onChange={(e) => set({ writing_budget_seconds: Number(e.target.value) })} />
             </Field>
-            <Field label="Agents at once" help="Only when steps run side by side.">
+            <Field label="Agents at once" help="Steps that do not need each other, across every level of planners (as memory allows).">
               <input className="input narrow" type="number" min={1} max={8} value={s.max_parallel_agents ?? 4} onChange={(e) => set({ max_parallel_agents: Number(e.target.value) })} />
+            </Field>
+            <Field label="Levels of planners" help="A step that is itself several pieces of work can go to a sub-planner with agents of its own, and its steps to sub-planners again. 0: only the main planner. All levels share the same agents at once.">
+              <input className="input narrow" type="number" min={0} max={4} value={s.max_team_depth ?? 2} onChange={(e) => set({ max_team_depth: Number(e.target.value) })} />
             </Field>
             <Field label="Most tasks in a plan">
               <input className="input narrow" type="number" min={2} max={16} value={s.max_team_tasks ?? 8} onChange={(e) => set({ max_team_tasks: Number(e.target.value) })} />
