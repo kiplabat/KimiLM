@@ -308,6 +308,39 @@ def describe_settings(app, harness, model_id, limits, auto=False, route_reason="
     return out
 
 
+def _stem(word):
+    word = word.lower()
+    for end in ("ings", "ing", "es", "s"):
+        if len(word) > len(end) + 3 and word.endswith(end):
+            return word[:-len(end)]
+    return word
+
+
+def rank_tools(tools, query):
+    """2.28.0: connector tools for a search, best first. Words match their stems ("settings" finds "setting"),
+    and a word in the tool's name counts more than one in its description. A query that matches nothing gives
+    nothing; an empty query gives every tool in order."""
+    words = [_stem(w) for w in re.findall(r"[a-zA-Z0-9]+", query or "") if len(w) > 1]
+    if not words:
+        return list(tools)
+    scored = []
+    for i, t in enumerate(tools):
+        name = t.name.lower().rsplit("__", 1)[-1].replace("_", " ")
+        text = (t.description or "").lower()
+        score = sum(3 if w in name else 1 if w in text else 0 for w in words)
+        if score:
+            scored.append((-score, i, t))
+    return [t for _s, _i, t in sorted(scored, key=lambda x: (x[0], x[1]))]
+
+
+def resolve_tool(tools, name):
+    """A connector tool named without its prefix ("setting_set" for "mcp__kimios_kimios__setting_set"), when
+    exactly one tool has that name."""
+    short = str(name or "").strip().lower().rsplit("__", 1)[-1]
+    hits = [t for t in tools if t.name.lower().rsplit("__", 1)[-1] == short] if short else []
+    return hits[0] if len(hits) == 1 else None
+
+
 class Turn:
     def __init__(self, app, chat_id, job):
         self.app, self.db = app, app.db
@@ -709,15 +742,16 @@ class Turn:
         by_name = {t.name: t for t in connector_tools}
 
         async def find(ctx, query=""):
-            words = query.lower().split()
-            rows = [t for t in connector_tools if not words or any(w in (t.name + t.description).lower() for w in words)]
+            rows = rank_tools(connector_tools, query)
             return "\n\n".join(f"{t.name}: {t.description[:300]}\nparameters: {json.dumps(t.parameters)[:600]}"
                                for t in rows[:12]) or "No matching tools"
 
         async def use(ctx, tool, arguments=None):
-            t = by_name.get(tool)
+            t = by_name.get(tool) or resolve_tool(connector_tools, tool)
             if not t:
-                raise ToolError(f"Unknown connector tool {tool!r}; use find_connector_tools first")
+                close = [x.name for x in rank_tools(connector_tools, str(tool).replace("_", " "))[:5]]
+                raise ToolError(f"Unknown connector tool {tool!r}; use find_connector_tools first"
+                                + (f". Closest: {', '.join(close)}" if close else ""))
             if not await self.approve(t, arguments or {}, t.describe_call(arguments or {})):
                 raise ToolDenied("The user declined this action")
             return await t.func(ctx, **(arguments or {}))

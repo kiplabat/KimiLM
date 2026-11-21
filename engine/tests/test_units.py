@@ -651,3 +651,22 @@ def test_telemetry_minute_averages_keep_peaks():
     rows = [{"t": i, "cpu": v, "gpu": None} for i, v in enumerate([10, 90, 20])]
     agg = Telemetry._aggregate(rows)
     assert agg["cpu"] == 40 and agg["cpu_max"] == 90 and agg["gpu"] is None
+
+
+# ---------------------------------------------------------------------------------------------- 2.28.0
+def test_connector_tools_are_found_by_stem_and_by_their_short_name():
+    from dva.runner import rank_tools, resolve_tool
+    from dva.tools import Tool
+    S = {"type": "object", "properties": {}}
+    mk = lambda n, d: Tool("mcp__kimios_kimios__" + n, "[KimiOS] " + d, S, None, "connector")  # noqa: E731
+    tools = [mk("machine", "This computer's hardware."),
+             mk("setting_get", "Read a desktop setting (gsettings schema and key)."),
+             mk("control_simulate", "Practise a controller. Compare settings before it touches a device."),
+             mk("setting_set", "Change an allowed desktop or display setting: dark or light mode (colour scheme, "
+                               "theme: org.gnome.desktop.interface color-scheme).")]
+    found = [t.name.rsplit("__", 1)[-1] for t in rank_tools(tools, "display settings color scheme")]
+    assert found[0] == "setting_set" and "setting_get" in found
+    assert rank_tools(tools, "zzz") == [] and len(rank_tools(tools, "")) == 4
+    assert resolve_tool(tools, "machine").name == "mcp__kimios_kimios__machine"
+    assert resolve_tool(tools, "mcp__other__machine").name == "mcp__kimios_kimios__machine"
+    assert resolve_tool(tools, "nothing") is None
