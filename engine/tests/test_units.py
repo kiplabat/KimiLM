@@ -670,3 +670,323 @@ def test_connector_tools_are_found_by_stem_and_by_their_short_name():
     assert resolve_tool(tools, "machine").name == "mcp__kimios_kimios__machine"
     assert resolve_tool(tools, "mcp__other__machine").name == "mcp__kimios_kimios__machine"
     assert resolve_tool(tools, "nothing") is None
+
+
+# ---------------------------------------------------------------------------------------------- 2.29.0
+class _Bus:
+    def __init__(self):
+        self.events = []
+
+    def publish(self, kind, **data):
+        self.events.append({"kind": kind, **data})
+
+
+class _Settings:
+    def __init__(self, **values):
+        self.values = values
+
+    def setting(self, key, default=None):
+        return self.values.get(key, default)
+
+    def set_setting(self, key, value):
+        self.values[key] = value
+
+
+def _fake_app(tmp_path, **settings):
+    from types import SimpleNamespace
+    (tmp_path / "data").mkdir(exist_ok=True)
+    return SimpleNamespace(paths=SimpleNamespace(data=tmp_path / "data"), db=_Settings(**settings), bus=_Bus(),
+                           log=lambda *a: None)
+
+
+def _w(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def _usb(root, name, vid, pid, product, interfaces, maker="", serial=None, driver_root=None):
+    """A USB device as sysfs shows it: the device under /sys/devices, symlinks in /sys/bus/usb/devices."""
+    dev = root / "sys/devices/pci0000:00/usb1" / name
+    for k, v in {"idVendor": vid, "idProduct": pid, "product": product, "manufacturer": maker,
+                 "busnum": "1", "devnum": name.split("-")[-1], "speed": "480"}.items():
+        _w(dev / k, v + "\n")
+    if serial:
+        _w(dev / "serial", serial)
+    link_dir = root / "sys/bus/usb/devices"
+    link_dir.mkdir(parents=True, exist_ok=True)
+    (link_dir / name).symlink_to(dev)
+    for i, (cls, sub, proto, drv) in enumerate(interfaces):
+        intf = dev / f"{name}:1.{i}"
+        for k, v in {"bInterfaceClass": cls, "bInterfaceSubClass": sub, "bInterfaceProtocol": proto}.items():
+            _w(intf / k, v)
+        _w(intf / "modalias", f"usb:v{vid.upper()}p{pid.upper()}d0100dc00dsc00dp00ic{cls}isc{sub}ip{proto}in0{i}")
+        if drv:
+            target = root / "sys/bus/usb/drivers" / drv
+            target.mkdir(parents=True, exist_ok=True)
+            (intf / "driver").symlink_to(target)
+        (link_dir / intf.name).symlink_to(intf)
+    return dev
+
+
+def _edid(name, maker="DEL"):
+    raw = bytearray(128)
+    raw[:8] = b"\x00\xff\xff\xff\xff\xff\xff\x00"
+    word = sum((ord(c) - 64) << s for c, s in zip(maker, (10, 5, 0)))
+    raw[8], raw[9] = word >> 8, word & 0xff
+    raw[21], raw[22] = 53, 30
+    raw[54:72] = b"\x00\x00\x00\xfc\x00" + name.encode().ljust(13, b"\n")[:13]
+    return bytes(raw)
+
+
+def _fake_sys(root):
+    _usb(root, "1-1", "18d1", "4ee7", "Pixel 8", [("ff", "42", "01", None), ("06", "01", "01", None)],
+         maker="Google", serial="34AB12")
+    _usb(root, "1-2", "046d", "c52b", "USB Receiver", [("03", "01", "01", "usbhid"), ("03", "01", "02", "usbhid")],
+         maker="Logitech")
+    pico = _usb(root, "1-3", "2e8a", "000a", "Pico", [("02", "02", "00", "cdc_acm"), ("0a", "00", "00", "cdc_acm")],
+                maker="Raspberry Pi", serial="E66")
+    _usb(root, "1-4", "1d6b", "0002", "hub", [("09", "00", "00", "hub")])
+    tty = root / "sys/class/tty/ttyACM0"
+    tty.mkdir(parents=True)
+    (tty / "device").symlink_to(pico / "1-3:1.0")
+    drm = root / "sys/class/drm"
+    _w(drm / "card1-HDMI-A-1/status", "connected")
+    _w(drm / "card1-HDMI-A-1/modes", "1920x1080\n1280x720\n")
+    (drm / "card1-HDMI-A-1/edid").write_bytes(_edid("DELL P2419H"))
+    _w(drm / "card1-eDP-1/status", "connected")
+    _w(drm / "card1-DP-1/status", "disconnected")
+    _w(root / "proc/bus/input/devices",
+       'I: Bus=0005 Vendor=05ac Product=024f Version=0001\nN: Name="Keychron K2"\nP: Phys=aa:bb\n'
+       'H: Handlers=sysrq kbd leds event7\nB: LED=1f\n\n'
+       'I: Bus=0019 Vendor=0000 Product=0001\nN: Name="Power Button"\nH: Handlers=kbd event2\n\n')
+
+
+def test_usb_devices_are_told_apart_by_what_they_say_about_themselves():
+    from dva.devices import usb_kind
+    I = lambda *c: [{"class": a, "subclass": b, "protocol": p} for a, b, p in c]  # noqa: E731
+    assert usb_kind("18d1", "4ee7", "Pixel 8", I((0xff, 0x42, 0x01)))[0] == "phone"
+    assert usb_kind("04e8", "6860", "SAMSUNG_Android", I((0x06, 1, 1)))[0] == "phone"
+    assert usb_kind("046d", "c52b", "USB Receiver", I((3, 1, 1), (3, 1, 2))) == ("keyboard", "Keyboard and mouse "
+                                                                                 "receiver (dongle)")
+    assert usb_kind("2e8a", "0003", "RP2 Boot", I((8, 6, 80)))[1].startswith("Raspberry Pi Pico in boot mode")
+    assert usb_kind("0525", "a4a2", "RNDIS", I((2, 6, 0)))[0] == "board"
+    assert usb_kind("1a86", "7523", "USB Serial", I((0xff, 1, 2)))[0] == "serial"
+    assert usb_kind("1234", "0001", "CO2 Sensor", I((3, 0, 0)))[0] == "sensor"
+    assert usb_kind("8087", "0026", "", I((0xe0, 1, 1)))[0] == "bluetooth"
+
+
+def test_linux_devices_are_read_from_sys_with_ports_displays_and_bluetooth_input(tmp_path):
+    from dva.devices import Devices, edid_info
+    _fake_sys(tmp_path)
+    dv = Devices(_fake_app(tmp_path), root=tmp_path)
+    found = {d["id"]: d for d in dv._linux()}
+    assert found["usb:1-1"]["kind"] == "phone" and found["usb:1-1"]["name"] == "Google Pixel 8"
+    assert found["usb:1-2"]["kind"] == "keyboard" and found["usb:1-2"]["drivers"] == ["usbhid"]
+    pico = found["usb:1-3"]
+    assert pico["kind"] == "board" and pico["ports"] == ["/dev/ttyACM0"] and pico["drivers"] == ["cdc_acm"]
+    assert "usb:1-4" not in found                                         # a hub is not a device of its own
+    hdmi = found["display:card1-HDMI-A-1"]
+    assert hdmi["name"] == "DELL P2419H" and hdmi["connection"] == "HDMI" and not hdmi["internal"]
+    assert hdmi["details"]["preferred_mode"] == "1920x1080" and hdmi["details"]["maker"] == "DEL"
+    assert found["display:card1-eDP-1"]["internal"] and "display:card1-DP-1" not in found
+    kb = found["input:keychron-k2"]
+    assert kb["kind"] == "keyboard" and kb["connection"] == "Bluetooth"
+    assert not any("power" in k for k in found)                           # a power button is not a keyboard
+    assert edid_info(b"junk") == {}
+    acts = {a["name"]: a for a in dv.actions(pico)}
+    assert acts["serial_write"]["physical"] and not acts["serial_read"]["changes"]
+    phone_acts = [a["name"] for a in dv.actions(found["usb:1-1"])]
+    assert {"phone_info", "pull", "screenshot", "shell"} <= set(phone_acts)
+    assert "brightness" in [a["name"] for a in dv.actions(hdmi)]
+
+
+def test_devices_coming_and_going_are_announced_once(tmp_path):
+    import shutil as _sh
+    from dva.devices import Devices
+    _fake_sys(tmp_path)
+    app = _fake_app(tmp_path)
+    dv = Devices(app, root=tmp_path)
+
+    async def go():
+        first = await dv.look(announce=True, fresh=True)          # what is there at start is not announced
+        assert not [e for e in app.bus.events if e["kind"] == "notify"]
+        _usb(tmp_path, "1-5", "2341", "0043", "Uno", [("02", "02", "01", "cdc_acm")], maker="Arduino")
+        await dv.look(announce=True)
+        said = [e for e in app.bus.events if e["kind"] == "notify"]
+        assert len(said) == 1 and said[0]["title"] == "Connected: Arduino Uno" and said[0]["level"] == "device"
+        (tmp_path / "sys/bus/usb/devices/1-1").unlink()
+        for p in (tmp_path / "sys/bus/usb/devices").glob("1-1:*"):
+            p.unlink()
+        await dv.look(announce=True)
+        said = [e for e in app.bus.events if e["kind"] == "notify"]
+        assert said[-1]["title"] == "Disconnected: Google Pixel 8" and not said[-1]["arrived"]
+        assert any(e["kind"] == "devices" for e in app.bus.events)
+        return first
+    assert len(asyncio.run(go())) >= 5
+    _sh.rmtree(tmp_path / "sys")
+
+
+@posix_only
+def test_a_serial_port_is_read_and_written(tmp_path):
+    import threading
+    from dva.devices import serial_exchange
+    master, slave = os.openpty()
+    port = os.ttyname(slave)
+
+    def board():                                         # answers a line like a MicroPython prompt would
+        import time as _t
+        _t.sleep(0.2)
+        os.write(master, b"temp=21.5\r\n")
+    threading.Thread(target=board).start()
+    got = serial_exchange(port, 115200, None, 1.0)
+    assert "temp=21.5" in got
+    out = serial_exchange(port, 9600, "print(1)", 0.3)
+    assert out.startswith("Sent 'print(1)'")
+    assert os.read(master, 100).startswith(b"print(1)\r\n")
+    os.close(master)
+    os.close(slave)
+
+
+def test_programs_install_into_kimilms_toolbox_on_an_image_based_system(tmp_path, monkeypatch):
+    from dva import installer
+    app = _fake_app(tmp_path)
+    calls = []
+
+    async def run(app_, argv, timeout=1800, on_status=None, owner=None, env=None):
+        calls.append(argv)
+        if argv[:2] == ["toolbox", "list"]:
+            return 0, "CONTAINER ID  CONTAINER NAME\n"
+        if "rpm" in argv:
+            return 0, "/usr/bin/adb\n/usr/bin/fastboot\n/usr/share/doc/x\n"
+        return 0, ""
+    monkeypatch.setattr(installer, "_run", run)
+    monkeypatch.setattr(installer, "computer", lambda: {"os": "linux", "immutable": True, "toolbox": True,
+                                                        "flatpak": True, "brew": False, "managers": []})
+    out = asyncio.run(installer.install(app, "adb", on_status=lambda t: None, by="test"))
+    assert ["toolbox", "create", "-y", installer.TOOLBOX] in calls
+    assert ["toolbox", "run", "-c", installer.TOOLBOX, "sudo", "dnf", "install", "-y", "android-tools"] in calls
+    launcher = installer.tools_dir(app) / "bin" / "adb"
+    assert launcher.exists() and f"toolbox run -c {installer.TOOLBOX} /usr/bin/adb" in launcher.read_text()
+    assert out["found"] == str(launcher) and out["how"].startswith("toolbox")
+    rec = installer.installed(app)[0]
+    assert rec["name"] == "adb" and str(launcher) in rec["launchers"]
+    env = installer.with_path(app, {"PATH": "/usr/bin"})
+    assert env["PATH"].split(os.pathsep)[0] == str(installer.tools_dir(app) / "bin")
+    asyncio.run(installer.remove(app, "adb"))
+    assert not launcher.exists() and installer.installed(app) == []
+    assert installer.kind_of("org.gimp.GIMP") == "app" and installer.kind_of("chrome-for-testing") == "browser"
+    assert installer.kind_of("pip:requests") == "python" and installer.kind_of("nmap") == "command"
+    with pytest.raises(installer.InstallError):
+        asyncio.run(installer.install(app, "adb; rm -rf /"))
+
+
+def test_a_program_that_needs_a_password_reads_as_needing_the_user(tmp_path, monkeypatch):
+    from dva import installer, recovery
+    app = _fake_app(tmp_path)
+
+    async def run(app_, argv, timeout=1800, on_status=None, owner=None, env=None):
+        return (1, "sudo: a password is required") if argv[:2] == ["sudo", "-n"] else (0, "")
+    monkeypatch.setattr(installer, "_run", run)
+    monkeypatch.setattr(installer, "computer", lambda: {"os": "linux", "immutable": False, "toolbox": False,
+                                                        "flatpak": False, "brew": False, "managers": ["apt"]})
+    monkeypatch.setattr(installer, "which", lambda app_, name: None)
+    with pytest.raises(installer.InstallError) as err:
+        asyncio.run(installer.install(app, "ffmpeg"))
+    assert "sudo apt-get install -y ffmpeg" in str(err.value)
+    assert recovery.classify(str(err.value)) == "permission"
+
+
+def test_a_missing_program_is_installed_not_asked_about():
+    from dva import recovery
+    assert recovery.fast_rule({"class": "missing", "reason": 'Browser "chromium" is not installed. Run `npx '
+                                                             '@playwright/mcp install-browser chromium`'}) == "install"
+    assert recovery.fast_rule({"class": "approach", "need": "tool", "reason": "bash: nmap: command not found"}) == "install"
+    assert recovery.fast_rule({"class": "missing", "reason": "No image model is installed"}) == "handover"
+    assert recovery.fast_rule({"class": "permission", "reason": "the user declined"}) == "ask"
+
+
+def test_the_browser_helper_installs_its_browser_when_it_is_missing(tmp_path):
+    from dva.services import Services
+    app = _fake_app(tmp_path, install_programs=True)
+    sv = Services(app)
+    answers = [(False, 'Error: Browser "chromium" is not installed; expected executable at /x. Run `npx '
+                       '@playwright/mcp install-browser chromium` to install'), (True, "page")]
+    did = []
+
+    async def call(key, name, args, timeout=120):
+        return answers.pop(0)
+
+    async def install(target, on_status=None):
+        did.append(target)
+
+    async def nothing(*a):
+        did.append("restart")
+    sv._browser_call, sv.install_browser, sv.close_browser, sv.restart_browser = call, install, nothing, nothing
+    assert asyncio.run(sv.browser_call("c1", "browser_navigate", {})) == (True, "page")
+    assert did == ["chromium", "restart", "restart"]
+
+
+def test_auto_approve_is_read_at_every_approval(tmp_path):
+    from types import SimpleNamespace
+    from dva.runner import Turn
+    from dva.tools import Tool
+    app = _fake_app(tmp_path)
+    app.approvals = {}
+    app.jobs = SimpleNamespace(set_status=lambda *a, **k: None)
+    t = Turn.__new__(Turn)
+    t.app, t.db, t.emit = app, app.db, (lambda *a, **k: None)
+    t.chat, t.parent_chat, t.job = {"id": "c1", "title": "x", "parent_chat_id": "lead"}, {"id": "lead"}, {"id": "j"}
+    t._auto_payload, t.policy, t.allowed_always = False, None, set()
+    tool = Tool("write_file", "", {}, None, "files", changes=True)
+
+    async def go():
+        waiting = asyncio.create_task(t.approve(tool, {}, "write it"))
+        always = asyncio.create_task(t.approve(tool, {}, "pay", ignore_auto=True))
+        await asyncio.sleep(0.2)
+        assert not waiting.done() and len(app.approvals) == 2
+        note = [e for e in app.bus.events if e["kind"] == "notify"][0]
+        assert note["level"] == "action" and note["approval_id"] in app.approvals
+        app.db.set_setting("chat_auto_approve:lead", True)     # switched on in the lead's chat
+        assert await asyncio.wait_for(waiting, 5) is True
+        assert not always.done()                               # paying still asks
+        always.cancel()
+    asyncio.run(go())
+    app.db.values.clear()
+    assert t.auto_approve is False
+    t.job = {"id": "j", "kind": "schedule"}
+    assert t.auto_approve is True                              # unattended work approves on its own by default
+    app.db.set_setting("unattended_auto_approve", False)
+    assert t.auto_approve is False
+
+
+def test_planners_are_told_that_agents_think_install_and_are_approved():
+    from types import SimpleNamespace
+    from dva.orchestrator import crew_facts
+    turn = SimpleNamespace(db=_Settings(), auto_approve=True)
+    text = crew_facts(turn)
+    assert "thinks before it acts" in text and "install_program" in text and "approved in advance" in text
+    turn = SimpleNamespace(db=_Settings(thinking_default=False, install_programs=False), auto_approve=False)
+    assert crew_facts(turn) == ""
+
+
+def test_a_chat_reply_that_took_a_while_tells_you_when_it_is_done(tmp_path):
+    from types import SimpleNamespace
+    from dva.db import DB
+    from dva.jobs import Jobs
+    db = DB(tmp_path / "j.db")
+    app = SimpleNamespace(db=db, bus=_Bus(), log=lambda *a: None)
+    jobs = Jobs(app)
+    db.insert("chats", {"id": "c1", "title": "Prices"})
+    db.insert("messages", {"id": "m1", "chat_id": "c1", "role": "assistant", "content": "The prices rose 4 %.",
+                           "created": "2026-11-21T10:00:00+00:00"})
+    db.insert("jobs", {"id": "j1", "kind": "chat", "title": "Prices", "status": "running", "chat_id": "c1",
+                       "created": "2026-11-21T09:00:00+00:00", "started": "2026-11-21T09:00:00+00:00"})
+    row = db.get("jobs", "j1")
+    assert jobs.worth_telling(row, "done")
+    jobs.tell_done(row, "done", None)
+    e = app.bus.events[-1]
+    assert e["title"] == "Done: Prices" and e["body"] == "The prices rose 4 %." and e["level"] == "done"
+    assert not jobs.worth_telling({**row, "kind": "agent"}, "done")
+    assert not jobs.worth_telling({**row, "payload": {"mission": {}}}, "done")
+    db.set_setting("notify_done_seconds", 0)
+    assert not jobs.worth_telling(row, "done")

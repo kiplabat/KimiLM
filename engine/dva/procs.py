@@ -363,11 +363,13 @@ class _Nothing:
         return False
 
 
-def python_argv(script, helpers=None):
+def python_argv(script, helpers=None, extra=()):
     """The app's own Python, isolated from the user's settings, running `script` so that errors still name the
-    script and its lines; `helpers` is a folder put first on the import path (the kimilm module)."""
+    script and its lines; `helpers` is a folder put first on the import path (the kimilm module); `extra` folders
+    go last (packages agents installed, 2.29.0)."""
     boot = ("import sys, runpy; sys.argv = [sys.argv[1]]"
             + (f"; sys.path.insert(0, {str(helpers)!r})" if helpers else "")
+            + "".join(f"; sys.path.append({str(e)!r})" for e in extra)
             + "; runpy.run_path(sys.argv[0], run_name='__main__')")
     return [sys.executable, "-I", "-c", boot, str(script)]
 

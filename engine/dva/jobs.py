@@ -98,6 +98,14 @@ def size_text(n):
     return f"{n / 2**30:.2f} GB" if n >= 2**30 else f"{n / 2**20:.0f} MB" if n >= 2**20 else f"{n / 1024:.0f} KB"
 
 
+def _seconds_between(a, b):
+    from datetime import datetime
+    try:
+        return (datetime.fromisoformat(str(b)) - datetime.fromisoformat(str(a))).total_seconds()
+    except (TypeError, ValueError):
+        return None
+
+
 class Jobs:
     def __init__(self, app):
         self.app = app
@@ -170,12 +178,40 @@ class Jobs:
                              chat_id=row["chat_id"], error=error)
         if notify:
             self.app.bus.publish("notify", title=("Task finished: " if status == "done" else "Task " + status + ": ")
-                                 + row["title"], body=(error or "Open it to see the result."), chat_id=row["chat_id"])
+                                 + row["title"], body=(error or "Open it to see the result."), chat_id=row["chat_id"],
+                                 level="done" if status == "done" else "failed", job_id=job_id)
+        elif self.worth_telling(row, status):
+            self.tell_done(row, status, error)
         if on_done:
             try:
                 on_done(status)
             except Exception as exc:
                 self.app.log(f"after job {job_id}: {type(exc).__name__}: {exc}")
+
+    def worth_telling(self, row, status):
+        """2.29.0: a chat reply that took a while tells you when it is done (or failed), wherever you are; the
+        window leaves it out when you are looking at that chat. Long-running tasks tell you themselves."""
+        if row.get("kind") != "chat" or status == "cancelled" or "mission" in (row.get("payload") or {}):
+            return False
+        chat = self.db.get("chats", row["chat_id"]) if row.get("chat_id") else None
+        if (chat or {}).get("harness") == "long-task":
+            return False
+        try:
+            wait = float(self.app.db.setting("notify_done_seconds", 20) or 0)
+        except (TypeError, ValueError):
+            wait = 20
+        started = self.db.get("jobs", row["id"]) or {}
+        took = _seconds_between(started.get("started") or row.get("created"), now())
+        return wait > 0 and took is not None and took >= wait
+
+    def tell_done(self, row, status, error):
+        last = self.db.one("SELECT content FROM messages WHERE chat_id=? AND role='assistant' "
+                           "ORDER BY created DESC, rowid DESC LIMIT 1", (row["chat_id"],)) if row.get("chat_id") else None
+        text = " ".join(str((last or {}).get("content") or "").split())
+        self.app.bus.publish("notify", title=("Done: " if status == "done" else "Could not finish: ") + row["title"],
+                             body=(error if status != "done" else text[:160] + ("…" if len(text) > 160 else ""))
+                             or "Open it to see the answer.", chat_id=row["chat_id"], job_id=row["id"],
+                             level="done" if status == "done" else "failed")
 
     def set_status(self, job_id, status, **extra):
         self.db.update("jobs", job_id, {"status": status, **extra})

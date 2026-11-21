@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -15,6 +16,22 @@ from pathlib import Path
 
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 VERSIONS = json.loads((Path(__file__).with_name("versions.json")).read_text(encoding="utf-8"))
+
+
+# 2.29.0: the browser the helper needs is not there: its own words name what to install
+NOT_INSTALLED = re.compile(r'(?:Browser "?([\w.-]+)"? is not installed|install-browser ([\w.-]+))', re.I)
+# browsers a Linux computer may already have, used before Playwright's own is downloaded
+SYSTEM_BROWSERS = ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser", "microsoft-edge-stable",
+                   "microsoft-edge", "brave-browser")
+
+
+def system_browser():
+    """A Chrome-like browser installed on this Linux computer (a Flatpak cannot be driven this way)."""
+    for name in SYSTEM_BROWSERS:
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
 
 
 def port_open(port):
@@ -113,25 +130,70 @@ class Services:
         folder.mkdir(parents=True, exist_ok=True)
         return folder
 
-    def _browser_cmd(self, port):
-        channel = self.app.db.setting("browser_channel") or {"Windows": "msedge", "Darwin": "chrome"}.get(
-            platform.system(), "chromium")
-        tail = ["--browser", channel, "--isolated", "--port", str(port), "--host", "127.0.0.1",
-                "--output-dir", str(self.browser_dir)]
-        if self.app.db.setting("browser_headless", False):
-            tail.append("--headless")
-        tail += (os.environ.get("DVA_BROWSER_ARGS") or "").split()     # e.g. --no-sandbox when run as root (tests)
+    def _helper(self):
+        """How the browser helper is started: (argv before its options, environment)."""
         node, cli = os.environ.get("DVA_NODE"), os.environ.get("DVA_PLAYWRIGHT_MCP")
         env = {**os.environ}
         env.pop("DVA_TOKEN", None)
         if node and cli and Path(cli).exists():
             if os.environ.get("DVA_NODE_IS_ELECTRON"):
                 env["ELECTRON_RUN_AS_NODE"] = "1"
-            return [node, cli, *tail], env
+            return [node, cli], env
         npx = shutil.which("npx.cmd" if os.name == "nt" else "npx")
         if not npx:
             raise RuntimeError("The browser helper needs the app's bundled Node or Node.js (npx) in development")
-        return [npx, "-y", f"@playwright/mcp@{VERSIONS['playwright_mcp']}", *tail], env
+        return [npx, "-y", f"@playwright/mcp@{VERSIONS['playwright_mcp']}"], env
+
+    def _browser_choice(self):
+        """--browser (and --executable-path): the user's choice; else Edge on Windows, Chrome on macOS; on Linux a
+        Chrome or Chromium the computer has, else Playwright's own (installed when it is first needed, 2.29.0)."""
+        channel = self.app.db.setting("browser_channel")
+        if channel:
+            return ["--browser", channel]
+        system = platform.system()
+        if system == "Windows":
+            return ["--browser", "msedge"]
+        if system == "Darwin":
+            return ["--browser", "chrome"]
+        found = system_browser()
+        if found:
+            return ["--browser", "chrome", "--executable-path", found]
+        return ["--browser", "chromium"]
+
+    async def install_browser(self, target="chromium", on_status=None):
+        """Download the browser the helper drives (Playwright's Chrome for Testing) into the user's own cache. No
+        password is needed; it happens once. Returns what was installed."""
+        target = target if re.fullmatch(r"[\w.-]{2,40}", target or "") else "chromium"
+        head, env = self._helper()
+        if on_status:
+            on_status(f"Installing the browser the browser tools need ({target}); this happens once…")
+        log = (self.app.paths.data / "logs" / "browser-helper.log").open("ab")
+        try:
+            proc = await asyncio.create_subprocess_exec(*head, "install-browser", target, stdout=log,
+                                                        stderr=subprocess.STDOUT, env=env, creationflags=NO_WINDOW)
+            try:
+                code = await asyncio.wait_for(proc.wait(), 1800)
+            except asyncio.TimeoutError:
+                proc.kill()
+                raise RuntimeError("Installing the browser took more than 30 minutes and was stopped")
+        finally:
+            log.close()
+        if code != 0:
+            raise RuntimeError(f"Installing the browser ({target}) failed (exit code {code}); see "
+                               "logs/browser-helper.log")
+        from . import installer
+        installer.record(self.app, target, "browser", how="Playwright (install-browser)", package=target)
+        self.app.bus.publish("notify", title="Installed a browser for the agents", body=target, level="info")
+        return target
+
+    def _browser_cmd(self, port):
+        tail = [*self._browser_choice(), "--isolated", "--port", str(port), "--host", "127.0.0.1",
+                "--output-dir", str(self.browser_dir)]
+        if self.app.db.setting("browser_headless", False):
+            tail.append("--headless")
+        tail += (os.environ.get("DVA_BROWSER_ARGS") or "").split()     # e.g. --no-sandbox when run as root (tests)
+        head, env = self._helper()
+        return [*head, *tail], env
 
     async def browser(self):
         async with self.lock:
@@ -154,8 +216,33 @@ class Services:
                 await asyncio.sleep(0.5)
             raise RuntimeError("The browser helper did not start within 2 minutes")
 
-    async def browser_call(self, key, name, args, timeout=120):
-        """Call a tool of the browser helper on the page that belongs to `key` (a chat). Returns (ok, text)."""
+    async def browser_call(self, key, name, args, timeout=120, on_status=None, _installed=False):
+        """Call a tool of the browser helper on the page that belongs to `key` (a chat). Returns (ok, text).
+        2.29.0: when the helper says its browser is not installed, it is installed and the call made again."""
+        ok, text = await self._browser_call(key, name, args, timeout)
+        miss = None if ok or _installed else NOT_INSTALLED.search(text or "")
+        if miss and self.app.db.setting("install_programs", True):
+            try:
+                await self.install_browser(miss.group(1) or miss.group(2), on_status)
+            except Exception as exc:
+                return False, (f"{text}\nKimiLM tried to install it and could not: {exc}")
+            await self.close_browser(key)
+            await self.restart_browser()
+            return await self.browser_call(key, name, args, timeout, on_status, _installed=True)
+        return ok, text
+
+    async def restart_browser(self):
+        """End the helper, so the next call starts it again (with a browser that was just installed)."""
+        async with self.lock:
+            proc, self.browser_proc = self.browser_proc, None
+            if proc and proc.poll() is None:
+                proc.terminate()
+                try:
+                    await asyncio.to_thread(proc.wait, 10)
+                except Exception:
+                    proc.kill()
+
+    async def _browser_call(self, key, name, args, timeout=120):
         for old, sess in list(self.sessions.items()):
             if old != key and (not sess.alive() or time.monotonic() - sess.used > self.BROWSER_IDLE):
                 self.sessions.pop(old, None)

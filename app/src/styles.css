@@ -646,3 +646,45 @@ body.resizing-y, body.resizing-y * { cursor: ns-resize !important; user-select: 
   .settings-nav .side-item { border: 1px solid var(--line); border-radius: 20px; padding: 4px 10px; }
 }
 a.btn { text-decoration: none; color: var(--text); }
+
+/* 2.29.0: notifications (on screen and under the bell) */
+.toasts { align-items: flex-end; }
+.note { display: flex; gap: 10px; align-items: flex-start; width: 380px; max-width: calc(100vw - 36px); background: var(--surface); color: var(--text);
+  border: 1px solid var(--line); border-left: 4px solid var(--ink-mid); border-radius: 12px; padding: 11px 12px; box-shadow: 0 8px 28px rgba(0,0,0,.16);
+  flex-wrap: wrap; position: relative; animation: note-in .18s ease-out; }
+@keyframes note-in { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
+.note-action { border-left-color: var(--coral); } .note-done { border-left-color: var(--sage); }
+.note-failed { border-left-color: var(--danger); } .note-device { border-left-color: var(--amber); }
+.note-icon { flex: none; margin-top: 2px; color: var(--text-soft); }
+.note-action .note-icon { color: var(--coral); } .note-done .note-icon { color: var(--sage); } .note-failed .note-icon { color: var(--danger); }
+.note-main { flex: 1; min-width: 0; cursor: pointer; padding-right: 18px; }
+.note-title { font-weight: 600; font-size: 13.5px; }
+.note-body { font-size: 12.5px; color: var(--text-soft); margin-top: 2px; overflow-wrap: anywhere; }
+.note-detail { font-family: var(--mono); font-size: 11.5px; color: var(--text-soft); margin-top: 6px; max-height: 90px; overflow: auto; white-space: pre-wrap; }
+.note-when { font-size: 11.5px; color: var(--text-soft); margin-top: 3px; }
+.note-actions { display: flex; gap: 6px; width: 100%; padding-left: 26px; }
+.note-close { position: absolute; top: 8px; right: 8px; background: none; border: 0; color: var(--text-soft); cursor: pointer; padding: 2px; border-radius: 6px; }
+.note-close:hover { background: var(--surface-2); }
+.note-compact { width: auto; box-shadow: none; border-width: 0 0 1px 3px; border-radius: 0; animation: none; padding: 9px 10px; }
+.note-compact.note-read { opacity: .62; }
+.brand .bell { margin-left: auto; position: relative; }
+.bell-btn { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 9px;
+  border: 1px solid transparent; background: transparent; color: var(--text-soft); cursor: pointer; }
+.bell-btn:hover { background: var(--surface-2); color: var(--text); }
+.bell-needs { color: var(--coral); }
+.bell-count { position: absolute; top: -2px; right: -3px; min-width: 16px; height: 16px; border-radius: 8px; background: var(--coral); color: white;
+  font: 600 10px/16px var(--font); text-align: center; padding: 0 3px; }
+.bell-list { position: absolute; top: 36px; left: 0; z-index: 70; width: 360px; max-height: 70vh; overflow: auto; background: var(--surface);
+  border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 12px 36px rgba(0,0,0,.18); font-family: var(--font); font-size: 13px; font-weight: 400; cursor: default; }
+.bell-head { padding: 10px 12px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--surface); }
+.bell-empty { padding: 14px 12px; }
+@media (prefers-reduced-motion: reduce) { .note { animation: none; } }
+
+/* 2.29.0: Devices */
+.dev-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
+.dev-card { text-align: left; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 12px; cursor: pointer; display: flex; gap: 10px; align-items: flex-start; color: var(--text); font: inherit; }
+.dev-card:hover { border-color: var(--ink-mid); } .dev-card.on { border-color: var(--coral); box-shadow: 0 0 0 1px var(--coral) inset; }
+.dev-card .dev-icon { flex: none; width: 34px; height: 34px; border-radius: 10px; background: var(--surface-2); display: flex; align-items: center; justify-content: center; color: var(--text-soft); }
+.dev-kv { display: grid; grid-template-columns: 150px 1fr; gap: 4px 12px; font-size: 13px; }
+.dev-kv > :nth-child(odd) { color: var(--text-soft); }
+.dev-result { max-height: 280px; overflow: auto; background: var(--surface-2); border-radius: 10px; padding: 10px; }

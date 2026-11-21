@@ -15,6 +15,7 @@ export function limitsText(l: any) {
 
 export function SetupCard({ setup, onChange, allowable, compact }: { setup: any; onChange: (s: any) => void; allowable: Record<string, string>; compact?: boolean }) {
   const { boot } = useApp();
+  const auto = boot?.settings?.unattended_auto_approve !== false;     // 2.29.0
   const harnesses = (boot?.harnesses || []).filter((h: any) => h.enabled && !h.error && h.type === "loop" && !["team", "mission"].includes(h.mode));
   const team: any[] = setup.team || [];
   const limits = setup.limits || {};
@@ -43,7 +44,8 @@ export function SetupCard({ setup, onChange, allowable, compact }: { setup: any;
         <Field label="Minutes one step may take"><input className="input narrow" type="number" min={5} value={limits.step_minutes ?? ""} onChange={(e) => setLimit("step_minutes", e.target.value)} /></Field>
         <Field label="Online spending (US$, 0 = the monthly budget only)"><input className="input narrow" type="number" min={0} step={0.5} value={limits.cost ?? 0} onChange={(e) => setLimit("cost", e.target.value)} /></Field>
       </div>
-      <div className="setup-title"><ShieldCheck size={14} /> It may do this without asking <span className="muted small">anything else waits for you and sends a notification</span></div>
+      {auto ? <div className="setup-title"><ShieldCheck size={14} /> It approves its own actions <span className="muted small">Settings → Teams and long tasks; paying, sending your files to a website and sending private material online still ask</span></div>
+        : <div className="setup-title"><ShieldCheck size={14} /> It may do this without asking <span className="muted small">anything else waits for you and sends a notification</span></div>}
       <div className="setup-allow">
         {Object.entries(allowable || {}).map(([key, label]) => (
           <label key={key} className="row gap-s small"><input type="checkbox" checked={allow.includes(key)}

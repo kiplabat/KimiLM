@@ -214,7 +214,29 @@ KIT_WORDS = {
              r"dictat|\bmp3\b|\bwav\b",
     "video": r"video|clip\b|footage|film|movie|animation|animate|slideshow|explainer|reel\b|trailer|\bmp4\b|subtitle|"
              r"screen recording",
+    # 2.29.0: what is plugged in
+    "devices": r"device|phone|android|iphone|tablet|raspberry|\bpi\b|pico|arduino|esp32|microcontroller|sensor|"
+               r"usb|serial|display|monitor|screen brightness|hdmi|bluetooth|headphone|headset|speaker|earbud|"
+               r"keyboard|mouse|dongle|plugged|attached|connected to (the|my|this) (computer|laptop)",
 }
+
+
+def crew_facts(turn):
+    """What a planner must know about every agent it starts (2.29.0), said in its own words in each planning prompt:
+    agents think before they act, they install what they lack, and (when it is so) nobody is asked to approve."""
+    s = turn.db.setting
+    out = []
+    if s("thinking_default", True):
+        out.append("Every agent you start thinks before it acts (thinking mode is on by default): give it goals that "
+                   "need judgement and it reasons them through; you need not tell it to think step by step.")
+    if s("install_programs", True):
+        out.append("Every agent can install a program it lacks with install_program (a browser, a command-line "
+                   "tool, a Python or Node package, an app). A missing program is never a reason to stop or to "
+                   "ask me: say in the goal that the agent installs what it needs, or give installing a step of its "
+                   "own.")
+    if getattr(turn, "auto_approve", False):
+        out.append("The agents' actions are approved in advance: nobody is asked, so plan steps that act.")
+    return " ".join(out)
 
 
 def lean_kit(goal, harness_groups=None):
@@ -530,6 +552,7 @@ class Orchestra:
             "- One agent does each step with tools (files in my folders, the web, Python and shell commands, memory, "
             "skills, connectors). goal: everything that agent needs to know (paths, sources, formats, limits); it "
             "sees only its goal and the results it builds on. done_when: a test the result can be checked against.\n"
+            + (f"- {crew_facts(turn)}\n" if crew_facts(turn) else "")
             + ("- Connected services the agents have tools for (what each promises):\n" + services + "\n  When a "
                "service offers what a step needs, say in its goal which service and tool to use. Send an agent to "
                "search or browse the web only for what no service offers.\n" if services else "") +
@@ -1304,7 +1327,14 @@ class Orchestra:
                                         "from where you stopped: do not redo what is already done. Then reply with "
                                         "the complete result.")
         change, hint = None, ""
-        if not last and rule == "handover":
+        if rule == "install" and (last or earlier or not self.db.setting("install_programs", True)):
+            rule = flag["rule"] = "handover"      # installing was already tried (or is off): as before
+        if not last and rule == "install":
+            change = "a fresh agent that installs what is missing first"
+            hint = ("What stopped the last agent is a program that is not installed. Install it first with "
+                    "install_program (check_only says how it would be installed; kind browser for the browser "
+                    "tools' browser), then do the step. Do not report that it is missing.")
+        elif not last and rule == "handover":
             change = self.handover(t, flag)
             if not change:
                 rule = flag["rule"] = "ask"

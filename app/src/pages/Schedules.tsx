@@ -7,7 +7,8 @@ import { ConnectorPicker, HarnessPicker, ModelPicker } from "../components/Picke
 import { EMPTY_SETUP, SetupCard, limitsText } from "../components/Setup";
 
 function Editor({ s, onClose, onDone }: any) {
-  const { toast, projects } = useApp();
+  const { toast, projects, boot } = useApp();
+  const selfApproving = boot?.settings?.unattended_auto_approve !== false;   // 2.29.0
   const [f, setF] = useState<any>(s ? { ...s, when: s.when } : { name: "", prompt: "", when: "every day at 09:00", harness: "planner", model: "", project_id: null,
     chat_mode: "new", connectors: [], auto_approve: false, catch_up: true, only_on_ac: false, max_runs_per_day: 0, enabled: true });
   const [preview, setPreview] = useState<any>(null);
@@ -76,6 +77,7 @@ function Editor({ s, onClose, onDone }: any) {
         </select>
       </Field>
       {long ? <SetupCard setup={f.setup} onChange={(v: any) => setF({ ...f, setup: v })} allowable={allowable} />
+        : selfApproving ? <div className="small muted">Scheduled runs approve their own actions (Settings → Teams and long tasks). Paying, sending your files to a website and sending private material online still ask.</div>
         : <Field label="It may do this without asking" help="Anything else waits for you and sends a notification. Leave all off to be asked about every change.">
           <div className="setup-allow">{Object.entries(allowable).map(([key, label]) => (
             <label key={key} className="row gap-s small"><input type="checkbox" checked={(f.setup?.allow || []).includes(key)}

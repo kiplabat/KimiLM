@@ -222,6 +222,7 @@ function createWindow(show = true) {
   win.webContents.on("will-navigate", (e, url) => {
     if (!url.startsWith(appUrl())) { e.preventDefault(); shell.openExternal(url); }
   });
+  win.on("focus", () => { try { win.flashFrame(false); } catch {} });   // 2.29.0: seen
   win.on("close", (e) => {
     // In the KimiOS session (2.23.0) KimiLM is the whole desktop and there is no tray to come back from: closing
     // the window quits, and the session returns to the login screen.
@@ -314,10 +315,12 @@ ipcMain.handle("dva:pick-file", async (_e, filters) => {
 ipcMain.handle("dva:open-path", (_e, p) => shell.openPath(p));
 ipcMain.handle("dva:show-item", (_e, p) => shell.showItemInFolder(p));
 ipcMain.handle("dva:open-external", (_e, url) => { if (/^https?:\/\//.test(url)) shell.openExternal(url); });
-ipcMain.handle("dva:notify", (_e, { title, body }) => {
+ipcMain.handle("dva:notify", (_e, { title, body, chatId, level }) => {
+  // 2.29.0: something that needs you also makes the taskbar ask for attention; a click opens that chat
+  if (level === "action" && win && !win.isFocused()) { try { win.flashFrame(true); } catch {} }
   if (!Notification.isSupported()) return;
-  const n = new Notification({ title, body, icon: iconPath() });
-  n.on("click", showWindow);
+  const n = new Notification({ title, body, icon: iconPath(), urgency: level === "action" ? "critical" : "normal" });
+  n.on("click", () => { showWindow(); if (chatId && win) win.webContents.send("dva:open", { chatId }); });
   n.show();
 });
 ipcMain.handle("dva:get-shell-prefs", () => ({ ...prefs(), openAtLogin: app.getLoginItemSettings().openAtLogin }));

@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { ClipboardCheck, Cpu, FolderOpen, Gauge, Globe, Info, Monitor, Search, ShieldCheck, Sparkles, Users, X, Zap } from "lucide-react";
 import { api, desktop } from "../api";
-import { go, useApp, useShown } from "../store";
+import { go, useApp, useEvent, useShown } from "../store";
 import { Badge, Button, ConfirmButton, Field, FolderInput, PageHeader, Toggle } from "../components/ui";
 import { SplitPane } from "../components/Resizable";
 
@@ -136,12 +136,12 @@ function SizeCard() {
 }
 
 const KW = {
- "general": "size text zoom larger smaller window panels sidebar width resize reset start sign in tray background keep awake running in the background start kimilm when i sign in to windows (in the tray) — needed for schedules closing the window keeps the app running in the tray keep the computer awake while a task is running (the screen may still turn off; closing a laptop's lid still follows windows' own setting)",
+ "general": "notifications notify sound bell done finished needs me device plugged in size text zoom larger smaller window panels sidebar width resize reset start sign in tray background keep awake running in the background start kimilm when i sign in to windows (in the tray) — needed for schedules closing the window keeps the app running in the tray keep the computer awake while a task is running (the screen may still turn off; closing a laptop's lid still follows windows' own setting)",
  "models": "models models folder save default context (tokens) longest reply (tokens) free memory after (minutes idle) models loaded at once more lets agents use different models in parallel; each needs memory. time limit per reply (minutes) agents stop and report what they found.",
  "less": "doing less work a model on this computer spends most of its time reading. these settings make it read less: what it has read once is kept, and what it is given to read follows how fast this computer reads. keep what a model has read of its instructions and tools on disk, so a freshly loaded model does not read them again snapshots are used when a model runs with one reply at a time. planned runs always do; for ordinary chats set the model's simultaneous replies to 1 (models), which also saves memory. delete snapshots disk space for snapshots (mb) the oldest are deleted first. memory for prompts already read (mb) reading time per tool result (seconds) how much of a web page, file or command output a model is given follows its measured reading speed: about this many seconds of reading. 0 = always 6,000 characters.",
- "teams": "teams of agents a planner (your strongest model) turns a multi-step request into a short sequence of steps and creates an agent for each. a step starts only when the results it needs are accepted. every result is checked; a step that does not pass goes round again with what is missing. before a step starts, its tokens, context and time are forecast, and each model is loaded with only the context the run needs and unloaded when no remaining step uses it. use a team automatically, when a request looks multi-step for every agent or planner request only when i ask (team harness or team builder) order of steps one after another (recommended) side by side when steps are independent load models for a run with the context its steps need (forecast), not each model's full context setting check every step's result against its 'done when' before the next step starts ask me before a plan starts (sche",
+ "teams": "how agents work think before answering thinking scheduled long-running tasks approve their own actions auto-approve install programs agents install teams of agents a planner (your strongest model) turns a multi-step request into a short sequence of steps and creates an agent for each. a step starts only when the results it needs are accepted. every result is checked; a step that does not pass goes round again with what is missing. before a step starts, its tokens, context and time are forecast, and each model is loaded with only the context the run needs and unloaded when no remaining step uses it. use a team automatically, when a request looks multi-step for every agent or planner request only when i ask (team harness or team builder) order of steps one after another (recommended) side by side when steps are independent load models for a run with the context its steps need (forecast), not each model's full context setting check every step's result against its 'done when' before the next step starts ask me before a plan starts (sche",
  "web": "web and downloads when search engines return nothing useful, search again in a real browser window (edge) cookie banners on websites an agent opens answered without asking, as a person would in passing. agreeing to terms, signing in, sending a file and paying are never done this way. choose what allows least (“reject all”, “only necessary”), else accept accept them leave them to the agent (a click then asks you) hugging face token (optional) only for models that require you to accept a licence on huggingface.co. stored in windows credential manager. save",
- "safety": "safety let the agent run code: python and commands such as tests and git (always asks first unless auto-approve is on) longest a program an agent runs may take (seconds) an agent may ask for less or more time for its code; never more than this. a program that runs longer is ended with every program it started. programs agents may run at once more wait their turn. code runs at low priority, so the model and this window stay responsive. a failure should reach the planner's decision within (seconds) agents of a plan or a long-running task stop as soon as they cannot finish, and the planner decides by rule where the answer is clear. a run's card shows how fast that was against this target (time spent by a model deciding is not counted). if nobody answers an approval, decline after (minutes) most tools offered directly to the model above this, connector tools are offered through a search tool",
+ "safety": "programs agents installed remove toolbox flatpak winget safety let the agent run code: python and commands such as tests and git (always asks first unless auto-approve is on) longest a program an agent runs may take (seconds) an agent may ask for less or more time for its code; never more than this. a program that runs longer is ended with every program it started. programs agents may run at once more wait their turn. code runs at low priority, so the model and this window stay responsive. a failure should reach the planner's decision within (seconds) agents of a plan or a long-running task stop as soon as they cannot finish, and the planner decides by rule where the answer is clear. a run's card shows how fast that was against this target (time spent by a model deciding is not counted). if nobody answers an approval, decline after (minutes) most tools offered directly to the model above this, connector tools are offered through a search tool",
  "about": "about open data folder open logs version data folder logs",
  "explore": "idle measure fastest setup suggestions evaluate better ways",
  "check": "evaluation check setup tasks compare models export csv pause continue delete",
@@ -163,6 +163,31 @@ const SECTIONS: { id: string; label: string; icon: any; words: string }[] = [
   { id: "about", label: "About", icon: Info, words: KW.about },
 ];
 
+// 2.29.0: programs agents installed for their work, and how to undo each
+function ProgramsCard() {
+  const { toast } = useApp();
+  const [data, setData] = useState<any>(null);
+  const load = () => api.get("/programs").then(setData).catch(() => {});
+  useEffect(() => { load(); }, []);
+  useEvent((e) => { if (e.kind === "programs_changed") load(); });
+  if (!data) return null;
+  const pc = data.computer || {};
+  const way = pc.os === "windows" ? "winget" : pc.os === "macos" ? "Homebrew" : pc.immutable ? "a toolbox of KimiLM's own (no password)"
+    : (pc.managers || [])[0] ? `${pc.managers[0]} when it needs no password` : "Flatpak and KimiLM's own folder";
+  return (
+    <div className="card stack-s">
+      <h3>Programs agents installed</h3>
+      <p className="muted small">Command-line programs go in with {way}; apps with {pc.os === "linux" ? "Flatpak (Flathub, for you only)" : pc.os === "windows" ? "winget" : "Homebrew"}; Python and Node packages into KimiLM's own folder.</p>
+      {data.installed.length === 0 ? <div className="muted small">None yet.</div> :
+        data.installed.map((r: any) => (
+          <div key={r.name + r.kind} className="row between gap-m">
+            <div className="grow"><b>{r.name}</b> <span className="muted small">{r.kind} · {r.how} · {r.when}{r.by ? ` · for ${r.by}` : ""}</span></div>
+            {r.kind !== "browser" && <ConfirmButton small kind="ghost" onConfirm={async () => { try { await api.del(`/programs/${encodeURIComponent(r.name)}`); load(); } catch (e: any) { toast(e.message, "error"); } }}>Remove</ConfirmButton>}
+          </div>))}
+    </div>
+  );
+}
+
 export default function Settings({ section }: { section?: string }) {
   const { boot, refreshBoot, toast } = useApp();
   const s = boot.settings;
@@ -182,6 +207,15 @@ export default function Settings({ section }: { section?: string }) {
     general: () => <>
       <SizeCard />
       <LayoutCard />
+      <div className="card stack-s">
+        <h3>Notifications</h3>
+        <p className="muted small">You are told on screen (and on the desktop when KimiLM is not in front) when something needs you, when long work is done and when a device is plugged in. Everything is kept under the bell next to KimiLM's name.</p>
+        <Field label="Tell me a chat is done when it took longer than (seconds)" help="0: only scheduled and long-running tasks, approvals and questions. Not shown when you are looking at that chat.">
+          <input className="input narrow" type="number" min={0} step={5} value={s.notify_done_seconds ?? 20} onChange={(e) => set({ notify_done_seconds: Number(e.target.value) })} />
+        </Field>
+        <Toggle checked={s.notify_sound ?? true} onChange={(v: boolean) => set({ notify_sound: v })} label="A short sound when something needs me" />
+        <Toggle checked={s.devices_watch ?? true} onChange={(v: boolean) => set({ devices_watch: v })} label="Tell me when a device is plugged in or taken out (Devices)" />
+      </div>
         {shell && (
           <div className="card stack-s">
             <h3>Running in the background</h3>
@@ -246,6 +280,13 @@ export default function Settings({ section }: { section?: string }) {
         </div>
     </>,
     teams: () => <>
+        <div className="card stack-s">
+          <h3>How agents work</h3>
+          <Toggle checked={s.thinking_default ?? true} onChange={(v: boolean) => set({ thinking_default: v })} label="Think before answering, in new chats and in every agent a planner starts (planners are told so)" />
+          <Toggle checked={s.unattended_auto_approve ?? true} onChange={(v: boolean) => set({ unattended_auto_approve: v })} label="Scheduled and long-running tasks approve their own actions (paying, sending your files to a website and sending private material online still ask)" />
+          <Toggle checked={s.install_programs ?? true} onChange={(v: boolean) => set({ install_programs: v })} label="Agents install programs they need (browsers, command-line tools, Python and Node packages, apps) instead of stopping" />
+          <div className="muted small">Switching Auto-approve on in a chat also answers what its agents are waiting for, at once.</div>
+        </div>
         <div className="card stack-s">
           <h3>Teams of agents</h3>
           <p className="muted small">A planner (your strongest model) turns a multi-step request into a short sequence of steps and creates an agent for each. A step starts only when the results it needs are accepted. Every result is checked; a step that does not pass goes round again with what is missing. Before a step starts, its tokens, context and time are forecast, and each model is loaded with only the context the run needs and unloaded when no remaining step uses it.</p>
@@ -324,6 +365,7 @@ export default function Settings({ section }: { section?: string }) {
         </div>
     </>,
     safety: () => <>
+        <ProgramsCard />
         <div className="card stack-s">
           <h3>Safety</h3>
           <Toggle checked={s.allow_python} onChange={(v: boolean) => set({ allow_python: v })} label="Let the agent run code: Python and commands such as tests and git (always asks first unless auto-approve is on)" />

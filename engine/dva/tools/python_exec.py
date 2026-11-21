@@ -13,6 +13,7 @@ import os
 import re
 import time
 
+from .. import installer
 from ..procs import HELPERS, python_argv
 from . import Tool, ToolError
 
@@ -64,15 +65,16 @@ async def run_python(ctx, code, timeout=None):
     script.write_text(code, encoding="utf-8")
     cwd = ctx.primary
     before = await asyncio.to_thread(_snapshot, cwd)
-    env = {**os.environ, "MPLBACKEND": "Agg", "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1",
-           "DVA_WORKSPACE": str(ctx.workspace)}
+    env = installer.with_path(ctx.app, {**os.environ, "MPLBACKEND": "Agg", "PYTHONIOENCODING": "utf-8",
+                                        "PYTHONUTF8": "1", "DVA_WORKSPACE": str(ctx.workspace)})
     env.pop("DVA_TOKEN", None)
     bridge = ctx.app.bridge.open(ctx) if getattr(ctx, "turn", None) is not None else None
     if bridge:                                         # kimilm.call(...) reaches this agent's connectors
         env.update(bridge["env"])
     ctx.emit("status", text="Running Python…")
     try:
-        code_, out = await ctx.app.procs.run(python_argv(script, HELPERS), cwd=cwd, env=env, timeout=timeout,
+        argv = python_argv(script, HELPERS, extra=[installer.python_dir(ctx.app)])   # packages agents installed
+        code_, out = await ctx.app.procs.run(argv, cwd=cwd, env=env, timeout=timeout,
                                              kind="python", label=(code.strip().splitlines() or [""])[0],
                                              owner=owner_of(ctx), on_line=waiting(ctx))
     except asyncio.TimeoutError:
@@ -109,9 +111,8 @@ def where_it_failed(stderr, script, code):
         out += f"\n\nThe error is at line {n} of your code:\n" + "\n".join(around)
     missing = re.search(r"No module named '([\w.]+)'", stderr or "")
     if missing:
-        out += (f"\nHint: the module '{missing.group(1)}' is not installed in the app's Python. Use what is available "
-                "(pandas, numpy, matplotlib, openpyxl and the standard library), or run_command if the computer has "
-                "its own Python with that package.")
+        out += (f"\nHint: the module '{missing.group(1)}' is not installed in the app's Python. Install it with "
+                f"install_program(name='{missing.group(1).split('.')[0]}', kind='python') and run the code again.")
     if "FileNotFoundError" in (stderr or ""):
         out += "\nHint: paths are relative to the chat's main folder; list_files shows what is there."
     return out
@@ -122,7 +123,8 @@ async def run_command(ctx, command, folder="", timeout=None):
     cwd = ctx.resolve(folder, write=True) if folder else ctx.primary
     if not cwd.is_dir():
         raise ToolError(f"{cwd} is not a folder")
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "DVA_WORKSPACE": str(ctx.workspace)}
+    env = installer.with_path(ctx.app, {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1",
+                                        "DVA_WORKSPACE": str(ctx.workspace)})
     env.pop("DVA_TOKEN", None)
     if os.name == "nt":
         argv = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",

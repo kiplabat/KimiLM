@@ -28,6 +28,7 @@ from .runtime import Runtime
 from .scheduler import Scheduler
 from .secrets import Secrets
 from .services import Services
+from .devices import Devices
 from .skills import Skills
 from .sound import Sound
 from .telemetry import Telemetry
@@ -39,7 +40,7 @@ STATE = None
 DEFAULT_SETTINGS = {
     "default_harness": "agent", "default_compute": "auto", "default_ctx": 8192, "max_reply_tokens": 2048,
     "unload_after_minutes": 20, "engine_memory_percent": 85, "explore_when_idle": True, "explore_idle_minutes": 30, "explore_evaluate": True, "suggestions_enabled": False, "memory_enabled": True, "learn_enabled": True, "learn_delay_seconds": 45,
-    "allow_python": True, "approval_timeout_minutes": 360, "max_native_tools": 47, "python_timeout_seconds": 180,
+    "allow_python": True, "approval_timeout_minutes": 360, "max_native_tools": 49, "python_timeout_seconds": 180,
     # 2.19.0: the most a tool call may ask for a program's time, and how many programs agents may run at once
     "code_timeout_max_seconds": 900, "code_runs_at_once": 2,
     "max_loaded_models": 3, "browser_search": True, "max_parallel_agents": 4, "turn_time_limit_minutes": 30,
@@ -88,6 +89,13 @@ DEFAULT_SETTINGS = {
     # that allows least, else accept) | accept | ask (left to the agent); browser_save_mb: the largest file
     # browser_save fetches through the browser
     "browser_consent": "necessary", "browser_save_mb": 300,
+    # 2.29.0: unattended_auto_approve: scheduled and long-running tasks (and their agents) approve their own actions;
+    # thinking_default: new chats and every agent a planner starts think before they answer; install_programs:
+    # agents may install a program they need (install_program); notify_done_seconds: a reply that took longer than
+    # this tells you when it is done (0: never); notify_sound: a short sound when something needs you;
+    # devices_watch: attached devices are watched and their arrival is announced
+    "unattended_auto_approve": True, "thinking_default": True, "install_programs": True,
+    "notify_done_seconds": 20, "notify_sound": True, "devices_watch": True,
 }
 CHAT_LIMIT_KEYS = ("max_reply_tokens", "max_steps", "time_limit_minutes", "temperature", "max_searches",
                    "max_tool_calls", "ctx")
@@ -130,6 +138,7 @@ class App:
         self.models.jobs = self.jobs          # downloads are tasks too
         self.scheduler = Scheduler(self)
         self.services = Services(self)
+        self.devices = Devices(self)                 # what is plugged in (2.29.0)
         self.images = Images(self)
         self.sound = Sound(self)
         self.voices = Voices(self)                   # your own voice: takes, checks, the reference (2.18.0)
@@ -170,6 +179,10 @@ class App:
         if self.db.setting("max_native_tools") == 44 and not self.db.setting("native_tools_2_14"):
             self.db.set_setting("max_native_tools", 47)
         self.db.set_setting("native_tools_2_14", True)
+        # 2.29.0 adds two tools every agent has (install_program, devices)
+        if self.db.setting("max_native_tools") == 47 and not self.db.setting("native_tools_2_29"):
+            self.db.set_setting("max_native_tools", 49)
+        self.db.set_setting("native_tools_2_29", True)
 
     def _release_pending_after_restart(self):
         """Follow-ups queued while a reply was running are not sent if the app closed meanwhile: they show as
@@ -216,6 +229,7 @@ class App:
         await asyncio.to_thread(self.telemetry.start)
         self._bg.append(asyncio.create_task(self.telemetry.watch(
             self.bus, lambda mid: (self.models.get_any(mid) or {}).get("name") or str(mid).split(":")[-1])))
+        self._bg.append(asyncio.create_task(self.devices._watch()))     # 2.29.0: devices coming and going
         self.log(f"engine started; data {self.paths.data}; secrets backend {self.secrets.backend}")
         # runs that were going when the app closed or crashed can be continued (2.7.0)
         cut = self.db.all("SELECT id, chat_id, resumes, kind FROM runs WHERE status='running'")
@@ -454,9 +468,11 @@ class App:
 
     # ------------------------------------------------------------------ chats
     def create_chat(self, project_id=None, title="", model=None, harness=None, connectors=None, folders=None,
-                    origin="user", schedule_id=None, thinking=False, settings=None, parent_chat_id=None,
+                    origin="user", schedule_id=None, thinking=None, settings=None, parent_chat_id=None,
                     agent_name=None):
         project = self.db.get("projects", project_id) if project_id else None
+        if thinking is None:                   # 2.29.0: thinking is on unless the chat says otherwise
+            thinking = bool(self.db.setting("thinking_default", True))
         chat_id = new_id("chat_")
         self.db.insert("chats", {
             "id": chat_id, "project_id": project_id, "title": title,

@@ -88,7 +88,7 @@ function Limits({ m, onClose, onDone }: any) {
 }
 
 export default function Missions() {
-  const { toast } = useApp();
+  const { toast, boot } = useApp();
   const [data, setData] = useState<any>(null);
   const [creating, setCreating] = useDraft("tasks.creating", false);
   const [limits, setLimits] = useState<any>(null);
@@ -129,7 +129,7 @@ export default function Missions() {
         {m.pause && <div className="small mission-pause">{m.pause.kind === "question" ? "The planner asks: " : "Paused: "}{m.pause.text}</div>}
         {m.understanding && <div className="small clamp-2" title={m.understanding}><b>Understanding:</b> {m.understanding}</div>}
         {m.last && <div className="small muted clamp-2" title={m.last.done}>Latest handoff ({m.last.id} {m.last.name}, {m.last.status}): {m.last.done || m.last.found}</div>}
-        <div className="small muted">Team: {(m.team || []).map((a: any) => a.name).join(", ") || "one general agent"}{m.allow?.length ? ` · without asking: ${m.allow.join(", ")}` : " · asks before every change"}</div>
+        <div className="small muted">Team: {(m.team || []).map((a: any) => a.name).join(", ") || "one general agent"}{boot?.settings?.unattended_auto_approve !== false ? " · approves its own actions" : m.allow?.length ? ` · without asking: ${m.allow.join(", ")}` : " · asks before every change"}</div>
       </div>
     );
   };
