@@ -1,5 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { api, connectEvents, desktop, onEvent } from "./api";
+import { NoticeStack } from "./components/Notices";
 
 export type Route = { page: string; id?: string; tab?: string };
 
@@ -13,6 +14,26 @@ export function go(page: string, id?: string, tab?: string) {
 }
 
 type Toast = { id: number; text: string; kind?: "ok" | "error" | "info" };
+// 2.29.0: notifications (finished, needs you, a device came or went): on screen with what you can do about them,
+// in the list under the bell, and on the desktop when the window is not in front
+export type Note = { id: number; seq?: number; title: string; body?: string; detail?: string; level: string; chat_id?: string;
+  approval_id?: string; device_id?: string; time: number; read?: boolean; shown?: boolean };
+const STARTED = Date.now();
+
+function chime() {        // two soft notes: something needs you
+  try {
+    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    [660, 880].forEach((f, i) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.frequency.value = f; o.type = "sine";
+      g.gain.setValueAtTime(0.0001, ctx.currentTime + i * 0.16);
+      g.gain.exponentialRampToValueAtTime(0.12, ctx.currentTime + i * 0.16 + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + i * 0.16 + 0.3);
+      o.connect(g); g.connect(ctx.destination); o.start(ctx.currentTime + i * 0.16); o.stop(ctx.currentTime + i * 0.16 + 0.32);
+    });
+    setTimeout(() => ctx.close(), 900);
+  } catch {}
+}
 
 const Ctx = createContext<any>(null);
 export const useApp = () => useContext(Ctx);
@@ -57,6 +78,26 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [modelStatus, setModelStatus] = useState<any>({ state: "idle" });
   const [downloads, setDownloads] = useState<Record<string, any>>({});
+  const [notes, setNotes] = useState<Note[]>([]);
+  const routeRef = useRef(route);
+  routeRef.current = route;
+  const bootRef = useRef<any>(null);
+  bootRef.current = boot;
+  const dismiss = useCallback((id: number) => setNotes((n) => n.map((x) => x.id === id ? { ...x, shown: false, read: true } : x)), []);
+  const markAllRead = useCallback(() => setNotes((n) => n.map((x) => ({ ...x, read: true, shown: false }))), []);
+  const notify = useCallback((e: any) => {
+    const watching = e.chat_id && routeRef.current.page === "chat" && routeRef.current.id === e.chat_id && !document.hidden && document.hasFocus();
+    if (e.level === "done" && watching) return;                       // you saw it finish
+    const old = e.time && e.time * 1000 < STARTED - 3000;               // from before this window opened
+    const id = e.seq || Date.now() + Math.random();
+    const note: Note = { id, seq: e.seq, title: e.title, body: e.body, detail: e.detail, level: e.level || "info", chat_id: e.chat_id,
+      approval_id: e.approval_id, device_id: e.device_id, time: (e.time || Date.now() / 1000), read: !!old, shown: !old };
+    setNotes((n) => (n.some((x) => x.id === id) ? n : [...n, note]).slice(-60));
+    if (old) return;
+    if (note.level !== "action") setTimeout(() => setNotes((n) => n.map((x) => x.id === id ? { ...x, shown: false } : x)), note.level === "device" ? 7000 : 10000);
+    if (desktop && (document.hidden || !document.hasFocus())) desktop.notify(e.title, e.body || "", { chatId: e.chat_id, level: note.level });
+    if (note.level === "action" && bootRef.current?.settings?.notify_sound !== false) chime();
+  }, []);
 
   const toast = useCallback((text: string, kind: Toast["kind"] = "info") => {
     const id = Date.now() + Math.random();
@@ -81,8 +122,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     window.addEventListener("hashchange", onHash);
     refreshBoot(); refreshProjects(); refreshChats(); refreshJobs();
     api.get("/downloads").then((r) => setDownloads(Object.fromEntries(r.downloads.map((d: any) => [d.id, d])))).catch(() => {});
+    api.get("/notifications").then((r) => (r.notifications || []).forEach((e: any) => notify(e))).catch(() => {});
+    const off = desktop?.onOpen?.((where: any) => { if (where?.chatId) go("chat", where.chatId); });
     connectEvents(setConnected);
-    return () => window.removeEventListener("hashchange", onHash);
+    return () => { window.removeEventListener("hashchange", onHash); off?.(); };
   }, []);
 
   useEvent((e) => {
@@ -96,10 +139,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       if (e.state === "done") { toast(`Downloaded ${e.name}`, "ok"); refreshBoot(); }
       if (e.state === "failed") toast(`Download failed: ${e.error}`, "error");
     }
-    if (e.kind === "notify") {
-      if (desktop && (document.hidden || !document.hasFocus())) desktop.notify(e.title, e.body || "");
-      else toast(e.title + (e.body ? ` — ${e.body}` : ""), "info");
-    }
+    if (e.kind === "notify") notify(e);
+    if (e.kind === "chat" && (e.type === "approval_done" || e.type === "agent_approval_done"))    // answered elsewhere
+      setNotes((n) => n.map((x) => x.approval_id === e.approval_id ? { ...x, shown: false, read: true, level: "info" } : x));
     if (e.kind === "runtime" && e.action === "installed") { toast(`Installed the ${e.backend} runtime`, "ok"); refreshBoot(); }
     if (e.kind === "runtime" && e.action === "install_failed") toast(`Runtime install failed: ${e.error}`, "error");
     if (e.kind === "image_engine" && e.action === "installed") toast("The image engine is installed", "ok");
@@ -116,12 +158,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const value = {
     route, boot, bootError, refreshBoot, projects, refreshProjects, chats, refreshChats, jobs, refreshJobs,
-    connected, toast, modelStatus, downloads, setDownloads,
+    connected, toast, modelStatus, downloads, setDownloads, notes, dismiss, markAllRead,
   };
   return (
     <Ctx.Provider value={value}>
       {children}
       <div className="toasts">
+        <NoticeStack notes={notes.filter((n) => n.shown)} dismiss={dismiss} />
         {toasts.map((t) => <div key={t.id} className={`toast toast-${t.kind}`}>{t.text}</div>)}
       </div>
     </Ctx.Provider>

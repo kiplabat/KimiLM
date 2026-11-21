@@ -65,7 +65,9 @@ CLASSES = {
                          "goal to save a tool's answer with save_to (or to page through a service in one run_python "
                          "program with kimilm.call), or give it to a stronger model."},
     "missing": {"label": "something it needs is not there", "repeat": 0,
-                "advice": "Get what is missing another way in a step of its own, or ask me for it ('ask')."},
+                "advice": "If it is a program (a browser, a command, a package, an app), the agent installs it with "
+                          "install_program: give the step again and say so in its goal, or give installing a step "
+                          "of its own. Anything else: get it another way in a step of its own, or ask me ('ask')."},
     "permission": {"label": "it needs you", "repeat": 0,
                    "advice": "Do not try it again. Ask me ('ask'), or do without it."},
     "stopped": {"label": "it was stopped", "repeat": 0, "advice": "It was stopped by the user."},
@@ -80,7 +82,7 @@ TIMEOUT = re.compile(r"time limit of [\d.]+ minutes|took more than|ran past its 
                      r"ran far past|used all \d+ steps|used its \d+ tool calls", re.I)
 MEMORY = re.compile(r"not enough memory|out of memory|failed to allocate|bad_alloc|ran out of memory", re.I)
 CONTEXT = re.compile(r"does not fit the model's context|context.{0,40}exceed|exceed.{0,40}context", re.I)
-PERMISSION = re.compile(r"declined|needs you to sign in|needs its key|needs your approval|not allowed to|"
+PERMISSION = re.compile(r"declined|needs you to sign in|needs its key|needs your approval|needs your password|not allowed to|"
                         r"was not approved|sign in first|unauthori[sz]ed|\b401\b", re.I)
 MISSING = re.compile(r"is not installed|not set up|no (image|video|sound|speech|music|vision)? ?model|there is no "
                      r"tool called|no model is installed|is unavailable|needs .{0,40} first|install it", re.I)
@@ -307,6 +309,22 @@ def declared_class(need, error):
             "more_time": "timeout"}.get(need, "approach")
 
 
+# 2.29.0: a program is missing (not a model, not a file): the agent installs it
+NO_PROGRAM = re.compile(r"is not installed|isn't installed|not installed on|command not found|no module named|"
+                        r"is not recognized as (an internal|the name of a cmdlet)|executable doesn't exist|"
+                        r"requires? .{0,40}(which|that) is not installed|missing (program|tool|browser|dependency|"
+                        r"package)|needs? .{0,30}installed|install(ed)? it first|not available on (this|the) "
+                        r"(computer|machine|system)", re.I)
+NO_MODEL = re.compile(r"\bmodels?\b.{0,30}(not installed|is not there|missing)|no (image|video|sound|speech|music|"
+                      r"vision|local) ?model", re.I)
+
+
+def program_missing(text):
+    """Does this failure say that a program is missing (one install_program can install)?"""
+    text = str(text or "")
+    return bool(NO_PROGRAM.search(text)) and not NO_MODEL.search(text)
+
+
 def fast_rule(entry):
     """What the planner does about an entry of the register when the answer is clear without asking its model:
     'retry' (a passing fault), 'ask' (only the user can give it), 'handover' (an agent with the tool), 'stronger'
@@ -315,6 +333,10 @@ def fast_rule(entry):
     kind, need = entry.get("class"), entry.get("need")
     if need == "information":
         return None                   # the planner (or another step) may know it
+    if kind in ("missing", "approach", "permission") or need in ("tool", "other", None):
+        if program_missing(" ".join(str(entry.get(k) or "") for k in ("reason", "error", "detail"))):
+            return "install"          # 2.29.0: install it and go on, never ask the user to
+
     if kind == "transient":
         return "retry"
     if kind == "permission" or need == "permission":

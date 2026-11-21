@@ -49,7 +49,7 @@ from .procs import end_tree
 from .providers import is_cloud
 from .recovery import public as public_entry, signature
 from .runtime import RuntimeError_
-from .tools import GROUPS, ON_REQUEST, Tool, ToolContext, ToolDenied, ToolError, builtin_tools
+from .tools import ALWAYS, GROUPS, ON_REQUEST, Tool, ToolContext, ToolDenied, ToolError, builtin_tools
 
 TOOL_RESULT_LIMIT = 6000      # characters of a tool result a model is given (online models, and the default)
 ROLES = ("worker", "strategist", "vision")
@@ -71,6 +71,14 @@ what you have. When code or a command fails, read the error, fix the cause and r
 you rely on them. If a search says NO RELEVANT RESULTS, do not search for the same thing again.
 Changes (writing files, running code, scheduling, connector actions that change things) are shown to the user for \
 approval by the app; if one is declined, do not retry it — explain or choose another way."""
+
+# 2.29.0: with auto-approve on, small models still wrote "shall I go ahead?" and stopped; they are told plainly
+AUTO_RULE = """Every action in this work is approved in advance: do not ask the user for permission or confirmation, \
+and do not stop to ask whether to go on. Act, then say what you did. Only paying for something, sending one of the \
+user's files to a website and sending private material to an online model still ask, and the app does that itself."""
+INSTALL_RULE = """If the work needs a program that is not on this computer (a browser, a command-line tool, a Python \
+or Node package, an app), do not stop and do not ask the user to install it: install_program checks whether it is there and installs it, \
+then carry on. Saying a tool is missing is not a result."""
 
 
 _PRIVATE_TOOLS = None
@@ -372,8 +380,10 @@ class Turn:
             self.workspace = team[0].dir
         self.run_fit = app.run_fit.get(chat_id)   # how a planned run loads its models (None: as set in Models)
         self.unload_after = set()                 # models to unload when this turn ends
-        self.auto_approve = bool(job.get("payload", {}).get("auto_approve")) or \
-            self.db.setting(f"chat_auto_approve:{chat_id}", False)
+        # 2.29.0: auto-approve is read at every approval, not once: switching it on in the chat (or in the lead's
+        # chat of a team, or for unattended work in Settings) lets a waiting agent go on at once
+        self._auto_payload = bool(job.get("payload", {}).get("auto_approve"))
+        self.parent_chat = self.db.get("chats", self.chat["parent_chat_id"]) if self.chat.get("parent_chat_id") else None
         # What this turn may do without asking (2.9.0): {"allow": [tool groups]} set when a scheduled or
         # long-running task was set up. Anything outside it still asks (and notifies), so an unattended run
         # never does more than was agreed.
@@ -386,6 +396,31 @@ class Turn:
         self.flagged = None                       # the register entry this agent wrote, once it could not finish
         self.guard = LoopGuard(self)
         self.ctx_need = 0                         # context this turn found it needs (it ran out once): 2.26.0
+
+    # ------------------------------------------------------------------ approving on its own (2.29.0)
+    @property
+    def unattended(self):
+        """Work nobody is watching: a scheduled run, a long-running task, or an agent of one."""
+        def of(chat):
+            return bool(chat) and (chat.get("origin") == "schedule" or chat.get("harness") == "long-task")
+        payload = self.job.get("payload") or {}
+        return (self.job.get("kind") == "schedule" or bool(payload.get("mission")) or of(self.chat)
+                or of(self.parent_chat))
+
+    @property
+    def auto_approve(self):
+        if self._auto_payload:
+            return True
+        s = self.db.setting
+        if s(f"chat_auto_approve:{self.chat['id']}", False):
+            return True
+        if self.parent_chat and s(f"chat_auto_approve:{self.parent_chat['id']}", False):
+            return True                     # the lead's chat was switched to approve: so are its agents
+        return bool(self.unattended and s("unattended_auto_approve", True))
+
+    @auto_approve.setter
+    def auto_approve(self, value):
+        self._auto_payload = bool(value)
 
     # ------------------------------------------------------------------ settings
     @property
@@ -559,7 +594,7 @@ class Turn:
         self.app.approvals[approval_id] = {"future": fut, "chat_id": self.chat["id"], "job_id": self.job["id"],
                                            "tool": tool.name, "label": tool.label or tool.name, "description": description,
                                            "parent_chat_id": self.chat.get("parent_chat_id"),
-                                           "agent": self.chat.get("agent_name")}
+                                           "agent": self.chat.get("agent_name"), "always_asks": bool(ignore_auto)}
         self.emit("approval", approval_id=approval_id, tool=tool.name, label=tool.label or tool.name,
                   description=description, arguments=_preview(args))
         if self.chat.get("parent_chat_id"):  # agents in a team ask in the lead's chat too
@@ -568,14 +603,28 @@ class Turn:
                                  agent_chat_id=self.chat["id"], tool=tool.name, label=tool.label or tool.name,
                                  description=description, arguments=_preview(args))
         self.app.jobs.set_status(self.job["id"], "waiting")
-        self.app.bus.publish("notify", title="Approval needed",
+        self.app.bus.publish("notify", title="Approval needed", level="action", approval_id=approval_id,
                              body=f"{self.chat.get('title') or 'A chat'}: {tool.label or tool.name}",
+                             detail=str(description or "")[:300],
                              chat_id=self.chat.get("parent_chat_id") or self.chat["id"])
         timeout = float(self.db.setting("approval_timeout_minutes", 360)) * 60
+        ends = time.monotonic() + timeout
         try:
-            decision = await asyncio.wait_for(fut, timeout)
-        except asyncio.TimeoutError:
-            decision = {"allow": False, "reason": "timed out"}
+            while True:
+                # 2.29.0: auto-approve switched on while this waits (here, in the lead's chat or in Settings)
+                # answers it at once
+                if not ignore_auto and self.auto_approve:
+                    decision = {"allow": True, "auto": True}
+                    break
+                left = ends - time.monotonic()
+                if left <= 0:
+                    decision = {"allow": False, "reason": "timed out"}
+                    break
+                try:
+                    decision = await asyncio.wait_for(asyncio.shield(fut), min(2.0, left))
+                    break
+                except asyncio.TimeoutError:
+                    continue
         finally:
             self.app.approvals.pop(approval_id, None)
             self.app.jobs.set_status(self.job["id"], "running")
@@ -614,6 +663,10 @@ class Turn:
         # the video tools are always there: a video from pictures, narration and music needs no video model
         if self.chat.get("parent_chat_id"):   # agents in a team do not start their own teams
             groups.discard("agents")
+        if self.db.setting("install_programs", True):     # 2.29.0: every agent can install what it lacks
+            groups |= set(ALWAYS)
+        else:
+            groups -= set(ALWAYS)
         return groups
 
     async def build_tools(self):
@@ -823,6 +876,10 @@ class Turn:
                             "once with report_failure." if "team_board" in self.tool_map else ""))
         if tools:
             parts.append(AGENT_RULES)
+            if self.auto_approve:
+                parts.append(AUTO_RULE)
+            if "install_program" in self.tool_map:
+                parts.append(INSTALL_RULE)
             # Which folders this chat may use is given with each request (request_context), not here: the path of
             # a chat's own folder is different for every chat, and anything that differs in the system prompt
             # makes the model read the whole tool list again. Without it, every chat with the same harness,
@@ -1289,18 +1346,22 @@ class Turn:
                            "between. Try again with a smaller context or a smaller model, or close other apps to "
                            "free memory.")
 
-    async def stream_text(self, messages, tools, final=True, max_tokens=None, _retry=False):
-        thinking = bool(self.chat.get("thinking")) or bool(self.harness.get("thinking"))
+    async def stream_text(self, messages, tools, final=True, max_tokens=None, _retry=False, _no_think=False):
+        thinking = (bool(self.chat.get("thinking")) or bool(self.harness.get("thinking"))) and not _no_think
         buffer = []
         await self.before_model_call(messages)
         self.stats["model_calls"] += 1
         self.status("Thinking…" if self.stats["model_calls"] == 1 else "Working…")
         end = None
-        thinking = thinking or (self.route_role == "strategist" and is_cloud(self.model_id))
+        thinking = (thinking or (self.route_role == "strategist" and is_cloud(self.model_id))) and not _no_think
+        allowance = int(max_tokens or self.max_reply)
+        if thinking and not is_cloud(self.model_id):
+            # 2.29.0: a local model's thinking is written inside the reply's tokens: it gets room of its own
+            allowance += int(self.db.setting("thinking_tokens", 2048) or 0)
         try:
             async for kind, value in self.app.llm.stream(messages, on_status=self.status,
                                                          tools=[t.schema() for t in tools] if tools else None,
-                                                         max_tokens=int(max_tokens or self.max_reply),
+                                                         max_tokens=allowance,
                                                          temperature=self.temperature, thinking=thinking,
                                                          server=self.server):
                 if kind == "token":
@@ -1352,6 +1413,10 @@ class Turn:
         if text.strip():
             self.steps.append({"type": "text", "text": text})
             self.text = [text] if final or not calls else self.text
+        if end.get("finish_reason") == "length" and not calls and thinking and not text.strip() and not _no_think:
+            # it thought until the limit and wrote nothing: once more, straight to the answer
+            self.status("It thought until its limit without answering; asking again without thinking…")
+            return await self.stream_text(messages, tools, final=final, max_tokens=max_tokens, _no_think=True)
         if end.get("finish_reason") == "length" and not calls:
             self.note(f"The reply reached its length limit ({int(max_tokens or self.max_reply):,} tokens). Raise "
                       "'Reply length' in this chat's limits for longer answers.")

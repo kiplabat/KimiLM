@@ -14,7 +14,9 @@ contextBridge.exposeInMainWorld("dva", {
   openPath: (p) => ipcRenderer.invoke("dva:open-path", p),
   showItem: (p) => ipcRenderer.invoke("dva:show-item", p),
   openExternal: (url) => ipcRenderer.invoke("dva:open-external", url),
-  notify: (title, body) => ipcRenderer.invoke("dva:notify", { title, body }),
+  notify: (title, body, extra) => ipcRenderer.invoke("dva:notify", { title, body, ...(extra || {}) }),
+  // 2.29.0: a desktop notification was clicked: open what it is about
+  onOpen: (fn) => { const h = (_e, where) => fn(where); ipcRenderer.on("dva:open", h); return () => ipcRenderer.removeListener("dva:open", h); },
   getShellPrefs: () => ipcRenderer.invoke("dva:get-shell-prefs"),
   setShellPrefs: (p) => ipcRenderer.invoke("dva:set-shell-prefs", p),
   openLogs: () => ipcRenderer.invoke("dva:logs-folder"),

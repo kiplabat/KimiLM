@@ -657,6 +657,10 @@ class Mission(Orchestra):
             parts.append("Connected services the agents have tools for (what each promises):\n" + self.services
                          + "\nWhen a service offers what a step needs, say in the step's goal which service and "
                          "tool to use. Send an agent to search or browse the web only for what no service offers.")
+        from .orchestrator import crew_facts
+        facts = crew_facts(self.turn)
+        if facts:
+            parts.append(facts)
         parts.append(f"Steps done so far: {len(self.handoffs)}"
                      + ("\n" + self.ledger(skip_last=True) if len(self.handoffs) > 1 else ""))
         if self.handoffs:
@@ -887,7 +891,7 @@ class Mission(Orchestra):
             self.say(self.paused_text())
             ask = self.pause.get("kind") == "question"
             self.app.bus.publish("notify", title=("A question about: " if ask else "Paused: ") + title,
-                                 body=_clip(self.pause.get("text"), 180), chat_id=turn.chat["id"])
+                                 body=_clip(self.pause.get("text"), 180), chat_id=turn.chat["id"], level="action")
             return
         done = [h for h in self.handoffs if h["status"] in ("done", "incomplete")]
         open_ = [h for h in self.handoffs if h["status"] != "done"]
@@ -917,6 +921,6 @@ class Mission(Orchestra):
                      + f".\n\n**What is known:** {self.understanding or '(nothing was written down)'}\n\n"
                      + "\n\n".join(self.handoff_text(h, 1500) for h in self.handoffs[-4:])
                      + f"\n\nShared folder: {self.dir}")
-        self.app.bus.publish("notify", title="Finished: " + title,
+        self.app.bus.publish("notify", title="Finished: " + title, level="done",
                              body=f"{len(done)} of {len(self.handoffs)} steps accepted. Open it to read the report.",
                              chat_id=turn.chat["id"])

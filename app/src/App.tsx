@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
   Activity as ActivityIcon, BookOpen, Brain, CalendarClock, Cpu, AudioLines, FolderKanban, Image as ImageIcon, MessageSquarePlus, Plug, Search,
-  Settings as SettingsIcon, Workflow, Loader2, Pin, Rocket, WifiOff, Film, ChevronDown, ChevronRight, Gauge, ChartColumn,
+  Settings as SettingsIcon, Workflow, Loader2, Pin, Rocket, WifiOff, Film, ChevronDown, ChevronRight, Gauge, ChartColumn, Usb,
 } from "lucide-react";
 import { api } from "./api";
 import { go, Shown, useApp } from "./store";
@@ -25,11 +25,14 @@ import Onboarding from "./pages/Onboarding";
 import Performance from "./pages/Performance";
 import Usage from "./pages/Usage";
 import { Handle, useSize } from "./components/Resizable";
+import { NoticeBell } from "./components/Notices";
+import Devices from "./pages/Devices";
 
 const NAV = [
   { page: "activity", label: "Activity", icon: ActivityIcon },
   { page: "performance", label: "Performance", icon: Gauge },
   { page: "usage", label: "Usage", icon: ChartColumn },
+  { page: "devices", label: "Devices", icon: Usb },
   { page: "tasks", label: "Long-running tasks", icon: Rocket },
   { page: "schedules", label: "Schedules", icon: CalendarClock },
   { page: "images", label: "Images", icon: ImageIcon },
@@ -83,6 +86,7 @@ function Sidebar() {
     <aside className="sidebar">
       <div className="brand" onClick={() => go("home")}>
         <img src="./icon.png" alt="" /> <span>KimiLM</span>
+        <NoticeBell />
       </div>
       <button className="new-chat" onClick={() => go("home")}><MessageSquarePlus size={16} /> New chat</button>
       <div className="search"><Search size={14} /><input placeholder="Search chats" value={q} onChange={(e) => setQ(e.target.value)} /></div>
@@ -198,6 +202,7 @@ export default function App() {
     case "settings": page = <Settings section={route.id} />; break;
     case "performance": page = <Performance />; break;
     case "usage": page = <Usage />; break;
+    case "devices": page = <Devices />; break;
     default: page = <Home projectId={route.page === "home" ? route.id : undefined} />;
   }
   const key = onboarding ? "onboarding" : slotKey(route.page, route.id);

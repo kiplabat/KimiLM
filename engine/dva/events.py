@@ -13,10 +13,14 @@ class EventBus:
         self.buffer = deque(maxlen=keep)
         self.subscribers = set()
         self.loop = None
+        self.notices = deque(maxlen=60)      # 2.29.0: the latest notifications, for the window's list
 
     def publish(self, kind, /, **data):
         event = {"seq": next(self.seq), "time": time.time(), **data, "kind": kind}
         self.buffer.append(event)
+        if kind == "notify":
+            event.setdefault("level", "info")
+            self.notices.append(event)
         for queue in list(self.subscribers):
             try:
                 queue.put_nowait(event)

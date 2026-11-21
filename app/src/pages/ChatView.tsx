@@ -707,7 +707,7 @@ export default function ChatView({ chatId }: { chatId: string }) {
             {chat.origin === "agent" && <Badge kind="accent">agent</Badge>}
           </div>
           <div className="row gap-s">
-            <span className="chip chip-toggle" title="Approve changes (file writes, Python, connector actions) automatically in this chat">
+            <span className="chip chip-toggle" title="Approve changes (file writes, Python, commands, installs, connector and device actions) automatically in this chat and for its agents; switching it on also answers what they are waiting for">
               <ShieldCheck size={14} /><Toggle checked={chat.auto_approve} onChange={(v: boolean) => patch({ auto_approve: v })} label="Auto-approve" />
             </span>
             {running && (chat.paused

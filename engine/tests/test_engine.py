@@ -1699,9 +1699,16 @@ def test_a_task_does_without_asking_only_what_its_setup_allows(engine):
     team = team_of(last_assistant(c, made["chat_id"]))
     note = next(m for m in c.get(f"/api/chats/{team['tasks'][0]['chat_id']}").json()["messages"] if m["role"] == "assistant")
     assert any(s["type"] == "tool" and s["name"] == "write_file" and s["ok"] for s in note["meta"]["steps"])
+    c.put("/api/settings", json={"unattended_auto_approve": False})     # 2.29.0: the set-up's list decides
+    try:
+        made = c.post("/api/missions", json={"text": "Long task with a note-step first.", "setup": {"allow": ["browser"]}}).json()
+        status, asked = approvals_seen(c, made["job_id"], made["chat_id"])
+        assert status == "done" and asked == ["write_file"]        # not agreed: it asked (and the user allowed it)
+    finally:
+        c.put("/api/settings", json={"unattended_auto_approve": True})
     made = c.post("/api/missions", json={"text": "Long task with a note-step first.", "setup": {"allow": ["browser"]}}).json()
     status, asked = approvals_seen(c, made["job_id"], made["chat_id"])
-    assert status == "done" and asked == ["write_file"]        # not agreed: it asked (and the user allowed it)
+    assert status == "done" and asked == []                    # 2.29.0 default: unattended work approves its own
 
 
 def test_a_planner_sets_up_a_task_and_code_repairs_the_setup(engine):
@@ -2430,7 +2437,7 @@ def test_connectors_are_taken_over_tested_and_used(engine):
     row = next(x for x in c.get("/api/connectors").json()["connectors"] if x["id"] == cid)
     assert row["env"] == {"API_KEY": "", "REGION": ""}
     assert c.delete(f"/api/connectors/{cid}/delete").json()["ok"]
-    c.put("/api/settings", json={"max_native_tools": 47})
+    c.put("/api/settings", json={"max_native_tools": 49})
 
 
 def test_remote_connectors_send_headers_speak_both_transports_and_sign_in(tmp_path, monkeypatch):

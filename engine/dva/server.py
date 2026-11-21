@@ -197,6 +197,71 @@ def create_app(data_dir=None, resources_dir=None, token=None):
     async def telemetry_summary(seconds: int = 300):
         return await asyncio.to_thread(A().telemetry.summary, seconds)
 
+    @api.get("/api/notifications")
+    async def notifications():
+        """2.29.0: the latest notifications (newest last), for the window's list."""
+        return {"notifications": list(A().bus.notices)}
+
+    # ------------------------------------------------------------------ devices and programs (2.29.0)
+    @api.get("/api/devices")
+    async def devices_list():
+        a = A()
+        found = await a.devices.look(fresh=True)
+        return {"devices": [{**d, "actions": a.devices.actions(d), "trusted": a.devices.trusted(d)} for d in found],
+                "watch": bool(a.db.setting("devices_watch", True))}
+
+    @api.get("/api/devices/one")
+    async def device_one(id: str):
+        return await A().devices.describe(id)
+
+    @api.post("/api/devices/control")
+    async def device_control(request: Request):
+        data = await body(request)
+        a = A()
+        folder = a.paths.data / "devices"
+        folder.mkdir(parents=True, exist_ok=True)
+        text = await a.devices.control(data.get("id"), data.get("action"), data.get("arguments") or {},
+                                       workspace=folder)
+        return {"result": text, "folder": str(folder)}
+
+    @api.put("/api/devices/trust")
+    async def device_trust(request: Request):
+        data = await body(request)
+        a = A()
+        d = await a.devices.get(data.get("id"))
+        a.db.set_setting(f"device_trust:{d.get('key') or d['id']}", bool(data.get("trusted")))
+        return {"trusted": bool(data.get("trusted"))}
+
+    @api.get("/api/programs")
+    async def programs():
+        from . import installer
+        return {"installed": installer.installed(A()), "computer": installer.computer()}
+
+    @api.get("/api/programs/find")
+    async def program_find(name: str, kind: str = "auto"):
+        from . import installer
+        return await installer.find(A(), name, kind)
+
+    @api.post("/api/programs")
+    async def program_install(request: Request):
+        from . import installer
+        data = await body(request)
+        a, name, kind = A(), str(data.get("name") or ""), str(data.get("kind") or "auto")
+        if not installer.NAME.match(name):
+            raise ValueError("Give the program's plain name")
+
+        async def go(row):
+            def status(text):
+                a.jobs.progress(row["id"], text)
+            return await installer.install(a, name, kind, data.get("package") or "", on_status=status,
+                                           owner=row["id"], by="You (Settings or Devices)")
+        return a.jobs.create("install", f"Install {name}", go, notify=True)
+
+    @api.delete("/api/programs/{name}")
+    async def program_remove(name: str):
+        from . import installer
+        return {"removed": await installer.remove(A(), name)}
+
     @api.get("/api/usage")
     async def usage(days: int = 30):
         return await asyncio.to_thread(A().meter.summary, days)
@@ -1239,7 +1304,7 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         return A().create_chat(project_id=data.get("project_id"), title=data.get("title", ""),
                                model=data.get("model"), harness=data.get("harness"),
                                connectors=data.get("connectors"), folders=data.get("folders"),
-                               thinking=data.get("thinking", False))
+                               thinking=data.get("thinking"))
 
     @api.post("/api/chats/{chat_id}/run/resume")
     async def run_resume(chat_id: str):

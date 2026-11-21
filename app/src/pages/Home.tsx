@@ -19,7 +19,7 @@ export default function Home({ projectId }: { projectId?: string }) {
   const [model, setModel] = useState<string>(project?.default_model || boot.default_model || "");
   const [connectors, setConnectors] = useState<string[]>(project?.connectors || []);
   const [folders, setFolders] = useState<string[]>([]);
-  const [thinking, setThinking] = useState(false);
+  const [thinking, setThinking] = useState<boolean>(boot.settings.thinking_default !== false);   // 2.29.0: on by default
   const [prefill, setPrefill] = useState("");
   const hour = new Date().getHours();
   const greeting = useMemo(() => hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening", [hour]);
@@ -33,7 +33,7 @@ export default function Home({ projectId }: { projectId?: string }) {
       // get this one's folders and connectors without being asked
       setHarness(project?.default_harness || boot.settings.default_harness || "agent");
       setModel(project?.default_model || boot.default_model || "");
-      setConnectors(project?.connectors || []); setFolders([]); setThinking(false); setPrefill("");
+      setConnectors(project?.connectors || []); setFolders([]); setThinking(boot.settings.thinking_default !== false); setPrefill("");
       go("chat", chat.id);
     } catch (e: any) { toast(e.message, "error"); throw e; }
   };

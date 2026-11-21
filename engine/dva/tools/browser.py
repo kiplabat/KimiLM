@@ -110,7 +110,7 @@ def dialog_in(text):
 
 async def call(ctx, name, args, timeout=120):
     try:
-        ok, text = await ctx.app.services.browser_call(ctx.chat["id"], name, args, timeout)
+        ok, text = await ctx.app.services.browser_call(ctx.chat["id"], name, args, timeout, on_status=ctx.progress)
     except Exception as exc:
         raise ToolError(f"The browser is not available ({type(exc).__name__}: {str(exc)[:200]})") from exc
     if not ok:
