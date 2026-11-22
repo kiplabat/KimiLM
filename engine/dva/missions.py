@@ -39,6 +39,7 @@ from . import recovery
 from .meter import purpose as usage_purpose
 from .db import now
 from .forecast import pretty_seconds, pretty_tokens
+from .abilities import SKILL_IDS
 from .orchestrator import SETTLED, Orchestra, _clip, same_objection
 from .providers import is_cloud
 
@@ -274,8 +275,14 @@ def parse_handoff(text):
     return out
 
 
-def move_schema(harness_ids, roles, most=2):
-    step = {"type": "object", "required": ["name", "goal", "done_when"], "properties": {
+def move_schema(harness_ids, roles, most=2, models=None, skills=None):
+    extra = {}
+    if skills:        # 2.32.0: the kind of work, and the model that measured best at it
+        extra["skill"] = {"enum": list(skills)}
+    if models:
+        extra["model"] = {"enum": list(models)}
+        extra["model_why"] = {"type": "string", "maxLength": 200}
+    step = {"type": "object", "required": ["name", "goal", "done_when"], "properties": {**extra,
         "together": {"type": "boolean"}, "team": {"type": "boolean"},
         "name": {"type": "string", "maxLength": 40}, "goal": {"type": "string", "maxLength": 1000},
         "done_when": {"type": "string", "maxLength": 240}, "agent": {"type": "string", "maxLength": 30},
@@ -488,7 +495,10 @@ class Mission(Orchestra):
                           "done_when": r.get("done_when") or "", "loop": bool(r.get("loop")),
                           "expects": r.get("expects") or [], "agent": who["name"], "harness": who["harness"],
                           "role": who.get("role"), "model": who.get("model"),
-                          "limits": {"time_limit_minutes": minutes}})
+                          "skill": r.get("skill"), "limits": {"time_limit_minutes": minutes}})
+            # 2.32.0: the planner's choice of model for this step, when the member has none of its own
+            if not who.get("model") and r.get("model") in self.choice_ids():
+                items[-1].update(model=r["model"], model_why=r.get("model_why"), model_by="planner")
         before = set(self.tasks)
         self.add(items)
         return [tid for tid in self.tasks if tid not in before]
@@ -748,6 +758,7 @@ class Mission(Orchestra):
             "and fix. expects: files it must save. minutes: only when a step needs longer than usual (it ran "
             "out of time while it was still getting somewhere).\n"
             "- outline: the few phases you expect after that; change it when the findings change the plan.\n"
+            + self.models_text(False) +
             "Never repeat a step that passed. When a step failed, try another way or a smaller piece, not the "
             "same thing again. JSON only.")
         return "\n\n".join(parts)
@@ -854,7 +865,9 @@ class Mission(Orchestra):
             await turn.hold_model()
             turn.status("The planner is reading the handoff and deciding the next step…" if self.handoffs
                         else "The planner is working out how to start…")
-            schema = move_schema(self.harness_ids, self.roles(), 2 if self.sequence else self.max_parallel)
+            ids = self.choice_ids()
+            schema = move_schema(self.harness_ids, self.roles(), 2 if self.sequence else self.max_parallel,
+                                 models=ids or None, skills=SKILL_IDS if ids else None)
             with usage_purpose("planner"):           # counted as the planner's work in Usage (2.27.0)
                 return (await turn.complete(messages + [{"role": "user", "content": self.move_prompt()}],
                                             schema=schema, max_tokens=1800, temperature=0.2))["json"]

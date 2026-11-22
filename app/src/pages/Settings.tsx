@@ -5,14 +5,56 @@ import { go, useApp, useEvent, useShown } from "../store";
 import { Badge, Button, ConfirmButton, Field, FolderInput, PageHeader, Toggle } from "../components/ui";
 import { SplitPane } from "../components/Resizable";
 
-// The built-in evaluation: twelve small tasks with answers that code checks. It turns "is this setup good?" into
-// numbers that can be compared between models, settings and versions.
+// 2.32.0: what each model is good at, by skill, from the evaluation's tasks; the planner reads the same table to
+// give each step the model that does that kind of work best (and to hand the planning itself to a better planner).
+function SkillsCard({ ab, reload }: { ab: any; reload: () => void }) {
+  const { toast } = useApp();
+  if (!ab) return null;
+  const put = async (v: any) => { try { await api.put("/settings", v); reload(); } catch (e: any) { toast(e.message, "error"); } };
+  const cell = (s: any) => {
+    if (!s) return <span className="muted">–</span>;
+    const cls = s.score >= 0.99 ? "ok" : s.score >= 0.5 ? "warn" : "bad";
+    return <span className={cls} title={`${s.passed} of ${s.ran} passed · about ${Math.round(s.seconds)} s each`}>{s.passed}/{s.ran}</span>;
+  };
+  return (
+    <div className="card stack-s">
+      <h3>What each model is good at</h3>
+      <p className="muted small">From the tasks above, by kind of work (passed / tried; the newest result of each task counts). When a request is planned, each step gets the model that passed most tasks of its kind, and the planner says why in the run. A model that was never tested for a kind of work is not chosen for it on a guess.</p>
+      {ab.models.length === 0 ? <div className="muted small">No model has been tested yet. Run the evaluation with each model you use (or only the skills you care about).</div> :
+        <div className="skill-table" style={{ ["--skills" as any]: ab.skills.length }}>
+          <div className="skill-row eval-head small muted"><span>Model</span>{ab.skills.map((k: any) => <span key={k.id} title={k.about}>{k.label}</span>)}</div>
+          {ab.models.map((m: any) => (
+            <div key={m.id} className="skill-row small">
+              <span className="ellipsis" title={`${m.id} · tested ${new Date(m.tested).toLocaleDateString()} with ${m.version}`}>
+                <b>{m.name}</b>{m.kind === "cloud" ? <span className="muted"> online</span> : null}{!m.usable ? <span className="muted"> (not available now)</span> : null}
+                <div className="muted">{m.passed} of {m.ran} tasks</div></span>
+              {ab.skills.map((k: any) => <span key={k.id}>{cell(m.skills[k.id])}</span>)}
+            </div>))}
+        </div>}
+      {(ab.untested || []).length > 0 && <div className="muted small">Not tested yet: {ab.untested.map((u: any) => u.name).join(", ")}.</div>}
+      <Toggle checked={ab.choose_step_models} label="Give each planned step the model that measured best at its kind of work"
+        onChange={(v: boolean) => put({ choose_step_models: v })} />
+      <Field label="Who plans" help="Decide: the chat's model plans, and may hand the planning to a model that planned clearly better here (on this computer or online). Best: always the best measured planner. The chat's model: never hand it on.">
+        <select className="input" style={{ maxWidth: 360 }} value={ab.planner_model} onChange={(e) => put({ planner_model: e.target.value })}>
+          <option value="decide">Decide: the planner may hand planning to a better planner</option>
+          <option value="best">Best: always the model that planned best</option>
+          <option value="default">The chat's model always plans</option>
+        </select>
+      </Field>
+    </div>
+  );
+}
+
+// The built-in evaluation: small tasks with answers that code checks (twenty in 2.32.0, each testing a kind of work).
+// It turns "is this setup good?" into numbers that can be compared between models, settings and versions.
 function EvaluationCard() {
   const { toast, boot } = useApp();
   const [data, setData] = useState<any>(null);
   const [open, setOpen] = useState<string | null>(null);
   const [model, setModel] = useState("");
   const [picked, setPicked] = useState<string[]>([]);       // up to two runs to compare
+  const [ab, setAb] = useState<any>(null);
+  const [skills, setSkills] = useState<string[]>([]);        // empty: every task
   const pick = (id: string) => setPicked((p) => p.includes(id) ? p.filter((x) => x !== id) : [...p.slice(-1), id]);
   const save = (name: string, text: string, type: string) => {
     const a = document.createElement("a");
@@ -28,7 +70,7 @@ function EvaluationCard() {
       lines.push([r.id, r.created, r.version, r.model, t.id, t.passed ? 1 : 0, t.seconds ?? "", t.read ?? "", t.cached ?? "", t.written ?? "", t.agent_tokens ?? "", t.calls ?? "", t.tools ?? "", t.planned ? 1 : 0, t.error || ""].map(q).join(","));
     save("kimilm-evaluation.csv", lines.join("\n") + "\n", "text/csv");
   };
-  const load = () => api.get("/evals").then(setData).catch(() => {});
+  const load = () => { api.get("/evals").then(setData).catch(() => {}); api.get("/abilities").then(setAb).catch(() => {}); };
   const shown = useShown();          // afresh when you come back to Settings (2.21.0)
   useEffect(() => { if (shown) load(); }, [shown]);
   useEffect(() => {
@@ -39,14 +81,16 @@ function EvaluationCard() {
   const dur = (sec: number) => sec < 90 ? `${Math.round(sec)} s` : sec < 5400 ? `${Math.round(sec / 60)} min` : `${(sec / 3600).toFixed(1)} h`;
   const k = (n: number) => n >= 10000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n || 0);
   const act = async (path: string, method: "post" | "del" = "post") => { try { await (api as any)[method](path); load(); } catch (e: any) { toast(e.message, "error"); } };
-  const run = async () => { try { await api.post("/evals/run", model ? { model } : {}); load(); } catch (e: any) { toast(e.message, "error"); } };
+  const run = async () => { try { await api.post("/evals/run", { ...(model ? { model } : {}), ...(skills.length ? { skills } : {}) }); load(); } catch (e: any) { toast(e.message, "error"); } };
+  const count = (data?.tasks || []).filter((t: any) => !skills.length || (t.skills || []).some((k: string) => skills.includes(k))).length;
   const two = picked.map((id) => data?.runs?.find((r: any) => r.id === id)).filter(Boolean);
   const [a, b] = two.length === 2 ? [...two].sort((x: any, y: any) => String(x.created).localeCompare(String(y.created))) : [null, null];
   const changed = a && b ? Object.keys({ ...(a.settings || {}), ...(b.settings || {}) }).filter((key) => JSON.stringify(a.settings?.[key]) !== JSON.stringify(b.settings?.[key])) : [];
   return (
+    <div className="stack">
     <div className="card stack-s">
       <h3>Check this setup</h3>
-      <p className="muted small">Runs {data?.tasks?.length || 12} small tasks (reading and computing, writing and editing files, fixing code, finding things, summarising, one planned run) with your default model and checks each answer in code. No internet, nothing personal, approvals off inside the test folder only. Use it to compare models, settings and versions on this computer. On a slow laptop it can take an hour or more.</p>
+      <p className="muted small">Runs {data?.tasks?.length || 20} small tasks, each testing a kind of work agents do (planning, research, browsing a website, coding, data, file work, extraction, writing, reasoning, long documents), with the model you choose, and checks each answer in code. No internet (the website is a few saved pages), nothing personal, approvals off inside the test folder only. Test every model you have: the planner uses the results to give each step the model that does it best. On a slow laptop the whole set can take an hour or more; pick only some skills to be quicker.</p>
       <div className="row gap-m wrap">
         {data?.current
           ? <><span className="small"><b>{data.current.paused ? "Paused" : "Running"}:</b> task {data.current.done + 1} of {data.current.total} · {data.current.task}</span>
@@ -57,12 +101,20 @@ function EvaluationCard() {
           : <>
               <select className="input" style={{ maxWidth: 280 }} value={model} onChange={(e) => setModel(e.target.value)} title="The model to test">
                 <option value="">Default model</option>
-                {(boot?.models || []).map((m: any) => <option key={m.id} value={m.id}>{m.name}</option>)}
+                <optgroup label="On this computer">{(boot?.models || []).map((m: any) => <option key={m.id} value={m.id}>{m.name}</option>)}</optgroup>
+                {(ab?.candidates || []).some((c: any) => c.kind === "cloud") && <optgroup label="Online (costs money)">
+                  {ab.candidates.filter((c: any) => c.kind === "cloud").map((c: any) => <option key={c.id} value={c.id}>{c.name}</option>)}</optgroup>}
               </select>
-              <Button small onClick={run}>Run the evaluation</Button>
+              <Button small onClick={run}>Run {count} task{count === 1 ? "" : "s"}</Button>
               {data?.runs?.length > 0 && <Button small kind="ghost" onClick={exportRuns}>Export all results (CSV)</Button>}
             </>}
       </div>
+      {!data?.current && ab && <div className="row gap-xs wrap small">
+        <span className="muted">Skills:</span>
+        <button className={`chip${skills.length === 0 ? " chip-on" : ""}`} onClick={() => setSkills([])}>All</button>
+        {ab.skills.map((k: any) => <button key={k.id} title={k.about} className={`chip${skills.includes(k.id) ? " chip-on" : ""}`}
+          onClick={() => setSkills((s) => s.includes(k.id) ? s.filter((x) => x !== k.id) : [...s, k.id])}>{k.label}</button>)}
+      </div>}
       {data?.runs?.length > 1 && <div className="small muted">Tick two runs to compare them task by task.</div>}
       {data?.runs?.length > 0 && <div className="eval-runs">
         <div className="eval-row eval-head small muted"><span>When</span><span>Version</span><span>Model</span><span>Passed</span><span>Time</span><span>Read</span><span>From cache</span><span>Written</span></div>
@@ -102,6 +154,8 @@ function EvaluationCard() {
           <span><b>{b.summary?.passed} of {b.summary?.total}</b> · {dur(b.summary?.seconds || 0)} · {b.summary?.cache_percent}% from cache</span><span /></div>
         <div className="small muted" style={{ padding: "8px 12px" }}>{changed.length ? <>Settings that differ: {changed.map((key) => `${key} ${JSON.stringify(a.settings?.[key])} → ${JSON.stringify(b.settings?.[key])}`).join("; ")}</> : "Both runs used the same settings."}</div>
       </div>}
+    </div>
+    <SkillsCard ab={ab} reload={load} />
     </div>
   );
 }

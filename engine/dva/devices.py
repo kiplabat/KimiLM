@@ -291,8 +291,9 @@ def linux_sensors(root=ROOT):
                            if re.search(r"_(raw|input)$", p.name)})
         if not channels:
             continue
+        usb = "usb" in str(dev.resolve())
         out.append({"id": f"iio:{dev.name}", "kind": "sensor", "name": read(dev / "name", dev.name),
-                    "connection": "built-in" if "usb" not in str(dev.resolve()) else "USB", "status": "connected",
+                    "connection": "USB" if usb else "built-in", "status": "connected", "internal": not usb,
                     "drivers": [d for d in [_driver(dev / "device")] if d], "channels": channels, "sysfs": str(dev)})
     return out
 

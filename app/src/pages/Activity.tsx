@@ -2,7 +2,8 @@ import React, { useEffect, useState } from "react";
 import { Activity as ActivityIcon, Ban, CheckCircle2, ChevronDown, ChevronRight, Clock, Cpu, Eye, Loader2, Play, Square, Workflow, X, XCircle } from "lucide-react";
 import { api, fmtTime } from "../api";
 import { go, useApp, useEvent, useShown } from "../store";
-import { Badge, Button, Empty, PageHeader, Spinner, Tabs } from "../components/ui";
+import { Badge, Button, ConfirmButton, Empty, PageHeader, Spinner, Tabs } from "../components/ui";
+import { InlineDetail } from "../components/InlineDetail";
 import { ACTIVE, KIND_NAME, PauseButton, PausedMark, Pulse, STATUS_ICON, WorkDetail, span, useTick } from "../components/Work";
 
 const kTokens = (n: number) => !n ? "0" : n >= 10000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
@@ -175,6 +176,61 @@ function TaskRow({ j, live, onOpen }: { j: any; live: any; onOpen: () => void })
   );
 }
 
+// 2.32.0 (KimiOS 0.11.0): snapshots of the home folder taken before unattended or auto-approved changes, what
+// changed since each one, and putting a file or folder back (the current version is kept beside it).
+function Undo() {
+  const { toast } = useApp();
+  const [data, setData] = useState<any>(null);
+  const [sel, setSel] = useState("");
+  const [path, setPath] = useState("~");
+  const [diff, setDiff] = useState<any>(null);
+  const [busy, setBusy] = useState(false);
+  const load = () => api.get("/snapshots").then(setData).catch((e) => toast(e.message, "error"));
+  useEffect(() => { load(); }, []);
+  if (!data) return <Spinner />;
+  if (!data.available) return <Empty title="Undo needs KimiOS">On KimiOS a snapshot of your home folder is taken before an unattended or auto-approved task changes anything, and you can put files back from here.</Empty>;
+  const look = async (id: string, p = path) => {
+    setBusy(true);
+    try { setDiff(await api.get(`/snapshots/changes?id=${encodeURIComponent(id)}&path=${encodeURIComponent(p)}`)); }
+    catch (e: any) { setDiff(null); toast(e.message, "error"); } finally { setBusy(false); }
+  };
+  const back = async (id: string, target: string) => {
+    try { const r = await api.post("/snapshots/restore", { id, path: target }); toast(`Put back: ${r.restored}${r.kept_current_as ? ` (the newer one is kept as ${r.kept_current_as.split("/").pop()})` : ""}`, "ok"); look(id); }
+    catch (e: any) { toast(e.message, "error"); }
+  };
+  const join = (base: string, rel: string) => rel === "." ? base : `${base.replace(/\/$/, "")}/${rel}`;
+  return (
+    <div className="stack-s">
+      <p className="muted small">A snapshot keeps your home folder as it was before an unattended or auto-approved task changed something (instant on btrfs; kept for a week, twelve at most). Choose one to see what changed since and put files back; the current version is kept beside what you restore, so this can be undone too.</p>
+      {data.error && <div className="small warn">{data.error}</div>}
+      {data.snapshots.length === 0 ? <Empty title="No snapshots yet">One is taken before the first change of an unattended or auto-approved task.</Empty> :
+        <div className="stack-xs">{data.snapshots.map((m: any) => (
+          <React.Fragment key={m.id}>
+            <div className={`pick-row${sel === m.id ? " active" : ""}`} onClick={() => { setSel(sel === m.id ? "" : m.id); setDiff(null); }}>
+              <span className="grow"><b>{new Date(m.created * 1000).toLocaleString()}</b> <span className="muted small">{m.kind === "copy" ? `copy of ${(m.paths || []).length} folder(s)` : "whole home folder"}</span>
+                <div className="small muted clamp">{m.reason || "—"}</div></span>
+            </div>
+            {sel === m.id && <InlineDetail id={m.id}>
+              <div className="stack-s">
+                <div className="row gap-s wrap">
+                  <input className="input" style={{ maxWidth: 420 }} value={path} onChange={(e) => setPath(e.target.value)} placeholder="~/Documents" title="A folder or file in your home folder" />
+                  <Button small busy={busy} onClick={() => look(m.id)}>What changed since</Button>
+                  {path.trim() && path.trim() !== "~" && <ConfirmButton small onConfirm={() => back(m.id, path.trim())}>Put this back as it was</ConfirmButton>}
+                </div>
+                {diff && diff.snapshot === m.id && <div className="stack-xs small">
+                  <div className="muted">In {diff.path}: {diff.counts.changed} changed, {diff.counts.removed} removed, {diff.counts.added} new since.</div>
+                  {[["changed", "changed"], ["removed", "removed"]].map(([k, label]) => diff[k].map((rel: string) => (
+                    <div key={k + rel} className="row between gap-s"><span className="ellipsis"><span className={k === "removed" ? "bad" : "warn"}>{label}</span> {rel}</span>
+                      <Button small kind="ghost" onClick={() => back(m.id, join(diff.path, rel))}>Put back</Button></div>)))}
+                  {diff.added.slice(0, 50).map((rel: string) => <div key={"a" + rel} className="ellipsis"><span className="ok">new</span> {rel}</div>)}
+                </div>}
+              </div>
+            </InlineDetail>}
+          </React.Fragment>))}</div>}
+    </div>
+  );
+}
+
 export default function Activity() {
   const [tab, setTab] = useState("tasks");
   const [group, setGroup] = useState("all");
@@ -198,7 +254,8 @@ export default function Activity() {
   return (
     <div className="page">
       <PageHeader title="Activity" subtitle="Everything that is working or has worked: chat replies, scheduled and long tasks, pictures, sound, video, downloads and installs. Open any of them to see its plan, every step with its time, and what the program itself printed. Tasks keep going when the window is closed." />
-      <Tabs value={tab} onChange={setTab} tabs={[{ id: "tasks", label: "Tasks" }, { id: "runs", label: "Planned runs" }, { id: "records", label: "Models' record" }]} />
+      <Tabs value={tab} onChange={setTab} tabs={[{ id: "tasks", label: "Tasks" }, { id: "runs", label: "Planned runs" }, { id: "records", label: "Models' record" }, { id: "undo", label: "Undo" }]} />
+      {tab === "undo" && <Undo />}
       {tab === "runs" && <Runs />}
       {tab === "records" && <Records />}
       {tab === "tasks" && <>

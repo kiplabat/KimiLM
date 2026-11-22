@@ -4,6 +4,7 @@ import { api, enc } from "../api";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, ConfirmButton, Field, Markdown, Modal, PageHeader, Spinner, Toggle } from "../components/ui";
 import { SplitPane } from "../components/Resizable";
+import { InlineDetail, useNarrow } from "../components/InlineDetail";
 
 export async function startAgentChat(text: string, harness = "agent") {
   const chat = await api.post("/chats", { harness });
@@ -28,6 +29,7 @@ function NewSkill({ onClose, onDone }: any) {
 export default function Skills({ selected }: { selected?: string }) {
   const { toast } = useApp();
   const [data, setData] = useState<any>(null);
+  const narrow = useNarrow();
   const [detail, setDetail] = useState<any>(null);
   const [raw, setRaw] = useState("");
   const [editing, setEditing] = useState(false);
@@ -42,6 +44,33 @@ export default function Skills({ selected }: { selected?: string }) {
   }, [selected, data]);
   if (!data) return <div className="page"><Spinner /></div>;
   const groups = [["user", "Your skills"], ["plugin", "From plugins"], ["builtin", "Built in"]];
+  // 2.32.0: beside the list on a wide window, right under the chosen row on a narrow one
+  const detailView = <>
+          {!detail ? <div className="muted pad">Choose a skill to read or edit it.</div> : (
+            <div className="card">
+              <div className="row between"><div><h2>{detail.name}</h2><div className="muted small">{detail.description}</div></div>
+                <Badge>{detail.source === "plugin" ? `plugin ${detail.plugin}` : detail.source}</Badge></div>
+              {detail.files?.length > 0 && <div className="small muted mt">Files: {detail.files.join(", ")}</div>}
+              {editing ? (
+                <>
+                  <textarea className="input mono mt" rows={22} value={raw} onChange={(e) => setRaw(e.target.value)} />
+                  <div className="row gap-s mt">
+                    <Button kind="primary" onClick={async () => { try { await api.put(`/skills/${enc(detail.id)}/raw`, { raw }); toast("Saved (previous version kept)", "ok"); setEditing(false); load(); } catch (e: any) { toast(e.message, "error"); } }}>Save</Button>
+                    <Button kind="ghost" onClick={() => { setEditing(false); setRaw(detail.raw); }}>Cancel</Button>
+                  </div>
+                </>
+              ) : <div className="mt"><Markdown>{detail.body}</Markdown></div>}
+              {!editing && (
+                <div className="row gap-s mt">
+                  {detail.editable ? <Button onClick={() => setEditing(true)}>Edit</Button>
+                    : <Button icon={<Copy size={13} />} onClick={async () => { const s = await api.post(`/skills/${enc(detail.id)}/copy`); toast("Copied to your skills", "ok"); load(); go("skills", s.id); }}>Copy to my skills to edit</Button>}
+                  <Button onClick={() => startAgentChat(`Improve my skill "${detail.name}". Load it with load_skill, ask me what isn't working, then save the improved version with save_skill under the same name.`)}>Improve with the agent</Button>
+                  {detail.editable && <ConfirmButton icon={<Trash2 size={13} />} onConfirm={async () => { await api.del(`/skills/${enc(detail.id)}/delete`); go("skills"); load(); }}>Delete</ConfirmButton>}
+                </div>
+              )}
+            </div>
+          )}
+  </>;
   return (
     <div className="page">
       <PageHeader title="Skills" subtitle="Reusable instructions. Only each skill's one-line description is in the agent's prompt; it loads the full skill when a task matches."
@@ -77,42 +106,18 @@ export default function Skills({ selected }: { selected?: string }) {
             return (
               <div key={src} className="mb">
                 <div className="small muted">{title}</div>
-                {items.map((s: any) => (
-                  <div key={s.id} className={`pick-row${selected === s.id ? " active" : ""}`} onClick={() => go("skills", s.id)}>
+                {items.map((s: any) => (<React.Fragment key={s.id}>
+                  <div className={`pick-row${selected === s.id ? " active" : ""}`} onClick={() => go("skills", s.id)}>
                     <BookOpen size={14} /><div className="grow"><b>{s.name}</b><div className="small muted clamp">{s.description}</div></div>
                     <span onClick={(e) => e.stopPropagation()}><Toggle checked={s.enabled} onChange={async (v: boolean) => { await api.put(`/skills/${enc(s.id)}/enabled`, { enabled: v }); load(); }} /></span>
                   </div>
+                  {narrow && selected === s.id && <InlineDetail id={s.id}>{detailView}</InlineDetail>}</React.Fragment>
                 ))}
               </div>
             );
           })}
         </div>
-        <div className="detail-col">
-          {!detail ? <div className="muted pad">Choose a skill to read or edit it.</div> : (
-            <div className="card">
-              <div className="row between"><div><h2>{detail.name}</h2><div className="muted small">{detail.description}</div></div>
-                <Badge>{detail.source === "plugin" ? `plugin ${detail.plugin}` : detail.source}</Badge></div>
-              {detail.files?.length > 0 && <div className="small muted mt">Files: {detail.files.join(", ")}</div>}
-              {editing ? (
-                <>
-                  <textarea className="input mono mt" rows={22} value={raw} onChange={(e) => setRaw(e.target.value)} />
-                  <div className="row gap-s mt">
-                    <Button kind="primary" onClick={async () => { try { await api.put(`/skills/${enc(detail.id)}/raw`, { raw }); toast("Saved (previous version kept)", "ok"); setEditing(false); load(); } catch (e: any) { toast(e.message, "error"); } }}>Save</Button>
-                    <Button kind="ghost" onClick={() => { setEditing(false); setRaw(detail.raw); }}>Cancel</Button>
-                  </div>
-                </>
-              ) : <div className="mt"><Markdown>{detail.body}</Markdown></div>}
-              {!editing && (
-                <div className="row gap-s mt">
-                  {detail.editable ? <Button onClick={() => setEditing(true)}>Edit</Button>
-                    : <Button icon={<Copy size={13} />} onClick={async () => { const s = await api.post(`/skills/${enc(detail.id)}/copy`); toast("Copied to your skills", "ok"); load(); go("skills", s.id); }}>Copy to my skills to edit</Button>}
-                  <Button onClick={() => startAgentChat(`Improve my skill "${detail.name}". Load it with load_skill, ask me what isn't working, then save the improved version with save_skill under the same name.`)}>Improve with the agent</Button>
-                  {detail.editable && <ConfirmButton icon={<Trash2 size={13} />} onConfirm={async () => { await api.del(`/skills/${enc(detail.id)}/delete`); go("skills"); load(); }}>Delete</ConfirmButton>}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
+        {!narrow && <div className="detail-col">{detailView}</div>}
       </SplitPane>
       {creating && <NewSkill onClose={() => setCreating(false)} onDone={load} />}
     </div>

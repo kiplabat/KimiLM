@@ -1098,7 +1098,7 @@ def test_auto_order_starts_independent_steps_together_on_one_local_model(tmp_pat
     o.tasks = {"a": {**W([]), "id": "a"}, "b": {**W([]), "id": "b"}, "c": {**W([]), "id": "c"},
                "d": {**W(["a"]), "id": "d"}, "e": {**W([], "m2"), "id": "e"}, "f": {**W([], "cloud:x"), "id": "f"}}
     ids = [t["id"] for t in o.startable()]
-    assert ids[:2] == ["a", "b"] and "c" not in ids and "d" not in ids
+    assert [i for i in ids if i != "f"][:2] == ["a", "b"] and "c" not in ids and "d" not in ids
     assert "f" in ids                                             # an online model runs alongside
     assert "e" not in ids and "one local model at a time" in o.tasks["e"]["wait_reason"]
     assert "free reply slot" in o.tasks["c"]["wait_reason"]
@@ -1106,3 +1106,105 @@ def test_auto_order_starts_independent_steps_together_on_one_local_model(tmp_pat
         {"ctx": 8192, "parallel": 3}
     o.order, o.sequence = "sequence", True
     assert [t["id"] for t in o.startable()] == ["a"]
+
+
+def _eval_app(rows):
+    from types import SimpleNamespace
+    return SimpleNamespace(db=SimpleNamespace(all=lambda sql, args=(): rows))
+
+
+def test_skill_profiles_count_the_newest_result_of_each_task():
+    """2.32.0: Check this setup's tasks are tagged with skills; a model's profile is the newest result per task."""
+    from dva import abilities
+    from dva.evals import TASKS
+    assert {s for t in TASKS for s in t["skills"]} == set(abilities.SKILL_IDS)
+    assert all(sum(1 for t in TASKS if k in t["skills"]) >= 1 for k in abilities.SKILL_IDS)
+    rows = [  # newest first, as the query orders them
+        {"model": "big", "created": "2026-11-20", "version": "2.32.0", "results": [
+            {"id": "sources", "passed": True, "seconds": 40, "read": 900},
+            {"id": "browse", "passed": True, "seconds": 30, "read": 800},
+            {"id": "plan", "passed": True, "seconds": 20, "read": 700}]},
+        {"model": "small", "created": "2026-11-19", "version": "2.32.0", "results": [
+            {"id": "sources", "passed": False, "seconds": 10, "read": 500},
+            {"id": "find", "passed": True, "seconds": 5, "read": 300},
+            {"id": "browse", "passed": True, "seconds": 9, "read": 400},
+            {"id": "plan", "passed": False, "seconds": 8, "read": 300},
+            {"id": "calc", "passed": False, "error": "LLMUnreachable: gone"}]},      # never worked: no verdict
+        {"model": "big", "created": "2026-11-01", "version": "2.31.0", "results": [
+            {"id": "sources", "passed": False, "seconds": 90, "read": 900}]},           # older: replaced
+    ]
+    profs = abilities.profiles(_eval_app(rows))
+    assert profs["big"]["skills"]["research"] == {"passed": 1, "ran": 1, "seconds": 40.0, "score": 1.0}
+    assert profs["small"]["skills"]["research"]["passed"] == 1 and profs["small"]["skills"]["research"]["ran"] == 2
+    assert "data" not in profs["small"]["skills"]
+    assert profs["big"]["tested"] == "2026-11-20"
+    cands = [{"id": "small", "name": "Small 4B", "kind": "local", "strength": 2, "role": "worker"},
+             {"id": "big", "name": "Big 14B", "kind": "local", "strength": 3, "role": "worker"},
+             {"id": "cloud:x", "name": "Online X", "kind": "cloud", "strength": 5, "role": "strategist"}]
+    mid, why = abilities.best_for("research", cands, profs, "small")
+    assert mid == "big" and "1/1 research" in why and "Small 4B passed 1/2" in why
+    assert abilities.best_for("browsing", cands, profs, "small") == (None, "")    # both pass: no reason to swap
+    assert abilities.best_for("coding", cands, profs, "small") == (None, "")      # nobody tested: no guess
+    better = abilities.planners(cands, profs, "small")
+    assert [c["id"] for c, _ in better] == ["big", "cloud:x"] and "1/1 planning" in better[0][1]
+    text = abilities.brief(cands, profs, "small")
+    assert "small = Small 4B" in text and "research 1/2" in text and "the default model" in text
+    assert "Online X (online, paid per use): not tested here; strength 5 of 5" in text
+
+
+def test_planned_steps_go_to_the_model_that_measured_best_at_their_kind_of_work():
+    from types import SimpleNamespace
+    from dva.orchestrator import Orchestra, plan_schema
+    o = Orchestra.__new__(Orchestra)
+    o.turn = SimpleNamespace(model_id="small")
+    o.logs = []
+    o.logline = o.logs.append
+    o.model_name = lambda m: m
+    cands = [{"id": "small", "name": "Small", "kind": "local"}, {"id": "big", "name": "Big", "kind": "local"}]
+    o.choices = {"cands": cands, "profs": {"small": {"skills": {"research": {"passed": 0, "ran": 2, "score": 0.0,
+                                                                            "seconds": 9}}},
+                                           "big": {"skills": {"research": {"passed": 2, "ran": 2, "score": 1.0,
+                                                                          "seconds": 30}}}}}
+    steps = [{"id": "t1", "skill": "research"}, {"id": "t2", "skill": "writing"}, {"id": "t3"}]
+    o.assign_by_skill(steps)
+    assert steps[0]["model"] == "big" and steps[0]["model_by"] == "results" and "2/2 research" in steps[0]["model_why"]
+    assert "model" not in steps[1] and "model" not in steps[2]
+    assert o.choice_ids() == ["small", "big"]
+    schema = plan_schema(["agent"], ["worker"], 4, True, models=["small", "big"], skills=["research"],
+                         planners=["big"])
+    task = schema["properties"]["tasks"]["items"]["properties"]
+    assert task["model"]["enum"] == ["small", "big"] and task["skill"]["enum"] == ["research"]
+    assert schema["properties"]["planner"]["enum"] == ["big"] and schema["properties"]["model"]["enum"]
+    assert "planner" not in plan_schema(["agent"], ["worker"], 4, True)["properties"]
+
+
+def test_a_snapshot_is_taken_once_before_the_first_change_of_an_unattended_reply(tmp_path, monkeypatch):
+    """2.32.0 (KimiOS 0.11.0): before an auto-approved change, KimiOS keeps the home folder as it was."""
+    import asyncio
+    import sys
+    from types import SimpleNamespace
+    from dva import undo
+    from dva.runner import Turn
+    from dva.tools import Tool
+    log = tmp_path / "calls.txt"
+    cli = tmp_path / "kimios-snapshot"
+    cli.write_text(f"#!{sys.executable}\nimport json, sys\nopen({str(log)!r}, 'a').write(' '.join(sys.argv[1:]) + "
+                   "'\\n')\nprint(json.dumps({'ok': True, 'id': 's1', 'kind': 'btrfs'} if sys.argv[1] == 'take' else "
+                   "{'ok': False, 'error': 'no snapshot \\'x\\''}))\n")
+    cli.chmod(0o755)
+    monkeypatch.setenv("KIMIOS_SNAPSHOT_CLI", str(cli))
+    assert undo.available()
+    with pytest.raises(undo.UndoError, match="no snapshot"):
+        undo.run("restore", "x", "~/a")
+    turn = SimpleNamespace(db=_Settings(snapshot_before_changes=True), chat={"title": "Monthly report"}, steps=[],
+                           notes=[])
+    turn.note = turn.notes.append
+    tool = Tool("write_file", "", {}, None, "files", changes=True, label="Write file")
+    asyncio.run(Turn.snapshot_first(turn, tool))
+    asyncio.run(Turn.snapshot_first(turn, tool))                     # once per reply
+    assert log.read_text().count("take --reason before Write file in “Monthly report”") == 1
+    assert turn.steps == [{"type": "snapshot", "id": "s1", "reason": "before Write file in “Monthly report”"}]
+    assert "Activity → Undo" in turn.notes[0]
+    off = SimpleNamespace(db=_Settings(snapshot_before_changes=False), chat={}, steps=[], notes=[])
+    asyncio.run(Turn.snapshot_first(off, tool))
+    assert log.read_text().count("take") == 1                        # switched off: nothing taken

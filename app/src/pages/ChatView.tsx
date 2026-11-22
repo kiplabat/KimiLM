@@ -200,7 +200,9 @@ function OrchestraTask({ t, live }: any) {
       <div className="small muted ellipsis">
         {t.partial ? "kept as best attempt" : TASK_LABEL[t.status] || t.status}{t.attempts > 1 || (t.status === "running" && t.rounds > 1) ? ` · round ${Math.max(1, t.attempts)}${t.rounds ? ` of ${t.rounds}` : ""}` : ""} · {t.agent ? `${t.agent} · ` : ""}{t.harness}
         {t.model_name ? <> · {t.online ? <Cloud size={11} /> : null} {t.model_name}</> : null}
+        {t.skill ? ` · ${t.skill}` : ""}
       </div>
+      {t.model_why && <div className="small muted clamp-2" title={t.model_why}>Model: {t.model_why}{t.model_by === "results" ? " (from Check this setup)" : ""}</div>}
       {(t.depends_on?.length > 0 || taskCost(t)) && <div className="small muted">
         {t.depends_on?.length > 0 ? `uses ${t.depends_on.join(", ")}` : ""}{t.depends_on?.length > 0 && taskCost(t) ? " · " : ""}{taskCost(t)}
       </div>}

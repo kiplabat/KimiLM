@@ -48,7 +48,11 @@ DEFAULT_SETTINGS = {
     "team_mode": "auto", "max_team_tasks": 8, "team_time_limit_minutes": 120,
     # 2.5.0: sequenced, looped runs. agent_order: sequence | parallel; step_rounds: tries per step before the best
     # attempt is kept; fit_context: load a run's models with the context its steps need
-    "agent_order": "auto", "step_rounds": 3, "verify_results": True, "plan_approval": False,
+    "agent_order": "auto",
+    # 2.32.0: choose_step_models: a planner gives each step the model that measured best at its kind of work
+    # (Check this setup); planner_model: decide (the planner may hand planning to a model that planned better)
+    # | best (always the best measured planner) | default (the chat's own model plans)
+    "choose_step_models": True, "planner_model": "decide", "snapshot_before_changes": True, "step_rounds": 3, "verify_results": True, "plan_approval": False,
     "fit_context": True, "unload_after_run": False, "stall_timeout_seconds": 180, "first_token_timeout_seconds": 0,
     # 2.6.0: doing less work. prompt_snapshots: keep what a model read of its instructions and tools on disk;
     # prompt_cache_mb: memory per loaded model for prompts already read (None = about 5% of memory);

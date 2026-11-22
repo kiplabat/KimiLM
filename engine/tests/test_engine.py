@@ -1417,7 +1417,8 @@ def test_a_step_gets_only_the_tools_its_goal_needs(engine):
 def test_the_evaluation_runs_tasks_and_keeps_the_numbers(engine):
     c = engine["client"]
     listing = c.get("/api/evals").json()
-    assert len(listing["tasks"]) == 12 and listing["current"] is None
+    assert len(listing["tasks"]) == 20 and listing["current"] is None
+    assert all(t["skills"] for t in listing["tasks"])
     started = c.post("/api/evals/run", json={"only": ["calc", "summary"]}).json()
     assert started["total"] == 2
     assert c.post("/api/evals/run", json={}).status_code == 400                            # one at a time
@@ -1442,6 +1443,7 @@ def test_the_evaluation_checks_judge_files_and_replies(tmp_path):
         d = tmp_path / task_id
         d.mkdir()
         for name, text in by_id[task_id]["files"].items():
+            (d / name).parent.mkdir(parents=True, exist_ok=True)
             (d / name).write_text(text, encoding="utf-8")
         return d
     assert evals.check_sum(None, "The total is 1,284.")[0] and not evals.check_sum(None, "1,248")[0]
@@ -1475,6 +1477,34 @@ def test_the_evaluation_checks_judge_files_and_replies(tmp_path):
     d = folder("report")
     (d / "report.md").write_text("| North | 165 |\n| South | 122 |\n| East | 355 |\n", encoding="utf-8")
     assert evals.check_report(d, "")[0]
+    # 2.32.0: the tasks by skill
+    assert evals.check_sources(None, "Final cost 3.1 million dollars (src-2.txt); 5,860 households (src-3.txt).")[0]
+    assert not evals.check_sources(None, "2.4 million (src-1.txt) and 5,860 households (src-3.txt).")[0]
+    assert evals.check_browse(None, "KES 1,240, on site/catalogue/items/zx-4471.html")[0]
+    assert not evals.check_browse(None, "KES 990 on sale.html")[0]
+    assert evals.check_web_table(None, "Highlands (1,020 MWh)")[0] and not evals.check_web_table(None, "Lake")[0]
+    d = folder("contacts")
+    (d / "contacts.csv").write_text("name,email\nWanjiru Kamau,wanjiru.kamau@example.org\nOtieno Odhiambo,"
+                                    "o.odhiambo@example.net\nAchieng Atieno,achieng@example.com\n", encoding="utf-8")
+    assert evals.check_contacts(d, "")[0]
+    good = ("Dear customer, the water supply in the east ward will be off on 14 March 2026 from 08:00 to 16:00 for "
+            "maintenance. Please store some water in advance. Questions: call 0711 555 019. We are sorry for the "
+            "inconvenience.")
+    assert evals.check_rewrite(None, good)[0] and not evals.check_rewrite(None, "NOTICE. " + good)[0]
+    assert evals.check_logic(None, "Dawit > Amina > Bilal > Chebet > Esther.\nAmina")[0]
+    assert not evals.check_logic(None, "Amina\nDawit")[0]
+    d = folder("plan")
+    plan = [{"id": "a", "goal": "Collect panel prices from panels.csv", "depends_on": []},
+            {"id": "b", "goal": "Collect battery prices from batteries.csv", "depends_on": []},
+            {"id": "c", "goal": "Chart panels against batteries", "depends_on": ["a", "b"]},
+            {"id": "d", "goal": "Write the two-page brief", "depends_on": ["c"]}]
+    (d / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    assert evals.check_plan(d, "")[0]
+    plan[1]["depends_on"] = ["a"]                                          # in a row: not what was asked
+    (d / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    assert not evals.check_plan(d, "")[0]
+    assert evals.check_long(None, "139 days")[0] and not evals.check_long(None, "1390")[0]
+    assert "site 14 was serviced on 3 May" in evals._minutes() and len(evals._minutes()) > 40000
     assert evals.Evals.summary([{"passed": True, "read": 100, "cached": 300, "written": 20, "seconds": 3.2},
                                 {"passed": False}], 12) == {
         "passed": 1, "ran": 2, "total": 12, "seconds": 3, "read": 100, "cached": 300, "written": 20,
@@ -4897,3 +4927,49 @@ def test_performance_readings_and_usage_statistics(engine):
     assert c.get("/api/telemetry?seconds=60").json()["running"] is False
     c.put("/api/settings", json={"telemetry_enabled": True})
     assert c.get("/api/telemetry?seconds=60").json()["running"] is True
+
+
+def test_planner_gives_steps_to_the_model_that_measured_best_and_can_hand_planning_on(engine):
+    """2.32.0: with two models and Check this setup's results by skill, a step of a kind goes to the model that
+    passed more of that kind (with the reason), the planner's own choice is kept, and the planner can hand the
+    planning to a model that planned better."""
+    import sqlite3
+    c, tmp = engine["client"], engine["tmp"]
+    if not c.get("/api/models").json().get("default"):
+        tiny_gguf(tmp / "fake-model-Q4_K_M.gguf")
+        c.post("/api/models/import", json={"path": str(tmp / "fake-model-Q4_K_M.gguf")})
+    default = c.get("/api/models").json()["default"]
+    tiny_gguf(tmp / "skilled-model-Q4_K_M.gguf", name="skilled-model")
+    other = c.post("/api/models/import", json={"path": str(tmp / "skilled-model-Q4_K_M.gguf")}).json()["id"]
+    assert other != default
+    res = lambda ok: [{"id": t, "title": t, "passed": ok, "seconds": 5, "read": 100}     # noqa: E731
+                      for t in ("sources", "find", "plan", "report")]
+    db = sqlite3.connect(str(tmp / "data" / "kimilm.sqlite3"))
+    for rid, model, ok in (("eval_skill_a", other, True), ("eval_skill_b", default, False)):
+        db.execute("INSERT INTO eval_runs (id, created, version, model, status, results_json, summary_json) "
+                   "VALUES (?, ?, ?, ?, 'done', ?, '{}')", (rid, "2026-11-20T10:00:00", "2.32.0", model,
+                                                           json.dumps(res(ok))))
+    db.commit()
+    db.close()
+    try:
+        view = c.get("/api/abilities").json()
+        mine = {r["id"]: r for r in view["models"]}
+        assert mine[other]["skills"]["research"]["passed"] == 2 and mine[default]["skills"]["planning"]["ran"] == 2
+        chat, status, msg = run_team(c, "As a team (skilled plan): collect greetings from the sources, then "
+                                        "summarise them.")
+        assert status == "done", msg
+        team = team_of(msg)
+        tasks = {t["id"]: t for t in team["tasks"]}
+        assert tasks["t1"]["skill"] == "research" and tasks["t1"]["model"] == other, tasks["t1"]
+        assert tasks["t1"]["model_by"] == "results" and "2/2 research" in tasks["t1"]["model_why"]
+        assert tasks["t2"]["model"] == default and tasks["t2"]["model_by"] == "planner"
+        log = " ".join(line["text"] for line in team["log"])
+        assert "runs on" in log, log
+        chat, status, msg = run_team(c, "As a team (hand-off plan): collect greetings, then summarise them.")
+        assert status == "done", msg
+        log = " ".join(line["text"] for line in team_of(msg)["log"])
+        assert "Planning handed to" in log and "it planned better here" in log, log
+    finally:
+        for rid in ("eval_skill_a", "eval_skill_b"):
+            c.delete(f"/api/evals/{rid}")
+        c.delete(f"/api/models/{other}")

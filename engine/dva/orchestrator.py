@@ -45,6 +45,7 @@ from .meter import purpose as usage_purpose
 from .db import new_id, now
 from .forecast import pretty_seconds, pretty_tokens
 from .llm import LLMError, estimate_tokens
+from .abilities import SKILL_IDS
 from .providers import is_cloud
 from .tools import Tool
 
@@ -146,7 +147,7 @@ class RunFit:
 
 
 # ---------------------------------------------------------------------- schemas
-def _task_props(harness_ids, roles, agents=None):
+def _task_props(harness_ids, roles, agents=None, models=None, skills=None):
     props = {"id": {"type": "string", "maxLength": 12}, "name": {"type": "string", "maxLength": 40},
              "goal": {"type": "string", "maxLength": 900}, "done_when": {"type": "string", "maxLength": 240},
              "depends_on": {"type": "array", "maxItems": 6, "items": {"type": "string", "maxLength": 12}},
@@ -155,19 +156,31 @@ def _task_props(harness_ids, roles, agents=None):
              "role": {"enum": list(roles)}, "harness": {"enum": list(harness_ids)}}
     if agents:
         props["agent"] = {"enum": list(agents)}
+    if skills:    # 2.32.0: the kind of work a step is, and (from Check this setup) the model that does it best
+        props["skill"] = {"enum": list(skills)}
+    if models:
+        props["model"] = {"enum": list(models)}
+        props["model_why"] = {"type": "string", "maxLength": 200}
     return props
 
 
-def plan_schema(harness_ids, roles, max_tasks, allow_direct, agents=None, parts=False):
+def plan_schema(harness_ids, roles, max_tasks, allow_direct, agents=None, parts=False, models=None, skills=None,
+                planners=None):
     props = {"approach": {"enum": ["direct", "team"] if allow_direct else ["team"]},
              "reason": {"type": "string", "maxLength": 200}}
+    if planners:  # 2.32.0: hand the planning of this request to a model that plans better
+        props["planner"] = {"enum": list(planners)}
+        props["planner_why"] = {"type": "string", "maxLength": 200}
     if parts:     # 2.31.0: the independent parts first, so a small planner looks for them before writing steps
         props["parts"] = {"type": "array", "maxItems": 6, "items": {"type": "string", "maxLength": 120}}
+    if models and allow_direct:     # 2.32.0: with approach 'direct', the model that does the whole request
+        props["model"] = {"enum": list(models)}
+        props["model_why"] = {"type": "string", "maxLength": 200}
     return {"type": "object", "required": ["approach", "tasks"], "properties": {
         **props,
-        "tasks": {"type": "array", "minItems": 0 if allow_direct else 1, "maxItems": max_tasks, "items": {
-            "type": "object", "required": ["id", "name", "goal", "done_when"],
-            "properties": _task_props(harness_ids, roles, agents)}},
+        "tasks": {"type": "array", "minItems": 0 if (allow_direct or planners) else 1, "maxItems": max_tasks,
+                  "items": {"type": "object", "required": ["id", "name", "goal", "done_when"],
+                            "properties": _task_props(harness_ids, roles, agents, models, skills)}},
         "final": {"type": "string", "maxLength": 300}}}
 
 
@@ -291,7 +304,7 @@ def lean_kit(goal, harness_groups=None):
 
 # the fields of a step that are saved so a run can continue after a stop, a crash or a restart
 SAVED = ("id", "name", "goal", "done_when", "depends_on", "role", "harness", "agent", "model", "limits", "status",
-         "auto_model", "chosen", "kit", "started_at",
+         "auto_model", "chosen", "kit", "started_at", "skill", "model_why", "model_by",
          "attempts", "output", "files", "loop", "expects", "rounds", "feedback", "partial", "note", "result_file",
          "chat_id", "used", "forecast", "brief_tokens", "kind", "best", "error", "result_state", "full_kit",
          "more_time", "tried_fresh")
@@ -343,6 +356,8 @@ class Orchestra:
         self.outcome = "done"                 # how drive() ended: done | stopped | interrupted
         self.resumes = 0
         self.lean = bool(s("lean_tools", True))
+        self.choices = None                   # 2.32.0: the models steps may run on, with their measured skills
+        self.planned_by = None                # 2.32.0: the model that wrote the plan when it was not the turn's
         self.escalate = bool(s("escalate_models", True))
         self.failures = []                    # every failed attempt at a step, with its class (recovery.py)
         # 2.20.0: the register. An entry is written the moment an agent reports that it cannot finish, or the app
@@ -442,7 +457,8 @@ class Orchestra:
         model = self.app.models.get_any(t["model"]) if t.get("model") else None
         out = {k: t.get(k) for k in ("id", "name", "agent", "done_when", "depends_on", "role", "harness", "model",
                                      "status", "attempts", "chat_id", "progress", "note", "files", "wait_reason",
-                                     "rounds", "loop", "partial", "forecast", "used", "result_file", "kind", "kit", "team")}
+                                     "rounds", "loop", "partial", "forecast", "used", "result_file", "kind", "kit", "team",
+                                     "skill", "model_why", "model_by")}
         out["goal"] = _clip(t.get("goal"), 400)
         out["output"] = _clip(t.get("output"), 700)
         if t.get("flag"):                     # how its latest round stopped, when it stopped fast (2.20.0)
@@ -499,6 +515,9 @@ class Orchestra:
             item = {"id": tid, "name": (str(r.get("name") or tid).strip() or tid)[:40], "goal": goal[:1500],
                     "done_when": (r.get("done_when") or "").strip()[:300], "depends_on": list(r.get("depends_on") or []),
                     "role": role, "harness": harness, "agent": agent, "model": r.get("model"),
+                    "skill": r.get("skill") if r.get("skill") in SKILL_IDS else None,
+                    "model_why": (str(r.get("model_why") or "").strip()[:200]) or None,
+                    "model_by": r.get("model_by") or ("planner" if r.get("model") and r.get("model_why") else None),
                     "limits": r.get("limits") or {}, "status": "waiting", "attempts": 0, "output": "", "files": [],
                     "loop": loop, "expects": expects, "rounds": self.rounds + 2 if loop else self.rounds,
                     "feedback": [], "_stated": bool(r.get("depends_on")),
@@ -570,11 +589,103 @@ class Orchestra:
             self.tasks[t["id"]] = t
             self.settled[t["id"]] = asyncio.Event()
         self._order()
+        self.assign_by_skill([t for t in self.tasks.values() if t["status"] == "waiting" and not t.get("model")])
         auto = [t for t in self.tasks.values() if t["status"] == "waiting" and
                 (not t.get("model") or str(t["model"]).startswith("role:") or t["model"] == "auto")]
         for t in auto:
             t["auto_model"] = True             # nobody fixed its model: it may be chosen from measured results
         self.turn.assign_models(auto)
+
+    # ------------------------------------------------------------------ 2.32.0: models chosen by measured skill
+    def model_choices(self):
+        """The models this run may give steps to (installed local ones, online ones this chat may use) and their
+        profiles from Check this setup. Empty when choosing is off or there is nothing to choose between."""
+        if self.choices is None:
+            self.choices = {"cands": [], "profs": {}}
+            if self.db.setting("choose_step_models", True) and not self.roster:
+                try:
+                    from . import abilities
+                    cands = abilities.candidates(self.app, self.turn.chat, self.turn.project)
+                    if len(cands) > 1:
+                        self.choices = {"cands": cands, "profs": abilities.profiles(self.app)}
+                except Exception as exc:          # never stops a plan
+                    self.app.log(f"model choices: {type(exc).__name__}: {exc}")
+        return self.choices
+
+    def choice_ids(self):
+        return [c["id"] for c in self.model_choices()["cands"]]
+
+    def assign_by_skill(self, items):
+        """A step the planner gave a kind of work but no model: the model that did that kind best here, if one
+        clearly did better than the planner's own model. Otherwise it is left to the usual choice."""
+        ch = self.model_choices()
+        if not ch["profs"]:
+            return
+        from . import abilities
+        for t in items:
+            if not t.get("skill"):
+                continue
+            mid, why = abilities.best_for(t["skill"], ch["cands"], ch["profs"], self.turn.model_id)
+            if mid:
+                t.update(model=mid, model_why=why, model_by="results")
+                self.logline(f"{t['id']} ({abilities.LABEL[t['skill']]}) runs on {self.model_name(mid)}: {why}.")
+
+    def models_text(self, allow_direct):
+        """What the planner reads about the models it can use, or "" with nothing to choose between."""
+        ch = self.model_choices()
+        if not ch["cands"]:
+            return ""
+        from . import abilities
+        return ("- skill: the kind of work each step is: " + "; ".join(f"{k} = {about}" for k, _l, about in
+                                                                       abilities.SKILLS) + ".\n"
+                "- model: which model does the step (an id from the list below) and model_why: in one sentence, "
+                "which result below shows it is the best one for this step. Choose by the step's skill: the model "
+                "that passed most tasks of that kind; among equals the faster one and one on this computer. Only "
+                "one model on this computer is loaded at a time, so steps that run at the same time do best on "
+                "the same local model, and a model that is not loaded takes a while to load. An online model "
+                "costs money: give it the steps the local models fail at. Steps on a model not tested for their "
+                "skill are a guess: say so in model_why.\n"
+                + ("  With approach 'direct', 'model' (top level) is the model that does the whole request.\n"
+                   if allow_direct else "")
+                + "  Models you can use (Check this setup ran small tasks of each kind on them; passed/tried):\n"
+                + abilities.brief(ch["cands"], ch["profs"], self.db.setting("default_model")) + "\n")
+
+    async def use_model_for_direct(self, out):
+        """The planner chose 'direct' and named another model for the whole request: the turn continues on it."""
+        mid = out.get("model")
+        turn = self.turn
+        if not mid or mid == turn.model_id or mid not in self.choice_ids():
+            return
+        why = (out.get("model_why") or "").strip()
+        await turn.drop_model()
+        turn.model_id = mid
+        turn.note(f"The planner gave this request to {self.model_name(mid)}" + (f": {why}" if why else "."))
+        turn.record_effective()
+
+    def better_planners(self):
+        """2.32.0: models that plan better than the turn's own (Settings → Teams → Planner model)."""
+        mode = self.db.setting("planner_model", "decide") or "decide"
+        if mode == "default" or self.depth > 0 or self.planned_by:
+            return []
+        ch = self.model_choices()
+        if not ch["cands"]:
+            return []
+        from . import abilities
+        return abilities.planners(ch["cands"], ch["profs"], self.turn.model_id)
+
+    async def plan_on(self, model_id, messages, prompt, schema):
+        """One planning call on another model (leased for it; the turn's own model stays the steps' default)."""
+        rt = self.app.runtime
+        overrides = None
+        if not is_cloud(model_id):
+            overrides = rt.fit(model_id, int(sum(len(str(m.get("content") or "")) for m in messages) / 3) + 6000, 1)
+            if not is_cloud(self.turn.model_id):
+                await self.turn.drop_model()      # one local model at a time: the turn's model is free to unload
+            self.used.add(model_id)
+        async with rt.lease(model_id, on_wait=self.turn.status, overrides=overrides) as server:
+            with usage_purpose("planner"):
+                return await self.app.llm.json(messages + [{"role": "user", "content": prompt}], schema,
+                                               max_tokens=1400, temperature=0.2, server=server)
 
     def preset(self, items):
         """Steps given directly (team builder with tasks, the delegate tool): no planning call."""
@@ -635,13 +746,35 @@ class Orchestra:
             'both prices","harness":"agent"} then {"id":"t2","name":"Price changes","goal":"Using the table from t1, '
             'compute the percentage change per product with Python and save changes.csv.","done_when":"changes.csv '
             'exists and lists every product with its change","depends_on":["t1"],"loop":true,"expects":["changes.csv"]}.\n'
-            "- 'final' says what the final answer must contain." + roster + " JSON only.")
+            + self.models_text(allow_direct) +
+            "- 'final' says what the final answer must contain." + roster)
+        # 2.32.0: a model that measured clearly better at planning may take the planning over (Settings → Teams)
+        better = self.better_planners()
+        ids = self.choice_ids()
+        handoff = ""
+        if better and (self.db.setting("planner_model", "decide") or "decide") == "decide":
+            handoff = ("\n- planner: if another model would plan this request clearly better, write its id in "
+                       "'planner' and the reason in 'planner_why', and leave tasks empty: it writes the plan "
+                       "instead (its plan takes a moment more; worth it for a request with several parts or hard "
+                       "reasoning, not for a simple one). Models that planned better than you here: "
+                       + "; ".join(f"{c['id']} ({why})" for c, why in better[:3]) + ".")
         schema = plan_schema(self.harness_ids, self.roles(), limit, allow_direct, self.agents(),
-                             parts=not self.sequence)
+                             parts=not self.sequence, models=ids or None, skills=SKILL_IDS if ids else None,
+                             planners=[c["id"] for c, _ in better[:3]] if handoff else None)
+        out = None
         try:
-            with usage_purpose("planner"):           # counted as the planner's work in Usage (2.27.0)
-                out = (await turn.complete(messages + [{"role": "user", "content": prompt}], schema=schema,
-                                           max_tokens=1400, temperature=0.2))["json"]
+            if better and (self.db.setting("planner_model", "decide") or "decide") == "best":
+                c, why = better[0]
+                out = await self.handed_plan(c, why, messages, prompt + " JSON only.", schema)
+            if out is None:
+                with usage_purpose("planner"):           # counted as the planner's work in Usage (2.27.0)
+                    out = (await turn.complete(messages + [{"role": "user", "content": prompt + handoff + " JSON only."}],
+                                               schema=schema, max_tokens=1400, temperature=0.2))["json"]
+                c = next((c for c, _ in better if c["id"] == out.get("planner")), None) if handoff else None
+                if c is not None:
+                    again = await self.handed_plan(c, (out.get("planner_why") or "").strip(), messages,
+                                                   prompt + " JSON only.", schema)
+                    out = again or out
         except LLMError as exc:
             if allow_direct:
                 turn.app.log(f"planning failed, one agent does the work: {exc}")
@@ -651,9 +784,15 @@ class Orchestra:
             turn.note(f"The planner's plan could not be read ({str(exc)[:120]}); one agent takes the whole task.")
         if out.get("approach") != "team" or not out.get("tasks"):
             if allow_direct:
+                await self.use_model_for_direct(out)
                 return False
             out["tasks"] = [{"id": "t1", "name": "Agent", "goal": self.overall, "done_when": "the request is answered"}]
         self.final_hint = (out.get("final") or "").strip()
+        known = set(self.choice_ids())
+        for r in out["tasks"]:                 # 2.32.0: a model the run cannot use is no choice
+            if isinstance(r, dict) and r.get("model") and r["model"] not in known:
+                r.pop("model", None)
+                r.pop("model_why", None)
         self.chain = self.chain_planned()
         stated = sum(len(t.get("depends_on") or []) for t in out["tasks"])
         self.add(out["tasks"][:self.max_tasks])
@@ -670,6 +809,26 @@ class Orchestra:
                      + (f" Added {found} link{'s' if found != 1 else ''} between steps that the plan implied."
                         if found > 0 else ""))
         return True
+
+    async def handed_plan(self, c, why, messages, prompt, schema):
+        """The planning goes to a model that plans better; its plan is used. None when that call fails (the turn's
+        own planner then plans as before)."""
+        self.planned_by = c["id"]
+        self.logline(f"Planning handed to {c['name']}" + (f": {why}." if why else "."))
+        self.turn.status(f"{c['name']} is planning…")
+        schema = dict(schema)
+        props = dict(schema["properties"])
+        props.pop("planner", None)
+        props.pop("planner_why", None)
+        schema["properties"] = props
+        try:
+            return await self.plan_on(c["id"], messages, prompt, schema)
+        except Exception as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            self.logline(f"{c['name']} could not plan ({type(exc).__name__}: {str(exc)[:120]}); planning here.")
+            self.planned_by = None
+            return None
 
     async def approve_plan(self):
         """Settings → Teams → 'Ask me before a plan starts'. Scheduled and auto-approved chats start right away."""
@@ -856,7 +1015,13 @@ class Orchestra:
                 if not is_cloud(m):
                     per_model[m] = self.busy_on(m)
         out = []
-        for t in self.tasks.values():
+        # 2.32.0: steps on a model that is loaded (or online) first, so models are not swapped back and forth
+        rt = getattr(self.app, "runtime", None)
+        loaded = {s["model_id"] for s in (rt.loaded() if hasattr(rt, "loaded") else [])} | set(per_model) \
+            | {self.turn.model_id}
+        ready = sorted(self.tasks.values(), key=lambda t: 0 if is_cloud(t.get("model") or self.turn.model_id)
+                       or (t.get("model") or self.turn.model_id) in loaded else 1)
+        for t in ready:
             if t["status"] != "waiting" or not self.deps_ready(t):
                 continue
             if len([r for r in running if not r.get("team")]) + len(out) >= self.max_parallel and not t.get("team"):
