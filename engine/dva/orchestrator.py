@@ -114,11 +114,15 @@ class RunFit:
     they all ask for the same settings and a model is loaded once for the run."""
     BASE = 12000
 
-    def __init__(self, sequence=True):
+    def __init__(self, sequence=True, mode=None):
         self.need = {}            # model id -> tokens of context one reply needs
         self.cap = {}             # model id -> upper limit after the model ran out of memory
         self.top = {}             # model id -> context it may grow to past its own setting (2.26.0: it ran out)
-        self.sequence = sequence
+        # 2.31.0: sequence (one step at a time) | parallel (the model's own reply slots) | auto (as many reply
+        # slots as the plan has independent steps, as far as memory allows; sized once per run)
+        self.mode = mode or ("sequence" if sequence else "parallel")
+        self.sequence = self.mode == "sequence"
+        self.slots = {}           # model id -> reply slots this run loads it with (auto)
 
     def want(self, model_id, tokens):
         """Raise a model's need (it never shrinks during a run, so the model is not reloaded back and forth)."""
@@ -134,8 +138,9 @@ class RunFit:
         self.top[model_id] = max(int(tokens), self.top.get(model_id, 0))
 
     def overrides(self, runtime, model_id):
-        out = runtime.fit(model_id, self.tokens(model_id), 1, top=self.top.get(model_id))
-        if not self.sequence:
+        out = runtime.fit(model_id, self.tokens(model_id), self.slots.get(model_id, 1) if self.mode == "auto" else 1,
+                          top=self.top.get(model_id))
+        if self.mode == "parallel":
             out.pop("parallel")   # steps side by side: keep the model's own number of reply slots
         return out
 
@@ -145,7 +150,7 @@ def _task_props(harness_ids, roles, agents=None):
     props = {"id": {"type": "string", "maxLength": 12}, "name": {"type": "string", "maxLength": 40},
              "goal": {"type": "string", "maxLength": 900}, "done_when": {"type": "string", "maxLength": 240},
              "depends_on": {"type": "array", "maxItems": 6, "items": {"type": "string", "maxLength": 12}},
-             "loop": {"type": "boolean"},
+             "loop": {"type": "boolean"}, "team": {"type": "boolean"},
              "expects": {"type": "array", "maxItems": 4, "items": {"type": "string", "maxLength": 80}},
              "role": {"enum": list(roles)}, "harness": {"enum": list(harness_ids)}}
     if agents:
@@ -153,10 +158,13 @@ def _task_props(harness_ids, roles, agents=None):
     return props
 
 
-def plan_schema(harness_ids, roles, max_tasks, allow_direct, agents=None):
+def plan_schema(harness_ids, roles, max_tasks, allow_direct, agents=None, parts=False):
+    props = {"approach": {"enum": ["direct", "team"] if allow_direct else ["team"]},
+             "reason": {"type": "string", "maxLength": 200}}
+    if parts:     # 2.31.0: the independent parts first, so a small planner looks for them before writing steps
+        props["parts"] = {"type": "array", "maxItems": 6, "items": {"type": "string", "maxLength": 120}}
     return {"type": "object", "required": ["approach", "tasks"], "properties": {
-        "approach": {"enum": ["direct", "team"] if allow_direct else ["team"]},
-        "reason": {"type": "string", "maxLength": 200},
+        **props,
         "tasks": {"type": "array", "minItems": 0 if allow_direct else 1, "maxItems": max_tasks, "items": {
             "type": "object", "required": ["id", "name", "goal", "done_when"],
             "properties": _task_props(harness_ids, roles, agents)}},
@@ -221,6 +229,39 @@ KIT_WORDS = {
 }
 
 
+ORDERS = ("auto", "sequence", "parallel")
+
+
+def order_setting(db):
+    """How a run orders its steps (2.31.0: auto by default)."""
+    v = db.setting("agent_order", "auto")
+    return v if v in ORDERS else "auto"
+
+
+def plan_width(tasks, model=None):
+    """How many waiting steps could run at the same time: the largest level of the plan's graph (steps whose
+    longest chain of needs has the same length), counting only steps on `model` when it is given."""
+    depth = {}
+
+    def level(tid, seen=()):
+        if tid in depth:
+            return depth[tid]
+        t = tasks.get(tid)
+        if not t or tid in seen:
+            return 0
+        d = 1 + max([level(x, seen + (tid,)) for x in t.get("depends_on") or [] if x in tasks] or [0])
+        depth[tid] = d
+        return d
+    counts = {}
+    for tid, t in tasks.items():
+        if t.get("status") not in ("waiting", "paused") and t.get("status") not in ACTIVE:
+            continue
+        if model is not None and (t.get("model") or "") != model:
+            continue
+        counts[level(tid)] = counts.get(level(tid), 0) + 1
+    return max(counts.values() or [0])
+
+
 def crew_facts(turn):
     """What a planner must know about every agent it starts (2.29.0), said in its own words in each planning prompt:
     agents think before they act, they install what they lack, and (when it is so) nobody is asked to approve."""
@@ -276,7 +317,13 @@ class Orchestra:
         self.dir = turn.workspace / "team"
         self.dir.mkdir(parents=True, exist_ok=True)
         s = self.db.setting
-        self.sequence = s("agent_order", "sequence") != "parallel"
+        # 2.31.0: auto (the default) runs the parts of a plan that do not need each other at the same time, on
+        # reply slots of one loaded model sized to memory; sequence: one step at a time; parallel: as each model's
+        # own Simultaneous replies allow
+        self.order = order_setting(self.db)
+        # 2.31.0: how deep this planner sits (0: the main planner; 1: a sub-planner of one of its steps; …)
+        self.depth = int((turn.job.get("payload") or {}).get("team_depth") or 0)
+        self.sequence = self.order == "sequence"
         self.chain = False                    # planned steps with no stated need build on the step before
         self.max_tasks = int(s("max_team_tasks", 8))
         self.max_parallel = 1 if self.sequence else int(s("max_parallel_agents", 4))
@@ -290,7 +337,7 @@ class Orchestra:
         self.used = set()                     # local models this run started steps on
         self.warm = set()                     # (model, harness) pairs whose fixed prompt part is already cached
         self.step = {"type": "orchestra", "id": self.id, "tasks": [], "log": [], "folder": str(self.dir),
-                     "mode": "sequence" if self.sequence else "parallel", "models": [], "totals": {}}
+                     "mode": self.order, "models": [], "totals": {}}
         self._wake = asyncio.Event()
         self._tick = time.monotonic()
         self.outcome = "done"                 # how drive() ended: done | stopped | interrupted
@@ -395,7 +442,7 @@ class Orchestra:
         model = self.app.models.get_any(t["model"]) if t.get("model") else None
         out = {k: t.get(k) for k in ("id", "name", "agent", "done_when", "depends_on", "role", "harness", "model",
                                      "status", "attempts", "chat_id", "progress", "note", "files", "wait_reason",
-                                     "rounds", "loop", "partial", "forecast", "used", "result_file", "kind", "kit")}
+                                     "rounds", "loop", "partial", "forecast", "used", "result_file", "kind", "kit", "team")}
         out["goal"] = _clip(t.get("goal"), 400)
         out["output"] = _clip(t.get("output"), 700)
         if t.get("flag"):                     # how its latest round stopped, when it stopped fast (2.20.0)
@@ -454,7 +501,11 @@ class Orchestra:
                     "role": role, "harness": harness, "agent": agent, "model": r.get("model"),
                     "limits": r.get("limits") or {}, "status": "waiting", "attempts": 0, "output": "", "files": [],
                     "loop": loop, "expects": expects, "rounds": self.rounds + 2 if loop else self.rounds,
-                    "feedback": [], "_stated": bool(r.get("depends_on"))}
+                    "feedback": [], "_stated": bool(r.get("depends_on")),
+                    # 2.31.0: an explicit [] says "needs nothing": it may run at once; left out says nothing
+                    "_alone": isinstance(r.get("depends_on"), list) and not r.get("depends_on"),
+                    # 2.31.0: a step that is itself several pieces of work goes to a sub-planner with agents of its own
+                    "team": bool(r.get("team")) and self.can_nest()}
             if self.roster and agent:
                 spec = next((x for x in self.roster if x["name"] == agent), None)
                 if spec:
@@ -479,11 +530,13 @@ class Orchestra:
                 if other != t["id"] and other not in deps and re.search(
                         rf"(?<![A-Za-z0-9_-]){re.escape(other)}(?![A-Za-z0-9_-])", text, re.I):
                     deps.append(other)
-            # a planned step that states no need builds on the step before it
-            if self.chain and not deps and earlier:
+            # a planned step that states no need builds on the step before it; with steps side by side (2.31.0)
+            # only a step that said depends_on: [] runs alone: a forgetful planner's step still waits for its input
+            if self.chain and not deps and earlier and (self.sequence or not t.get("_alone")):
                 deps.append(earlier[-1])
             t["depends_on"] = deps
             t.pop("_stated", None)
+            t.pop("_alone", None)
             earlier.append(t["id"])
         # break cycles: walk in order, keep only edges to tasks that cannot reach back
         graph = {t["id"]: set(t["depends_on"]) for t in out}
@@ -547,8 +600,12 @@ class Orchestra:
         services = self.services_text()
         prompt = (
             "You plan work for AI agents on the user's computer. " + direct +
-            f"Otherwise write a plan of 2 to {limit} steps for my last request (fewer is better). The steps run one "
-            "after another, in the order you write them.\n"
+            f"Otherwise write a plan of 2 to {limit} steps for my last request (fewer is better). "
+            + ("The steps run one after another, in the order you write them.\n" if self.sequence else
+               "First look for the parts of the request that do not need each other (two topics to research, "
+               "several files to process, separate sections to draft): write them in 'parts' and make each its own "
+               "step with no depends_on — those steps run at the same time, on separate agents. A step that "
+               "uses another step's result lists it in depends_on and starts when it is done.\n") +
             "- One agent does each step with tools (files in my folders, the web, Python and shell commands, memory, "
             "skills, connectors). goal: everything that agent needs to know (paths, sources, formats, limits); it "
             "sees only its goal and the results it builds on. done_when: a test the result can be checked against.\n"
@@ -556,8 +613,14 @@ class Orchestra:
             + ("- Connected services the agents have tools for (what each promises):\n" + services + "\n  When a "
                "service offers what a step needs, say in its goal which service and tool to use. Send an agent to "
                "search or browse the web only for what no service offers.\n" if services else "") +
-            "- depends_on: the ids of the earlier steps whose results this step needs; it receives them. With no "
-            "depends_on a step receives the result of the step before it.\n"
+            ("- depends_on: the ids of the earlier steps whose results this step needs; it receives them. With no "
+               "depends_on a step receives the result of the step before it.\n" if self.sequence else
+               "- depends_on: the ids of the steps whose results this step needs (it receives them and waits for "
+               "them); write [] for a step that needs no other step's result — it starts at once, alongside the "
+               "others. Left out, a step waits for the step before it.\n") +
+            ("- team: true for a step that is itself a job of several parts (three sources to research and compare, "
+               "a set of files to build): a sub-planner splits it and runs agents of its own at the same time, and "
+               "hands back one result. Plain steps leave it out.\n" if self.can_nest() else "") +
             "- loop: true for a step that usually takes several rounds of try, check and fix (writing and running "
             "code, collecting until complete, drafting to a standard).\n"
             "- expects: names of files the step must save (leave out if none).\n"
@@ -573,7 +636,8 @@ class Orchestra:
             'compute the percentage change per product with Python and save changes.csv.","done_when":"changes.csv '
             'exists and lists every product with its change","depends_on":["t1"],"loop":true,"expects":["changes.csv"]}.\n'
             "- 'final' says what the final answer must contain." + roster + " JSON only.")
-        schema = plan_schema(self.harness_ids, self.roles(), limit, allow_direct, self.agents())
+        schema = plan_schema(self.harness_ids, self.roles(), limit, allow_direct, self.agents(),
+                             parts=not self.sequence)
         try:
             with usage_purpose("planner"):           # counted as the planner's work in Usage (2.27.0)
                 out = (await turn.complete(messages + [{"role": "user", "content": prompt}], schema=schema,
@@ -590,7 +654,7 @@ class Orchestra:
                 return False
             out["tasks"] = [{"id": "t1", "name": "Agent", "goal": self.overall, "done_when": "the request is answered"}]
         self.final_hint = (out.get("final") or "").strip()
-        self.chain = self.sequence and not self.roster
+        self.chain = self.chain_planned()
         stated = sum(len(t.get("depends_on") or []) for t in out["tasks"])
         self.add(out["tasks"][:self.max_tasks])
         if not self.tasks:
@@ -598,8 +662,10 @@ class Orchestra:
         found = sum(len(t["depends_on"]) for t in self.tasks.values()) - stated
         reason = (out.get("reason") or "").strip()
         n = len(self.tasks)
+        width = plan_width(self.tasks)
         self.logline(f"Planned {n} task{'s' if n > 1 else ''}"
-                     + (" to run one after another" if self.sequence and n > 1 else "")
+                     + (" to run one after another" if self.sequence and n > 1 else
+                        f", up to {width} at the same time" if width > 1 else "")
                      + (f": {reason}" if reason else ".")
                      + (f" Added {found} link{'s' if found != 1 else ''} between steps that the plan implied."
                         if found > 0 else ""))
@@ -679,10 +745,64 @@ class Orchestra:
             top = self.app.runtime.ceiling(model)
             said.append(f"{self.model_name(model)} with a {ov['ctx']:,}-token context"
                         + (f" (its setting allows {top:,})" if top > ov["ctx"] else ""))
+        slots = self.size_slots()
+        if slots:
+            said.append(slots)
         total = sum((t.get("forecast") or {}).get("seconds", 0) for t in self.tasks.values())
         if said:
             self.logline("Forecast: this run needs " + "; ".join(said) + f". About {pretty_seconds(total)} of "
                          "model time.")
+
+    def can_nest(self):
+        """May a step of this run be a team of its own? Not one at a time, and not deeper than the setting."""
+        return not self.sequence and self.depth < int(self.db.setting("max_team_depth", 2) or 0)
+
+    def fleet(self):
+        """Every run sharing this run's model sizing: this one, the runs of its sub-teams, and the run above."""
+        if self.fit is None:
+            return [self]
+        return [o for o in self.app.orchestras.values() if getattr(o, "fit", None) is self.fit] or [self]
+
+    def busy_on(self, model):
+        """Agents working on a model across the whole hierarchy. A sub-team's step does not count: its planner
+        only plans and checks (the reserved slot), and counting it would starve its own agents."""
+        n = 0
+        for o in self.fleet():
+            for t in o.tasks.values():
+                if t["status"] in ACTIVE and not t.get("team") and (t.get("model") or o.turn.model_id) == model:
+                    n += 1
+        return n
+
+    def chain_planned(self):
+        """Planned steps that state no need build on the step before. Side by side (2.31.0), a step must say
+        depends_on: [] to run at once; one that says nothing still waits for the step before it."""
+        return not self.roster
+
+    def size_slots(self):
+        """2.31.0 (auto): load each local model with as many reply slots as the plan has steps that can run at
+        the same time on it (one more for the planner's checks), as far as memory allows. Sized once; never
+        shrinks during a run (no reloading back and forth). Returns a line for the log, or ''."""
+        if self.order != "auto" or self.fit is None or self.depth > 0:
+            return ""                         # sub-teams use the slots the main planner sized (no reloads)
+        lines = []
+        cap = int(self.db.setting("max_parallel_agents", 4) or 4)
+        for model in dict.fromkeys(t.get("model") or self.turn.model_id for t in self.tasks.values()):
+            if is_cloud(model):
+                continue
+            scope = model if any(t.get("model") for t in self.tasks.values()) else None
+            # a sub-team runs agents of its own: room for two
+            width = min(cap, plan_width(self.tasks, scope) + sum(1 for t in self.tasks.values() if t.get("team")
+                                                                and t["status"] == "waiting"))
+            if width <= 1 or self.fit.slots.get(model, 1) >= width + 1:
+                continue
+            n = self.app.runtime.slots_for(model, self.fit.tokens(model), width + 1, top=self.fit.top.get(model))
+            if n > self.fit.slots.get(model, 1):
+                self.fit.slots[model] = n
+            agents = max(1, self.fit.slots.get(model, 1) - 1)
+            lines.append(f"{agents} agent{'s' if agents > 1 else ''} at a time on {self.model_name(model)}"
+                         + (f" (the plan has {width} parts that can run together; memory allows {agents})"
+                            if agents < width else ""))
+        return "; ".join(lines)
 
     # ------------------------------------------------------------------ running
     def deps_ready(self, t):
@@ -703,6 +823,10 @@ class Orchestra:
     def capacity(self, model):
         if is_cloud(model):
             return int(self.db.setting("cloud_max_parallel", 4))
+        if self.order == "auto":
+            # the run's reply slots on this model, one kept for the planner's checks (2.31.0)
+            slots = (self.fit.slots.get(model, 1) if self.fit is not None else 1)
+            return max(1, slots - 1)
         m = self.app.models.get_any(model) or {}
         return max(1, int((m.get("settings") or {}).get("parallel") or 1))
 
@@ -727,22 +851,35 @@ class Orchestra:
         per_model = {}
         for t in running:
             per_model[t["model"]] = per_model.get(t["model"], 0) + 1
+        if self.order == "auto":                # 2.31.0: slots are shared by every level of the hierarchy
+            for m in list(per_model):
+                if not is_cloud(m):
+                    per_model[m] = self.busy_on(m)
         out = []
         for t in self.tasks.values():
             if t["status"] != "waiting" or not self.deps_ready(t):
                 continue
-            if len(running) + len(out) >= self.max_parallel:
+            if len([r for r in running if not r.get("team")]) + len(out) >= self.max_parallel and not t.get("team"):
                 t["wait_reason"] = "waiting for a free agent slot"
                 continue
             if t.get("agent") and t["agent"] in busy_agents:
                 t["wait_reason"] = f"{t['agent']} is busy with another task"
                 continue
             model = t.get("model") or self.turn.model_id
-            if per_model.get(model, 0) >= self.capacity(model):
-                t["wait_reason"] = f"waiting for {self.model_name(model)} (raise its Simultaneous replies to run more at once)"
+            if self.order == "auto" and not is_cloud(model):
+                other = next((m for m in per_model if m != model and not is_cloud(m) and per_model[m]), None)
+                if other:
+                    # local models side by side are what bloated memory before (2.5.0): one at a time
+                    t["wait_reason"] = f"waiting for the steps on {self.model_name(other)} (one local model at a time)"
+                    continue
+            if not t.get("team") and per_model.get(model, 0) >= self.capacity(model):
+                t["wait_reason"] = (f"waiting for a free reply slot on {self.model_name(model)}" if self.order == "auto"
+                                    else f"waiting for {self.model_name(model)} (raise its Simultaneous replies to "
+                                    "run more at once)")
                 continue
             t["wait_reason"] = None
-            per_model[model] = per_model.get(model, 0) + 1
+            if not t.get("team"):
+                per_model[model] = per_model.get(model, 0) + 1
             if t.get("agent"):
                 busy_agents.add(t["agent"])
             out.append(t)
@@ -763,6 +900,10 @@ class Orchestra:
         ids = list(self.tasks)
         where = f"step {ids.index(t['id']) + 1} of {len(ids)}" if t["id"] in ids else "one step"
         parts = [f"You do {where} of a plan that a planner runs. Other agents do the other steps."]
+        if t.get("team"):
+            parts.append("This step is a job of several parts: you lead it. Plan it into steps for agents of your "
+                         "own (the parts that do not need each other run at the same time), check their results, "
+                         "and hand back one complete result for the step.")
         if self.overall and self.overall.strip() != t["goal"].strip():
             parts.append(f"Overall request (for context only — do just your task): {_clip(self.overall, 700)}")
         parts.append(f"Your task ({t['id']} “{t['name']}”): {t['goal']}")
@@ -901,10 +1042,14 @@ class Orchestra:
         # a step may run this long before it is stopped: generous against the forecast and the reply time limit
         minutes = float((t.get("limits") or {}).get("time_limit_minutes") or self.harness_of(t).get("time_limit_minutes")
                         or self.db.setting("turn_time_limit_minutes", 30) or 30)
+        if t.get("team"):                      # a sub-team runs a plan of its own
+            minutes = max(minutes, float(self.db.setting("team_time_limit_minutes", 120) or 120) / 2)
         t["deadline"] = time.monotonic() + max((minutes + 10) * 60, (t.get("forecast") or {}).get("seconds", 0) * 4)
-        job = self.app.start_turn(chat_id, message, kind="agent",
-                                  payload={"auto_approve": self.turn.auto_approve,
-                                           "policy": getattr(self.turn, "policy", None)})
+        payload = {"auto_approve": self.turn.auto_approve, "policy": getattr(self.turn, "policy", None)}
+        if t.get("team"):
+            # 2.31.0: this step's agent is a sub-planner: it splits the step and runs agents of its own
+            payload.update({"sub_team": True, "team_depth": self.depth + 1})
+        job = self.app.start_turn(chat_id, message, kind="agent", payload=payload)
         t["job_id"] = job["id"]
         self.handles[t["id"]] = self.app.spawn(self._watch(t, job["id"]))
         self.save()
@@ -1704,8 +1849,12 @@ class Orchestra:
                 stalled_once = False
                 done = sum(t["status"] in SETTLED for t in self.tasks.values())
                 now_running = running[0] if running else None
-                turn.status(f"Step {min(done + 1, len(self.tasks))} of {len(self.tasks)}"
-                            + (f": {now_running['name']}" if now_running else ""))
+                if len(running) > 1:              # 2.31.0: steps side by side
+                    turn.status(f"{len(running)} steps at the same time ({done} of {len(self.tasks)} done): "
+                                + ", ".join(t["name"] for t in running[:4]))
+                else:
+                    turn.status(f"Step {min(done + 1, len(self.tasks))} of {len(self.tasks)}"
+                                + (f": {now_running['name']}" if now_running else ""))
                 self.watch_limits()
                 if self.events.empty():
                     self._wake.clear()

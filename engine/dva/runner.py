@@ -1062,7 +1062,8 @@ class Turn:
             team_mode == "always" or (team_mode == "auto" and looks_multistep(self.last_user_text()))))
         if not likely:
             return
-        fit = RunFit(sequence=self.db.setting("agent_order", "sequence") != "parallel")
+        from .orchestrator import order_setting
+        fit = RunFit(mode=order_setting(self.db))
         fit.want(self.model_id, min(self.rough_need(), 24000))
         self.run_fit = self.app.run_fit[self.chat["id"]] = fit
 
@@ -1731,6 +1732,9 @@ class Turn:
 
     def wants_team(self):
         """Should the planner look at this request? Cheap filter first; the planner can still say 'direct'."""
+        payload = self.job.get("payload") or {}
+        if payload.get("sub_team"):           # 2.31.0: a step of a plan given to a sub-planner
+            return int(payload.get("team_depth") or 1) <= int(self.db.setting("max_team_depth", 2) or 0)
         if self.chat.get("parent_chat_id") or "delegate" not in self.tool_map or \
                 (self.job.get("payload") or {}).get("no_team"):
             return False

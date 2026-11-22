@@ -1051,3 +1051,58 @@ def test_kimios_bench_devices_join_the_device_list(tmp_path, monkeypatch):
     srv.shutdown()
     monkeypatch.setenv("KIMIOS_ENVELOPE_SOCKET", str(tmp_path / "none.sock"))
     assert not bench.available() and bench.listing_sync() == []
+
+
+# ---------------------------------------------------------------------------------------------- 2.31.0
+def test_plan_width_counts_the_steps_that_can_run_together():
+    from dva.orchestrator import plan_width
+    T = lambda deps, model=None, status="waiting": {"depends_on": deps, "model": model, "status": status}  # noqa: E731
+    two_topics = {"a": T([]), "b": T([]), "c": T(["a", "b"])}
+    assert plan_width(two_topics) == 2
+    chain = {"a": T([]), "b": T(["a"]), "c": T(["b"])}
+    assert plan_width(chain) == 1
+    fan = {"get": T([]), "x": T(["get"]), "y": T(["get"]), "z": T(["get"]), "report": T(["x", "y", "z"])}
+    assert plan_width(fan) == 3
+    fan["x"]["status"] = "done"
+    assert plan_width(fan) == 2                                   # what is done no longer counts
+    mixed = {"a": T([], "m1"), "b": T([], "m1"), "c": T([], "cloud:x")}
+    assert plan_width(mixed, "m1") == 2 and plan_width(mixed) == 3
+
+
+def test_reply_slots_are_as_many_as_memory_holds():
+    from types import SimpleNamespace
+    from dva.runtime import Runtime
+    GB = 2**30
+    fake = SimpleNamespace(fit=lambda m, tokens, n, top=None: {"ctx": 16384, "parallel": n},
+                           memory=lambda m, over: {"free": 6 * GB, "reclaimable": 0,
+                                                   "need": int(4 * GB + over["parallel"] * 0.5 * GB)})
+    assert Runtime.slots_for(fake, "m", 16000, 4) == 2            # 4+2×0.5+1 margin ≤ 6; three slots would not fit
+    fake.memory = lambda m, over: {"free": 20 * GB, "reclaimable": 0, "need": 5 * GB}
+    assert Runtime.slots_for(fake, "m", 16000, 4) == 4
+    fake.memory = lambda m, over: {"free": 1 * GB, "reclaimable": 0, "need": 5 * GB}
+    assert Runtime.slots_for(fake, "m", 16000, 4) == 1
+
+
+def test_auto_order_starts_independent_steps_together_on_one_local_model(tmp_path):
+    from types import SimpleNamespace
+    from dva.orchestrator import Orchestra, RunFit
+    o = Orchestra.__new__(Orchestra)
+    o.db = _Settings(max_parallel_agents=4)
+    o.order, o.sequence, o.max_parallel = "auto", False, 4
+    o.fit = RunFit(mode="auto")
+    o.fit.slots["m1"] = 3                                         # two agents and the planner's checks
+    o.turn = SimpleNamespace(model_id="m1")
+    o.app = SimpleNamespace(models=SimpleNamespace(get_any=lambda m: {}))
+    o.model_name = lambda m: m
+    W = lambda deps, model="m1": {"status": "waiting", "depends_on": deps, "model": model}  # noqa: E731
+    o.tasks = {"a": {**W([]), "id": "a"}, "b": {**W([]), "id": "b"}, "c": {**W([]), "id": "c"},
+               "d": {**W(["a"]), "id": "d"}, "e": {**W([], "m2"), "id": "e"}, "f": {**W([], "cloud:x"), "id": "f"}}
+    ids = [t["id"] for t in o.startable()]
+    assert ids[:2] == ["a", "b"] and "c" not in ids and "d" not in ids
+    assert "f" in ids                                             # an online model runs alongside
+    assert "e" not in ids and "one local model at a time" in o.tasks["e"]["wait_reason"]
+    assert "free reply slot" in o.tasks["c"]["wait_reason"]
+    assert o.fit.overrides(SimpleNamespace(fit=lambda m, t, n, top=None: {"ctx": 8192, "parallel": n}), "m1") == \
+        {"ctx": 8192, "parallel": 3}
+    o.order, o.sequence = "sequence", True
+    assert [t["id"] for t in o.startable()] == ["a"]

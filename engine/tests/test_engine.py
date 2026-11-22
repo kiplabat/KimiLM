@@ -1031,7 +1031,7 @@ def test_steps_run_in_order_with_links_the_plan_forgot(engine):
     assert status == "done"
     team = team_of(msg)
     tasks = {t["id"]: t for t in team["tasks"]}
-    assert team["mode"] == "sequence" and list(tasks) == ["t1", "t2", "t3"]
+    assert team["mode"] == "auto" and list(tasks) == ["t1", "t2", "t3"]     # 2.31.0: side by side by default
     assert tasks["t2"]["depends_on"] == ["t1"] and tasks["t3"]["depends_on"] == ["t2"], tasks
     assert all(t["status"] == "done" for t in tasks.values()), team
     assert any("links between steps" in line["text"] or "link between steps" in line["text"] for line in team["log"])
@@ -1045,6 +1045,44 @@ def test_steps_run_in_order_with_links_the_plan_forgot(engine):
     assert "never rebuild it from memory" in first_user_text(c, tasks["t3"]["chat_id"])
     # every accepted result is a file the next steps (and you) can read
     assert all(t["result_file"] and Path(t["result_file"]).exists() for t in tasks.values())
+
+
+def test_independent_parts_run_at_the_same_time_and_the_step_that_needs_both_waits(engine):
+    """2.31.0: the planner names the parts that do not need each other; they run together on reply slots of the
+    one loaded model, and the step that combines them starts when both are done."""
+    c = engine["client"]
+    chat, status, msg = run_team(c, "As a team in parts: hellos and goodbyes, then combine them.")
+    assert status == "done", msg
+    team = team_of(msg)
+    tasks = {t["id"]: t for t in team["tasks"]}
+    assert team["mode"] == "auto" and tasks["t1"]["depends_on"] == [] and tasks["t2"]["depends_on"] == []
+    assert sorted(tasks["t3"]["depends_on"]) == ["t1", "t2"]
+    span = {}
+    for tid, t in tasks.items():
+        rows = c.get(f"/api/chats/{t['chat_id']}").json()["messages"]
+        span[tid] = (rows[0]["created"], rows[-1]["created"])
+    assert span["t1"][0] < span["t2"][1] and span["t2"][0] < span["t1"][1], span     # they overlapped
+    assert span["t3"][0] >= max(span["t1"][1], span["t2"][1]), span
+    log = " ".join(line["text"] for line in team["log"])
+    assert "at the same time" in log and "agents at a time" in log, log
+
+
+def test_a_step_can_be_a_team_with_a_planner_of_its_own(engine):
+    """2.31.0: a planned step that is several pieces of work goes to a sub-planner, which runs agents of its own
+    (here one of them a team again, up to the levels allowed) and hands back one result."""
+    c = engine["client"]
+    chat, status, msg = run_team(c, "As a team with a sub-team: gather greetings in parts, then summarise.",
+                                 timeout=240)
+    assert status == "done", msg
+    tasks = {t["id"]: t for t in team_of(msg)["tasks"]}
+    assert tasks["t1"]["team"] and tasks["t1"]["status"] == "done" and not tasks["t2"].get("team")
+    sub_msg = last_assistant(c, tasks["t1"]["chat_id"])
+    sub = team_of(sub_msg)                                       # the sub-planner's own plan, in its chat
+    sub_tasks = {t["id"]: t for t in sub["tasks"]}
+    assert set(sub_tasks) == {"t1", "t2"} and all(t["status"] == "done" for t in sub_tasks.values())
+    assert sub_tasks["t1"]["team"]                               # level 2 of 2: allowed
+    micro = team_of(last_assistant(c, sub_tasks["t1"]["chat_id"]))
+    assert not any(t.get("team") for t in micro["tasks"])       # level 3: not allowed, plain steps
 
 
 def test_a_failed_step_stops_the_steps_that_need_it(engine):

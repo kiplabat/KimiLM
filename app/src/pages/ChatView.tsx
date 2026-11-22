@@ -189,7 +189,7 @@ function OrchestraTask({ t, live }: any) {
   return (
     <div className={`orch-task st-${t.paused && t.status === "running" ? "paused" : t.status}`}>
       <div className="row between gap-s">
-        <span className="row gap-s ellipsis">{taskIcon(t)}<b className="ellipsis">{t.name}</b><span className="muted small">{t.id}</span></span>
+        <span className="row gap-s ellipsis">{taskIcon(t)}<b className="ellipsis">{t.name}</b><span className="muted small">{t.id}</span>{t.team && <span className="badge badge-accent" title="A sub-planner splits this step and runs agents of its own; open it to see its plan">team</span>}</span>
         <span className="row gap-xs">
           {live && t.status === "running" && t.chat_id && (t.paused
             ? <button className="icon-btn" title="Resume this agent" onClick={() => act("resume")}><Play size={13} /></button>
@@ -294,8 +294,8 @@ function OrchestraCard({ step, live }: any) {
   return (
     <div className="orch">
       <div className="orch-head">
-        <span className="row gap-s"><Workflow size={14} /> <b>{step.mission ? "Long-running task" : sequence ? "Plan" : "Team"}</b>
-          <span className="muted small">{done} of {tasks.length} done{failed ? ` · ${failed} failed` : ""}{skipped ? ` · ${skipped} not run` : ""}{running ? ` · ${running} working` : ""}{sequence ? " · one step at a time" : ""}
+        <span className="row gap-s"><Workflow size={14} /> <b>{step.mission ? "Long-running task" : sequence || step.mode === "auto" ? "Plan" : "Team"}</b>
+          <span className="muted small">{done} of {tasks.length} done{failed ? ` · ${failed} failed` : ""}{skipped ? ` · ${skipped} not run` : ""}{running ? ` · ${running} working${running > 1 ? " at the same time" : ""}` : ""}{sequence ? " · one step at a time" : ""}
             {step.totals?.tokens ? ` · ${fmtTokens(step.totals.tokens)} tokens` : ""}</span></span>
         <span className="row gap-s">
           {register.length > 0 && <button className="link small" onClick={() => setShowReg(!showReg)} title="Failures reported by agents or caught by the app, and what the planner decided">{showReg ? "Hide failures" : `Failures (${register.length})`}</button>}

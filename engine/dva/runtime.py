@@ -843,6 +843,20 @@ class Runtime:
             want = int(s.plan["ctx"])
         return {"ctx": want, "parallel": parallel}
 
+    def slots_for(self, model_id, need_tokens, want, top=None):
+        """2.31.0: how many reply slots (steps at the same time) this model can be loaded with for a run whose
+        replies need `need_tokens` each: at most `want`, and only as many as memory holds now (what is free plus
+        what idle models would give back), leaving a margin. Each slot has its own context (KV cache); the model's
+        weights are loaded once, which is what makes this the cheap way to run agents side by side."""
+        want = max(1, int(want or 1))
+        margin = 1.0 * 2**30
+        for n in range(want, 1, -1):
+            over = self.fit(model_id, need_tokens, n, top=top)
+            m = self.memory(model_id, over)
+            if m["need"] + margin <= m["free"] + m["reclaimable"]:
+                return n
+        return 1
+
     def keep(self, model_id, need_tokens):
         """A model that a run loaded with a smaller context stays as it is for the chats that follow, as long as
         it is large enough for them: no reload back to the full setting until something needs it."""

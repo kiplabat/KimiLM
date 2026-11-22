@@ -31,6 +31,7 @@ program" calls run_python although its kit has no Python, then (with all its too
 "stopped early") just answers. "Long task: needs a key it lacks" is a long-running task whose first step reports
 that; after my answer the planner gives a step that uses the mirror."""
 import argparse
+import asyncio
 import json
 import re
 import sys
@@ -454,6 +455,28 @@ def structured(schema, body):
             return {"approach": "team", "reason": "one step", "final": "the report", "tasks": [
                 {"id": "t1", "name": "Report", "goal": "say hello and keep a report", "done_when": "a greeting",
                  "expects": ["team/report.txt"]}]}
+        if "team" in allowed and "in parts" in users and "This step is a job of several parts" not in users \
+                and "with a sub-team" not in users:
+            # 2.31.0: two parts that do not need each other, then one that needs both
+            return {"approach": "team", "reason": "two independent parts", "parts": ["hellos", "goodbyes"],
+                    "final": "both", "tasks": [
+                        {"id": "t1", "name": "Hellos", "goal": "say hello at length", "done_when": "a greeting",
+                         "depends_on": []},
+                        {"id": "t2", "name": "Goodbyes", "goal": "say goodbye at length", "done_when": "a farewell",
+                         "depends_on": []},
+                        {"id": "t3", "name": "Combine", "goal": "combine t1 and t2", "done_when": "one line",
+                         "depends_on": ["t1", "t2"]}]}
+        if "team" in allowed and "with a sub-team" in users:
+            if "This step is a job of several parts" in users:          # the sub-planner's own plan
+                return {"approach": "team", "reason": "split", "final": "the parts", "tasks": [
+                    {"id": "t1", "name": "Part A", "goal": "say hello", "done_when": "a greeting", "depends_on": [],
+                     "team": True},
+                    {"id": "t2", "name": "Part B", "goal": "say goodbye", "done_when": "a farewell", "depends_on": []}]}
+            return {"approach": "team", "reason": "a big part and a summary", "final": "the summary", "tasks": [
+                {"id": "t1", "name": "Gather", "goal": "gather greetings in two parts", "done_when": "greetings",
+                 "depends_on": [], "team": True},
+                {"id": "t2", "name": "Summarise", "goal": "summarise t1", "done_when": "one line",
+                 "depends_on": ["t1"]}]}
         if "team" in allowed and "forgetful plan" in users:
             return {"approach": "team", "reason": "three steps", "final": "all parts", "tasks": [
                 {"id": "t1", "name": "Find", "goal": "say hello" + (" then explode" if "explode-first" in users else ""),
@@ -533,6 +556,8 @@ async def chat(request: Request):
     goal = step_goal(text_of(body["messages"][-1].get("content")), said)
     if "slowly" in goal:
         time.sleep(4)                               # a step that takes a while (tests stop a run in the middle)
+    if "at length" in goal:
+        await asyncio.sleep(2.5)                    # a while, without holding up other requests (2.31.0: side by side)
     if "explode" in goal:
         return JSONResponse({"error": {"message": "the fake model exploded"}}, 500)
     rf = body.get("response_format")
