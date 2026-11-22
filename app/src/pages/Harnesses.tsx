@@ -4,6 +4,7 @@ import { api, enc } from "../api";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, ConfirmButton, Field, PageHeader, Spinner, Toggle } from "../components/ui";
 import { SplitPane } from "../components/Resizable";
+import { InlineDetail, useNarrow } from "../components/InlineDetail";
 import { startAgentChat } from "./Skills";
 
 const GROUPS = [
@@ -77,6 +78,7 @@ function Editor({ h, onSaved, onCancel }: any) {
 export default function Harnesses({ selected }: { selected?: string }) {
   const { toast, refreshBoot, boot } = useApp();
   const [list, setList] = useState<any[] | null>(null);
+  const narrow = useNarrow();
   const [detail, setDetail] = useState<any>(null);
   const [mode, setMode] = useState<"view" | "edit" | "new">("view");
   const [ask, setAsk] = useState("");
@@ -90,34 +92,8 @@ export default function Harnesses({ selected }: { selected?: string }) {
   }, [selected, list]);
   if (!list) return <div className="page"><Spinner /></div>;
   const after = (h: any) => { load(); refreshBoot(); setMode("view"); go("harnesses", h.id); };
-  return (
-    <div className="page">
-      <PageHeader title="Harnesses" subtitle="A harness is how the agent works: its instructions, tools, step limit and style — or a fixed pipeline. Pick one per chat or scheduled task."
-        actions={<>
-          <label className="btn btn-default"><Upload size={14} /><span>Upload</span>
-            <input type="file" accept=".zip,.json" hidden onChange={async (e) => {
-              const file = e.target.files?.[0]; e.target.value = "";
-              if (file) try { const h = await api.upload("/harnesses-upload", file); toast("Harness added", "ok"); after(h); } catch (err: any) { toast(err.message, "error"); }
-            }} /></label>
-          <Button icon={<Plus size={14} />} onClick={() => go("harnesses", "new")}>New harness</Button>
-        </>} />
-      <div className="card ask-card">
-        <MessageSquarePlus size={18} className="accent" />
-        <input className="input" value={ask} onChange={(e) => setAsk(e.target.value)} placeholder="Or describe the assistant you want, e.g. 'a proofreader for my reports'" />
-        <Button kind="primary" disabled={!ask} onClick={() => startAgentChat(`Create a harness for me: ${ask}. Load the harness-creator skill first, propose the design, then save it with save_harness.`)}>Ask the agent</Button>
-      </div>
-      <SplitPane id="harnesses" className="split" initial={0.3} min={0.15} max={0.6}>
-        <div className="list-col">
-          {list.map((h) => (
-            <div key={h.id} className={`pick-row${selected === h.id ? " active" : ""}`} onClick={() => go("harnesses", h.id)}>
-              <Workflow size={14} />
-              <div className="grow"><b>{h.name}</b> {h.type === "pipeline" && <Badge>pipeline</Badge>} {h.id === boot.settings.default_harness && <Badge kind="accent">default</Badge>}
-                <div className="small muted clamp">{h.error ? `Problem: ${h.error}` : h.description}</div></div>
-              <span onClick={(e) => e.stopPropagation()}><Toggle checked={h.enabled} onChange={async (v: boolean) => { await api.put(`/harnesses/${enc(h.id)}/enabled`, { enabled: v }); load(); refreshBoot(); }} /></span>
-            </div>
-          ))}
-        </div>
-        <div className="detail-col">
+  // 2.32.0: beside the list on a wide window, right under the chosen row on a narrow one
+  const detailView = <>
           {mode === "new" && <Editor onSaved={after} onCancel={() => go("harnesses")} />}
           {mode === "edit" && detail && <Editor h={detail} onSaved={after} onCancel={() => setMode("view")} />}
           {mode === "view" && !detail && <div className="muted pad">Choose a harness to see how it works.</div>}
@@ -150,7 +126,37 @@ export default function Harnesses({ selected }: { selected?: string }) {
               </div>
             </div>
           )}
+  </>;
+  return (
+    <div className="page">
+      <PageHeader title="Harnesses" subtitle="A harness is how the agent works: its instructions, tools, step limit and style — or a fixed pipeline. Pick one per chat or scheduled task."
+        actions={<>
+          <label className="btn btn-default"><Upload size={14} /><span>Upload</span>
+            <input type="file" accept=".zip,.json" hidden onChange={async (e) => {
+              const file = e.target.files?.[0]; e.target.value = "";
+              if (file) try { const h = await api.upload("/harnesses-upload", file); toast("Harness added", "ok"); after(h); } catch (err: any) { toast(err.message, "error"); }
+            }} /></label>
+          <Button icon={<Plus size={14} />} onClick={() => go("harnesses", "new")}>New harness</Button>
+        </>} />
+      <div className="card ask-card">
+        <MessageSquarePlus size={18} className="accent" />
+        <input className="input" value={ask} onChange={(e) => setAsk(e.target.value)} placeholder="Or describe the assistant you want, e.g. 'a proofreader for my reports'" />
+        <Button kind="primary" disabled={!ask} onClick={() => startAgentChat(`Create a harness for me: ${ask}. Load the harness-creator skill first, propose the design, then save it with save_harness.`)}>Ask the agent</Button>
+      </div>
+      <SplitPane id="harnesses" className="split" initial={0.3} min={0.15} max={0.6}>
+        <div className="list-col">
+          {list.map((h) => (<React.Fragment key={h.id}>
+            <div className={`pick-row${selected === h.id ? " active" : ""}`} onClick={() => go("harnesses", h.id)}>
+              <Workflow size={14} />
+              <div className="grow"><b>{h.name}</b> {h.type === "pipeline" && <Badge>pipeline</Badge>} {h.id === boot.settings.default_harness && <Badge kind="accent">default</Badge>}
+                <div className="small muted clamp">{h.error ? `Problem: ${h.error}` : h.description}</div></div>
+              <span onClick={(e) => e.stopPropagation()}><Toggle checked={h.enabled} onChange={async (v: boolean) => { await api.put(`/harnesses/${enc(h.id)}/enabled`, { enabled: v }); load(); refreshBoot(); }} /></span>
+            </div>
+            {narrow && selected === h.id && <InlineDetail id={h.id}>{detailView}</InlineDetail>}</React.Fragment>
+          ))}
+          {narrow && selected === "new" && <InlineDetail id="new">{detailView}</InlineDetail>}
         </div>
+        {!narrow && <div className="detail-col">{detailView}</div>}
       </SplitPane>
     </div>
   );

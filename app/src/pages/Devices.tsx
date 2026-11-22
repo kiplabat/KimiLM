@@ -1,12 +1,13 @@
 import React, { useEffect, useState } from "react";
 import {
   Bluetooth, Camera, Cpu, HardDrive, Keyboard, Monitor, Mouse, Network, Plug, Printer, RefreshCw, Smartphone,
-  Speaker, Thermometer, Usb, Download, ShieldCheck, Refrigerator, Heater, DoorOpen, Flame, Target, Square,
+  Speaker, Thermometer, Usb, Download, ShieldCheck, Refrigerator, Heater, DoorOpen, Flame, Target, Square, Search, X,
+  AlertTriangle, Copy,
 } from "lucide-react";
 import { api, desktop, enc } from "../api";
 import { useApp, useEvent } from "../store";
 import { Badge, Button, Empty, Field, PageHeader, Spinner, Toggle } from "../components/ui";
-import { SplitPane } from "../components/Resizable";
+import { InlineDetail, matches } from "../components/InlineDetail";
 import { startAgentChat } from "./Skills";
 import { BenchChart, type BenchRow } from "../components/BenchChart";
 import { go } from "../store";
@@ -116,9 +117,9 @@ function BenchPanel({ device }: { device: any }) {
   return (
     <div className="stack-m">
       <div className="card stack-s">
-        <div className="row gap-s wrap"><Refrigerator size={20} /><h3 style={{ margin: 0 }}>{ds.model}</h3>
+        <div className="row gap-s wrap">{React.createElement(ICONS[device.kind] || Refrigerator, { size: 20 })}<h3 style={{ margin: 0 }}>{ds.model}</h3>
           {info.simulated && <Badge>simulated · {ds.speed}× faster</Badge>}
-          <Badge kind={modeTone[st.mode] as any} title="custom: a controller you or an agent started · default: the device's own · fallback: its own, after the custom one failed · safe: every output at its safe value">{st.mode}</Badge>
+          {st.mode !== "no driver" && <Badge kind={modeTone[st.mode] as any} title="custom: a controller you or an agent started · default: the device's own · fallback: its own, after the custom one failed · safe: every output at its safe value">{st.mode}</Badge>}
           {info.driver?.current ? <Badge>driver v{info.driver.current}</Badge> : <Badge kind="warn">no driver</Badge>}</div>
         <div className="muted small">{ds.about}</div>
         {rows.length > 0 && <BenchChart rows={rows} sensors={sensors} outputs={outputs} setpoints={setpoints} />}
@@ -214,21 +215,50 @@ function Detail({ id, onChanged }: { id: string; onChanged: () => void }) {
   );
 }
 
+// 2.32.0: when KimiOS's device service is not running (or cannot list a device), say so and what to do, instead
+// of showing no simulated devices at all.
+function BenchProblem({ st }: { st: any }) {
+  const { toast } = useApp();
+  if (!st?.kimios || (!st.reason && !(st.problems || []).length)) return null;
+  const svc = Object.entries(st.services || {}).filter(([, v]) => v);
+  return (
+    <div className="card stack-s warn-card">
+      <div className="row gap-s"><AlertTriangle size={16} className="warn" /><b>{st.reason || "KimiOS's devices have a problem"}</b></div>
+      {(st.problems || []).map((p: string, i: number) => <div key={i} className="small">{p}</div>)}
+      {svc.length > 0 && <div className="row gap-s wrap small">{svc.map(([k, v]: any) =>
+        <Badge key={k} kind={v === "active" ? "ok" : "warn"}>{k}: {v}</Badge>)}</div>}
+      {st.fix && <div className="row gap-s"><code className="small">{st.fix}</code>
+        <Button small kind="ghost" icon={<Copy size={12} />} onClick={() => { navigator.clipboard?.writeText(st.fix); toast("Copied: run it in a terminal", "ok"); }}>Copy</Button></div>}
+      {st.fix && <div className="muted small">Run it in a terminal (it asks for your password), then press Look again. Drivers and long-running tasks you started are kept; continue them from Activity.</div>}
+      {(st.journal || []).length > 0 && <details className="small"><summary>What the services last wrote</summary><pre className="dev-result">{st.journal.join("\n")}</pre></details>}
+    </div>
+  );
+}
+
+const PARTS: [string, string, (d: any) => boolean][] = [
+  ["bench", "KimiOS devices (run by the guard)", (d) => !!d.bench],
+  ["outside", "Attached", (d) => !d.bench && !d.internal],
+  ["inside", "Built in", (d) => !d.bench && !!d.internal],
+];
+
 export default function Devices() {
   const { boot, toast } = useApp();
   const [data, setData] = useState<any>(null);
   const [sel, setSel] = useState<string>("");
+  const [q, setQ] = useState("");
   const [busy, setBusy] = useState(false);
   const load = async () => {
     setBusy(true);
-    try { const r = await api.get("/devices"); setData(r); if (!sel && r.devices.length) setSel((r.devices.find((d: any) => !d.internal) || r.devices[0]).id); }
+    try { setData(await api.get("/devices")); }
     catch (e: any) { toast(e.message, "error"); }
     finally { setBusy(false); }
   };
   useEffect(() => { load(); }, []);
   useEvent((e) => { if (e.kind === "devices") load(); });
   if (!data) return <div className="page"><PageHeader title="Devices" /><Spinner /></div>;
-  const list = [...data.devices].sort((a: any, b: any) => (a.internal ? 1 : 0) - (b.internal ? 1 : 0) || ORDER.indexOf(a.kind) - ORDER.indexOf(b.kind));
+  const all = [...data.devices].sort((a: any, b: any) => (a.internal ? 1 : 0) - (b.internal ? 1 : 0) || ORDER.indexOf(a.kind) - ORDER.indexOf(b.kind));
+  const list = all.filter((d: any) => matches(q, d.name, d.kind, d.what, d.connection, d.id, d.state, d.drivers, d.simulated ? "simulated" : ""));
+  const chosen = all.find((d: any) => d.id === sel);
   return (
     <div className="page">
       <PageHeader title="Devices" subtitle="What is plugged into this computer, what drives it and what you (and your agents) can do with it."
@@ -236,26 +266,33 @@ export default function Devices() {
           <Toggle checked={boot.settings.devices_watch !== false} label="Tell me when a device is plugged in"
             onChange={async (v: boolean) => { await api.put("/settings", { devices_watch: v }); }} />
           <Button icon={<RefreshCw size={14} />} busy={busy} onClick={load}>Look again</Button></>} />
-      {list.length === 0 ? <Empty icon={<Usb />} title="Nothing attached">Plug in a phone, a board, a sensor or a display; it appears here.</Empty> :
-        <SplitPane id="devices" initial={0.42}>
-          <div className="stack-s">
-            {["outside", "inside"].map((part) => {
-              const rows = list.filter((d: any) => (part === "inside") === !!d.internal);
-              if (!rows.length) return null;
-              return <div key={part} className="stack-s"><div className="muted small">{part === "inside" ? "Built in" : "Attached"}</div>
-                <div className="dev-grid">{rows.map((d: any) => {
-                  const Icon = ICONS[d.kind] || Usb;
-                  return <button key={d.id} className={`dev-card${sel === d.id ? " on" : ""}`} onClick={() => setSel(d.id)}>
+      <BenchProblem st={data.bench} />
+      {all.length > 0 && <div className="search dev-search"><Search size={14} />
+        <input placeholder="Find a device: name, kind, connection, driver…" value={q} onChange={(e) => setQ(e.target.value)} />
+        {q && <span className="muted small">{list.length} of {all.length}</span>}
+        {q && <button className="icon-btn" onClick={() => setQ("")} title="Clear"><X size={13} /></button>}</div>}
+      {all.length === 0 ? <Empty icon={<Usb />} title="Nothing attached">Plug in a phone, a board, a sensor or a display; it appears here.</Empty> :
+        list.length === 0 ? <Empty icon={<Search />} title={`No device matches “${q}”`}>Try another word, or clear the search.</Empty> :
+        <div className="stack-m">
+          {PARTS.map(([part, title, has]) => {
+            const rows = list.filter(has);
+            if (!rows.length) return null;
+            return <div key={part} className="stack-s"><div className="muted small">{title}</div>
+              <div className="dev-grid inline-grid">{rows.map((d: any) => {
+                const Icon = ICONS[d.kind] || Usb;
+                return <React.Fragment key={d.id}>
+                  <button className={`dev-card${sel === d.id ? " on" : ""}`} aria-expanded={sel === d.id}
+                    onClick={() => setSel(sel === d.id ? "" : d.id)}>
                     <span className="dev-icon"><Icon size={17} /></span>
                     <span className="stack-xs" style={{ minWidth: 0 }}><b className="ellipsis">{d.name}</b>
                       <span className="muted small">{d.what || d.kind}{d.connection ? ` · ${d.connection}` : ""}</span>
-                      {d.state && <span className="small warn">{d.state}</span>}</span></button>;
-                })}</div></div>;
-            })}
-          </div>
-          <div>{sel ? (list.find((d: any) => d.id === sel)?.bench ? <BenchPanel device={list.find((d: any) => d.id === sel)} />
-            : <Detail id={sel} onChanged={() => {}} />) : null}</div>
-        </SplitPane>}
+                      {d.state && <span className="small warn">{d.state}</span>}</span></button>
+                  {sel === d.id && chosen && <InlineDetail id={d.id}>
+                    {chosen.bench ? <BenchPanel device={chosen} /> : <Detail id={sel} onChanged={() => {}} />}</InlineDetail>}
+                </React.Fragment>;
+              })}</div></div>;
+          })}
+        </div>}
     </div>
   );
 }

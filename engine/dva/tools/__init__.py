@@ -20,6 +20,7 @@ class Tool:
     summary: Callable[[dict], str] | None = None
     source: str = "builtin"         # builtin | connector:<id>
     physical: bool = False          # 2.30.0: it can move, heat, cool or switch a real device: a person approves
+    destructive: bool = False       # 2.32.0: it deletes or overwrites (a connector said so): a snapshot comes first
 
     def schema(self):
         return {"type": "function", "function": {"name": self.name, "description": self.description,

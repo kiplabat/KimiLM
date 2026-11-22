@@ -207,8 +207,11 @@ def create_app(data_dir=None, resources_dir=None, token=None):
     async def devices_list():
         a = A()
         found = await a.devices.look(fresh=True)
+        from . import bench
+        st = await asyncio.to_thread(bench.status_sync) if os.name != "nt" else {"kimios": False}
+        st.pop("devices", None)
         return {"devices": [{**d, "actions": a.devices.actions(d), "trusted": a.devices.trusted(d)} for d in found],
-                "watch": bool(a.db.setting("devices_watch", True))}
+                "watch": bool(a.db.setting("devices_watch", True)), "bench": st}
 
     @api.get("/api/devices/one")
     async def device_one(id: str):
@@ -236,9 +239,7 @@ def create_app(data_dir=None, resources_dir=None, token=None):
     @api.get("/api/bench")
     async def bench_list():
         from . import bench
-        if not bench.available():
-            return {"available": False, "devices": []}
-        return {"available": True, "devices": (await bench.envelope({"op": "devices"}))["devices"]}
+        return await asyncio.to_thread(bench.status_sync)   # 2.32.0: with the reason when it is missing
 
     @api.get("/api/bench/device")
     async def bench_device(id: str):
@@ -267,6 +268,35 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         from . import bench
         data = await body(request)
         return await bench.envelope({"op": "controller_stop", "device": data.get("id")})
+
+    @api.get("/api/snapshots")
+    async def snapshots_list():
+        """2.32.0: KimiOS's snapshots of the home folder (Activity → Undo)."""
+        from . import undo
+        if not undo.available():
+            return {"available": False, "snapshots": []}
+        try:
+            rows = (await asyncio.to_thread(undo.run, "list"))["snapshots"]
+        except undo.UndoError as exc:
+            return {"available": True, "snapshots": [], "error": str(exc)}
+        return {"available": True, "snapshots": list(reversed(rows)), "home": str(Path.home())}
+
+    @api.get("/api/snapshots/changes")
+    async def snapshot_changes(id: str = "latest", path: str = "~"):
+        from . import undo
+        try:
+            return await asyncio.to_thread(undo.run, "changes", id, path)
+        except undo.UndoError as exc:
+            raise ValueError(str(exc)) from None
+
+    @api.post("/api/snapshots/restore")
+    async def snapshot_restore(request: Request):
+        from . import undo
+        data = await body(request)
+        try:
+            return await asyncio.to_thread(undo.run, "restore", str(data.get("id") or "latest"), str(data.get("path") or ""))
+        except undo.UndoError as exc:
+            raise ValueError(str(exc)) from None
 
     @api.get("/api/programs")
     async def programs():
@@ -1005,7 +1035,29 @@ def create_app(data_dir=None, resources_dir=None, token=None):
     @api.post("/api/evals/run")
     async def evals_run(request: Request):
         data = await body(request)
-        return A().evals.start(model=data.get("model"), only=data.get("only"))
+        return A().evals.start(model=data.get("model"), only=data.get("only") or data.get("skills"))
+
+    @api.get("/api/abilities")
+    async def abilities_view():
+        """2.32.0: what each model is good at (Check this setup, by skill) and the models a planner may choose."""
+        from . import abilities
+        a = A()
+        cands = abilities.candidates(a)
+        names = {c["id"]: c for c in cands}
+        for r in a.db.all("SELECT id, name FROM models"):
+            names.setdefault(r["id"], {"id": r["id"], "name": r["name"], "kind": "local"})
+        profs = abilities.profiles(a)
+        rows = []
+        for mid, p in profs.items():
+            c = names.get(mid) or {"id": mid, "name": mid, "kind": "cloud" if mid.startswith("cloud:") else "local"}
+            rows.append({"id": mid, "name": c.get("name") or mid, "kind": c.get("kind"), "usable": mid in
+                         {x["id"] for x in cands}, **p})
+        rows.sort(key=lambda r: (-r["passed"] / max(1, r["ran"]), r["name"]))
+        return {"skills": [{"id": k, "label": l, "about": t} for k, l, t in abilities.SKILLS], "models": rows,
+                "untested": [{"id": c["id"], "name": c["name"], "kind": c["kind"]} for c in cands if c["id"] not in profs],
+                "candidates": [{"id": c["id"], "name": c["name"], "kind": c["kind"]} for c in cands],
+                "choose_step_models": bool(a.db.setting("choose_step_models", True)),
+                "planner_model": a.db.setting("planner_model", "decide")}
 
     @api.post("/api/evals/{run_id}/continue")
     async def evals_continue(run_id: str):

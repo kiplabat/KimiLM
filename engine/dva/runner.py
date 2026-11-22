@@ -53,6 +53,7 @@ from .tools import ALWAYS, GROUPS, ON_REQUEST, Tool, ToolContext, ToolDenied, To
 
 TOOL_RESULT_LIMIT = 6000      # characters of a tool result a model is given (online models, and the default)
 ROLES = ("worker", "strategist", "vision")
+SNAPSHOT_GROUPS = ("files", "python", "setup", "connector")   # 2.32.0: changes worth a snapshot first
 ROLE_HELP = ("worker = a model on this computer for routine, well-defined parts; strategist = the strongest model "
              "(often online) for planning and hard reasoning; vision = a model that can see images and video.")
 PLAN_SCHEMA_STEP = {"type": "object", "required": ["title"], "properties": {
@@ -764,7 +765,7 @@ class Turn:
         warn = " (it deletes or overwrites)" if t.get("destructive") else ""
         return Tool(tool_key(cid, t["name"]), f"[{conf['name']}] {t['description']}", t["parameters"], call,
                     "connector", changes=changes or bool(t.get("physical")), label=f"{conf['name']}: {shown}",
-                    source=f"connector:{cid}", physical=bool(t.get("physical")),
+                    source=f"connector:{cid}", physical=bool(t.get("physical")), destructive=bool(t.get("destructive")),
                     summary=lambda a, n=shown, c=conf["name"]: f"{c} → {n}{warn} {json.dumps(a, ensure_ascii=False)[:300]}")
 
     def _resource_tools(self, connector_ids):
@@ -1470,6 +1471,24 @@ class Turn:
         self._count(out)
         return out
 
+    async def snapshot_first(self, tool):
+        """2.32.0 (KimiOS 0.11.0): before the first change an unattended or auto-approved reply makes (and before
+        anything that deletes or overwrites), a snapshot of the home folder, so it can be undone in Activity. Once
+        per reply; never stops the work."""
+        if getattr(self, "_snapshot_tried", False) or "snapshot" in tool.name or \
+                not self.db.setting("snapshot_before_changes", True):
+            return
+        self._snapshot_tried = True
+        from . import undo
+        if not undo.available():
+            return
+        reason = f"before {tool.label or tool.name} in “{(self.chat.get('title') or 'a chat')[:60]}”"
+        snap = await undo.take(reason)
+        if snap and not snap.get("recent"):
+            self.steps.append({"type": "snapshot", "id": snap["id"], "reason": reason})
+            self.note(f"A snapshot of your home folder was taken first ({snap['id']}): Activity → Undo shows what "
+                      "changed since and puts files back.")
+
     async def run_tool(self, call):
         # `save_to` (2.19.0) is the app's, not the tool's: taken off before the call is checked
         args = call["arguments"] if isinstance(call["arguments"], dict) else {}
@@ -1499,6 +1518,8 @@ class Turn:
                 if call["name"] != "use_connector_tool" and not await self.approve(
                         tool, call["arguments"], tool.describe_call(call["arguments"])):
                     raise ToolDenied("The user declined this action.")
+                if tool.changes and (tool.destructive or (self.auto_approve and tool.group in SNAPSHOT_GROUPS)):
+                    await self.snapshot_first(tool)  # 2.32.0: KimiOS keeps the home folder as it was first
                 if tool.group == "vision" and is_cloud(self.model_id):
                     self.private.add("files")        # the tool sends the picture itself: ask first
                     await self.before_model_call([])

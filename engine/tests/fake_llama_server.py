@@ -484,6 +484,18 @@ def structured(schema, body):
                 {"id": "t2", "name": "Summarise", "goal": "summarise what t1 found" + (" slowly" if "slow-steps" in users else ""),
                  "done_when": "one line"},
                 {"id": "t3", "name": "Publish", "goal": "publish the summary", "done_when": "a report"}]}
+        if "planner" in props and "hand-off plan" in users:      # 2.32.0: the planner hands the planning on
+            return {"approach": "team", "planner": props["planner"]["enum"][0], "planner_why": "it planned better here",
+                    "tasks": []}
+        step_props = props["tasks"]["items"]["properties"]
+        if "team" in allowed and "skilled plan" in users and "model" in step_props:   # 2.32.0: models by skill
+            ids = step_props["model"]["enum"]
+            mine = next((i for i in ids if i.startswith("fake-model")), ids[0])
+            return {"approach": "team", "reason": "two kinds of work", "final": "the summary", "tasks": [
+                {"id": "t1", "name": "Sources", "goal": "say hello from the sources", "done_when": "a greeting",
+                 "depends_on": [], "skill": "research"},
+                {"id": "t2", "name": "Write", "goal": "summarise t1", "done_when": "one line", "depends_on": ["t1"],
+                 "skill": "writing", "model": mine, "model_why": "it writes well enough and is loaded"}]}
         if "team" in allowed and ("direct" not in allowed or "as a team" in users):
             agents = props["tasks"]["items"]["properties"].get("agent", {}).get("enum")
             marks = "".join(f" ({m})" for m in ("retry-me", "never-pass") if m in users)
