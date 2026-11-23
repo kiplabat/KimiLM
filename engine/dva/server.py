@@ -227,6 +227,38 @@ def create_app(data_dir=None, resources_dir=None, token=None):
                                        workspace=folder)
         return {"result": text, "folder": str(folder)}
 
+    # 2.33.0: a display in detail: the monitor's own settings (DDC/CI) and how the computer drives it
+    @api.get("/api/devices/display")
+    async def device_display(id: str):
+        from . import display
+        a = A()
+        d = await a.devices.get(id)
+        out = {"supported": display.supported(), "internal": bool(d.get("internal"))}
+        if not out["supported"]:
+            return out
+        if not d.get("internal"):
+            try:
+                await a.devices.need("ddcutil")
+                out["monitor"] = await display.monitor_state(a, d.get("port"))
+            except Exception as exc:                                    # noqa: BLE001 — shown, not raised
+                out["monitor"] = {"error": str(exc)}
+        lay = await display.layout(a)
+        me = display.find_screen(lay, d.get("port") or "") if lay["how"] else None
+        out["layout"] = {"how": lay["how"], "note": lay.get("note"), "screen": me,
+                         "others": [o["name"] for o in lay["outputs"] if me is None or o["name"] != me["name"]]}
+        return out
+
+    @api.post("/api/devices/display")
+    async def device_display_set(request: Request):
+        data = await body(request)
+        a = A()
+        if data.get("setting"):
+            text = await a.devices.control(data.get("id"), "monitor_set",
+                                           {"setting": data["setting"], "value": data.get("value")})
+        else:
+            text = await a.devices.control(data.get("id"), "screen_set", data.get("layout") or {})
+        return {"result": text}
+
     @api.put("/api/devices/trust")
     async def device_trust(request: Request):
         data = await body(request)
