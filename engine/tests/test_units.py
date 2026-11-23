@@ -1208,3 +1208,136 @@ def test_a_snapshot_is_taken_once_before_the_first_change_of_an_unattended_reply
     off = SimpleNamespace(db=_Settings(snapshot_before_changes=False), chat={}, steps=[], notes=[])
     asyncio.run(Turn.snapshot_first(off, tool))
     assert log.read_text().count("take") == 1                        # switched off: nothing taken
+
+
+# ---------------------------------------------------------------------------------------------- displays (2.33.0)
+CAPS = """Model: HP M27fw FHD
+MCCS version: 2.1
+VCP Features:
+   Feature: 02 (New control value)
+   Feature: 10 (Brightness)
+   Feature: 12 (Contrast)
+   Feature: 14 (Select color preset)
+      Values:
+         05: 6500 K
+         08: 9300 K
+         0b: User 1
+   Feature: 16 (Video gain: Red)
+   Feature: 18 (Video gain: Green)
+   Feature: 1A (Video gain: Blue)
+   Feature: 60 (Input Source)
+      Values:
+         11: HDMI-1
+         12: HDMI-2
+   Feature: D6 (Power mode)
+      Values: 01 04 (interpretation unavailable)
+   Feature: DF (VCP Version)
+"""
+GETVCP = "VCP 10 C 70 100\nVCP 12 C 80 100\nVCP 14 SNC x05\nVCP 16 C 50 100\nVCP 18 C 50 100\n" \
+         "VCP 1A C 48 100\nVCP 60 SNC x11\nVCP D6 SNC x01\n"
+DETECT = "Display 1\n   I2C bus:  /dev/i2c-5\n   DRM connector:  card1-HDMI-A-1\n   Monitor: HPN:HP M27fw FHD\n"
+
+
+def _fake_ddc(calls):
+    async def sh(argv, *a, **k):
+        calls.append(argv)
+        if argv[1:3] == ["detect", "--terse"]:
+            return 0, DETECT
+        if "capabilities" in argv:
+            return 0, CAPS
+        if "getvcp" in argv:
+            return 0, GETVCP
+        return 0, ""
+    return sh
+
+
+def test_the_monitor_says_what_it_offers_and_takes_its_own_names(monkeypatch):
+    from dva import display
+    feats = display.parse_capabilities(CAPS)
+    assert feats["60"]["values"] == {"11": "HDMI-1", "12": "HDMI-2"}
+    assert set(feats["D6"]["values"]) == {"01", "04"}               # listed on one line, named from MCCS
+    assert display.parse_getvcp(GETVCP)["60"] == {"kind": "NC", "value": "11"}
+    calls = []
+    monkeypatch.setattr(display, "sh", _fake_ddc(calls))
+    st = asyncio.run(display.monitor_state(None, "card1-HDMI-A-1"))
+    by = {r["name"]: r for r in st["settings"]}
+    assert st["bus"] == "5" and st["model"] == "HP M27fw FHD"
+    assert by["contrast"]["current"] == 80 and by["input"]["current_name"] == "HDMI-1"
+    assert [o["name"] for o in by["power"]["options"]] == ["on", "off (soft)"]
+    assert "speaker_volume" not in by                                # not offered by this monitor
+    assert asyncio.run(display.monitor_set(None, "card1-HDMI-A-1", "input", "hdmi 2")) == "Input set to HDMI-2"
+    assert calls[-1][-3:] == ["setvcp", "60", "x12"]
+    asyncio.run(display.monitor_set(None, "card1-HDMI-A-1", "red", "140"))
+    assert calls[-1][-3:] == ["setvcp", "16", "100"]                 # kept within the monitor's maximum
+    with pytest.raises(display.DeviceError, match="HDMI-1, HDMI-2"):
+        asyncio.run(display.monitor_set(None, "card1-HDMI-A-1", "input", "VGA"))
+    with pytest.raises(display.DeviceError, match="does not offer"):
+        asyncio.run(display.monitor_set(None, "card1-HDMI-A-1", "speaker_volume", 30))
+
+
+def _mode(mid, w, h, r, cur=False, pref=False, scales=(1.0, 1.25, 1.5, 2.0)):
+    return [mid, w, h, r, 1.0, list(scales), {"is-current": {"type": "b", "data": cur},
+                                              "is-preferred": {"type": "b", "data": pref}}]
+
+
+MUTTER_STATE = {"type": "ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv}", "data": [
+    7,
+    [[["eDP-1", "BOE", "0x0a1c", "0"], [_mode("1920x1080@60.000", 1920, 1080, 60.0, True, True)],
+      {"is-builtin": {"type": "b", "data": True}, "display-name": {"type": "s", "data": "Built-in display"}}],
+     [["HDMI-1", "HPN", "HP M27fw FHD", "X"], [_mode("1920x1080@60.000", 1920, 1080, 60.0, True, True),
+                                               _mode("1920x1080@74.973", 1920, 1080, 74.973),
+                                               _mode("1280x720@60.000", 1280, 720, 60.0, scales=(1.0,))],
+      {"display-name": {"type": "s", "data": "HP 27\""}}]],
+    [[0, 0, 1.25, 0, True, [["eDP-1", "BOE", "0x0a1c", "0"]], {}],
+     [1536, 0, 1.0, 0, False, [["HDMI-1", "HPN", "HP M27fw FHD", "X"]], {}]],
+    {"layout-mode": {"type": "u", "data": 1}}]}
+
+
+def test_gnome_screens_are_read_and_changed_as_gnome_wants_them():
+    from dva import display
+    st = display.parse_mutter(MUTTER_STATE)
+    hdmi = display.find_screen(st, "card1-HDMI-A-1")                 # the kernel's name finds GNOME's
+    assert hdmi["name"] == "HDMI-1" and hdmi["mode"] == "1920x1080@60" and hdmi["position"] == {"x": 1536, "y": 0}
+    screens, said = display.plan(st, "card1-HDMI-A-1", refresh="75", position="left-of eDP-1")
+    me = next(s for s in screens if s["name"] == "HDMI-1")
+    edp = next(s for s in screens if s["name"] == "eDP-1")
+    assert me["mode"]["id"] == "1920x1080@74.973"
+    assert (me["x"], edp["x"]) == (0, 1920)                          # moved so nothing is left of 0
+    assert "75 Hz" in said and "left of eDP-1" in said
+    screens, said = display.plan(st, "card1-HDMI-A-1", mode="1280x720", scale="1.25")
+    assert next(s for s in screens if s["name"] == "HDMI-1")["scale"] == 1.0   # the only scale it offers there
+    screens, _ = display.plan(st, "card1-HDMI-A-1", rotation="90", primary="true")
+    argv = display.mutter_argv(7, screens)
+    assert argv[argv.index("ApplyMonitorsConfig") + 1:][:4] == ["uua(iiduba(ssa{sv}))a{sv}", "7", "2", "2"]
+    tail = argv[argv.index("HDMI-1") - 6:argv.index("HDMI-1") + 3]
+    assert tail == ["1536", "0", "1.0", "1", "true", "1", "HDMI-1", "1920x1080@60.000", "0"]
+    assert argv[argv.index("eDP-1") - 2] == "false"                  # one main screen
+    screens, said = display.plan(st, "card1-HDMI-A-1", enabled="false")
+    assert [s["name"] for s in screens] == ["eDP-1"] and said == "HDMI-1: off"
+    only = {**st, "outputs": [o for o in st["outputs"] if o["name"] == "HDMI-1"]}
+    with pytest.raises(display.DeviceError, match="only screen"):
+        display.plan(only, "card1-HDMI-A-1", enabled="false")
+    with pytest.raises(display.DeviceError, match="it can: 1920x1080, 1280x720"):
+        display.plan(st, "card1-HDMI-A-1", mode="3840x2160")
+
+
+def test_wlroots_screens_are_read_with_wlr_randr():
+    from dva import display
+    st = {"outputs": display.parse_wlr_randr(json.dumps([
+        {"name": "HDMI-A-1", "description": "HP M27fw", "enabled": True, "scale": 1.0, "transform": "normal",
+         "position": {"x": 0, "y": 0}, "modes": [{"width": 1920, "height": 1080, "refresh": 60.0, "current": True,
+                                                  "preferred": True}]}]))}
+    o = display.find_screen(st, "card0-HDMI-A-1")
+    assert o["mode"] == "1920x1080@60" and o["rotation"] == "0"
+    screens, said = display.plan(st, "card0-HDMI-A-1", rotation="180", normalize=False)
+    assert screens[0]["transform"] == 2 and said == "HDMI-A-1: rotated 180°"
+
+
+def test_an_external_display_offers_its_own_settings_and_a_built_in_one_only_the_layout(tmp_path):
+    from dva.devices import Devices
+    dev = Devices.__new__(Devices)
+    ext = [a["name"] for a in dev.actions({"kind": "display", "internal": False, "name": "HP"})]
+    built = [a["name"] for a in dev.actions({"kind": "display", "internal": True, "name": "Built-in screen"})]
+    if os.name == "posix" and sys.platform != "darwin":
+        assert {"monitor_settings", "monitor_set", "screen_layout", "screen_set"} <= set(ext)
+        assert "monitor_set" not in built and "screen_set" in built

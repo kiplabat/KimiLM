@@ -47,6 +47,108 @@ function ActionForm({ device, action, onDone }: any) {
   );
 }
 
+// 2.33.0: a display in detail. The monitor's own menu over DDC/CI (levels as sliders, lists such as the input
+// as choices; a change is sent when the slider is let go) and how the computer drives it (resolution, refresh,
+// scale, rotation, position, main screen, on/off). GNOME asks on the screen to keep a layout change.
+function Level({ row, onCommit }: any) {
+  const [v, setV] = useState<number>(row.current ?? 0);
+  useEffect(() => setV(row.current ?? 0), [row.current]);
+  const commit = () => { if (v !== row.current) onCommit(v); };
+  return (<>
+    <input type="range" min={0} max={row.max || 100} value={v} onChange={(e) => setV(Number(e.target.value))}
+      onPointerUp={commit} onKeyUp={commit} onBlur={commit} />
+    <span className="small">{v} of {row.max || 100}</span>
+  </>);
+}
+
+function DisplayPanel({ d }: { d: any }) {
+  const { toast } = useApp();
+  const [st, setSt] = useState<any>(null);
+  const [busy, setBusy] = useState(false);
+  const [lay, setLay] = useState<Record<string, string>>({});
+  const load = () => api.get(`/devices/display?id=${enc(d.id)}`).then(setSt).catch((e) => setSt({ error: e.message }));
+  useEffect(() => { setSt(null); setLay({}); load(); }, [d.id]);
+  if (!st) return <div className="card"><Spinner /></div>;
+  if (!st.supported) return null;
+  const send = async (body: any) => {
+    setBusy(true);
+    try { const r = await api.post("/devices/display", { id: d.id, ...body }); toast(r.result, "ok"); }
+    catch (e: any) { toast(e.message, "error"); }
+    finally { setBusy(false); setTimeout(load, body.layout ? 1500 : 300); }
+  };
+  const mon = st.monitor, scr = st.layout?.screen;
+  const modes: any[] = scr?.modes || [];
+  const sizes = Array.from(new Set(modes.map((m) => `${m.width}x${m.height}`)));
+  const curMode = modes.find((m) => m.current);
+  const size = lay.mode || (curMode ? `${curMode.width}x${curMode.height}` : sizes[0]);
+  const rates = modes.filter((m) => `${m.width}x${m.height}` === size).map((m) => m.refresh);
+  const scales: number[] = (modes.find((m) => `${m.width}x${m.height}` === size && (!lay.refresh || String(m.refresh) === lay.refresh)) || curMode)?.scales || [];
+  const changed = Object.keys(lay).length > 0;
+  return (<>
+    {!st.internal && <div className="card stack-s">
+      <h3>The monitor's own settings</h3>
+      {mon?.error ? <div className="small warn">{mon.error}</div> : !mon ? <Spinner /> : <>
+        <div className="muted small">{mon.model ? `${mon.model}, ` : ""}over the cable (DDC/CI). These are the settings in the monitor's own menu.</div>
+        <div className="dev-kv">{(mon.settings || []).map((row: any) => <React.Fragment key={row.name}>
+          <div>{row.label}</div>
+          <div className="row gap-s">{row.kind === "C"
+            ? <Level row={row} onCommit={(v: number) => send({ setting: row.name, value: v })} />
+            : <select className="input narrow-auto" disabled={busy} value={row.value || ""}
+                onChange={(e) => send({ setting: row.name, value: e.target.value })}>
+                {!row.value && <option value="">?</option>}
+                {row.options.map((o: any) => <option key={o.value} value={o.value}>{o.name}</option>)}
+              </select>}</div>
+        </React.Fragment>)}</div>
+        {(mon.other || []).length > 0 && <details className="small"><summary>Other features it lists ({mon.other.length})</summary>
+          <div className="muted">{mon.other.map((o: any) => `${o.code} ${o.name}`).join(" · ")}</div></details>}
+      </>}
+    </div>}
+    <div className="card stack-s">
+      <h3>How the computer drives it</h3>
+      {!st.layout?.how ? <div className="muted small">{st.layout?.note}</div>
+        : !scr ? <div className="muted small">This screen is not in the session's layout.</div> : <>
+        <div className="dev-kv">
+          <div>On</div><div><Toggle checked={lay.on ? lay.on === "true" : scr.enabled} label=""
+            onChange={(v: boolean) => setLay({ ...lay, on: String(v) })} /></div>
+          {(scr.enabled || lay.on === "true") && <>
+            <div>Resolution</div><div><select className="input narrow-auto" value={size}
+              onChange={(e) => setLay({ ...lay, mode: e.target.value, refresh: "" })}>
+              {sizes.map((x) => <option key={x} value={x}>{x.replace("x", " × ")}</option>)}</select></div>
+            <div>Refresh</div><div><select className="input narrow-auto" value={lay.refresh || (curMode && `${curMode.width}x${curMode.height}` === size ? String(curMode.refresh) : "")}
+              onChange={(e) => setLay({ ...lay, refresh: e.target.value })}>
+              <option value="">best</option>
+              {rates.map((r) => <option key={r} value={String(r)}>{r} Hz</option>)}</select></div>
+            {scales.length > 0 && <><div>Scale</div><div><select className="input narrow-auto" value={lay.scale || String(scr.scale ?? 1)}
+              onChange={(e) => setLay({ ...lay, scale: e.target.value })}>
+              {scales.map((x) => <option key={x} value={String(x)}>{Math.round(x * 100)} %</option>)}</select></div></>}
+            <div>Rotation</div><div><select className="input narrow-auto" value={lay.rotation || scr.rotation || "0"}
+              onChange={(e) => setLay({ ...lay, rotation: e.target.value })}>
+              {["0", "90", "180", "270"].map((r) => <option key={r} value={r}>{r}°</option>)}</select></div>
+            {st.layout.others.length > 0 && <><div>Where</div><div><select className="input narrow-auto" value={lay.position || ""}
+              onChange={(e) => setLay({ ...lay, position: e.target.value })}>
+              <option value="">{scr.position ? `as it is (${scr.position.x}, ${scr.position.y})` : "as it is"}</option>
+              {st.layout.others.flatMap((o: string) => ["right-of", "left-of", "above", "below"].map((w) =>
+                <option key={w + o} value={`${w} ${o}`}>{w.replace("-", " ")} {o}</option>))}</select></div></>}
+            {st.layout.how === "gnome" && <><div>Main screen</div><div><Toggle checked={lay.primary ? lay.primary === "true" : scr.primary} label=""
+              onChange={(v: boolean) => setLay({ ...lay, primary: String(v) })} /></div></>}
+          </>}
+        </div>
+        <div className="row gap-s">
+          <Button small busy={busy} disabled={!changed} onClick={() => {
+            const l: Record<string, string> = { ...lay };
+            if (l.mode && !l.refresh) delete l.refresh;
+            if (l.primary === "false") delete l.primary;
+            if (l.on === String(scr.enabled)) delete l.on;
+            send({ layout: l }).then(() => setLay({}));
+          }}>Apply</Button>
+          {changed && <Button small kind="ghost" onClick={() => setLay({})}>Undo</Button>}
+          {st.layout.how === "gnome" && <span className="muted small">GNOME asks on the screen to keep it; without an answer it goes back after 20 seconds.</span>}
+        </div>
+      </>}
+    </div>
+  </>);
+}
+
 // 2.30.0: a device run by KimiOS's guard (simulated or real): live readings, what it is asked to hold, the guard's
 // events; set a goal (a long-running task works through driver → experiment → model → controller); stop it;
 // and, on a simulated one, make things happen to it.
@@ -184,6 +286,7 @@ function Detail({ id, onChanged }: { id: string; onChanged: () => void }) {
         <div className="dev-kv">{kv.filter(([, v]) => v).map(([k, v]) => <React.Fragment key={k}><div>{k}</div><div>{String(v)}</div></React.Fragment>)}</div>
         {d.next && <div className="small warn">{d.next}</div>}
       </div>
+      {d.kind === "display" && <DisplayPanel d={d} />}
       {(d.programs || []).length > 0 && <div className="card stack-s">
         <h3>Programs that control it</h3>
         {d.programs.map((p: any) => (

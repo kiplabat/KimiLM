@@ -696,6 +696,24 @@ class Devices:
         if kind == "display":
             out.append(A("brightness", "set the screen's brightness (built-in: the backlight; external: DDC/CI "
                          "with ddcutil)", {"percent": "0 to 100"}, changes=True))
+            if os.name != "nt" and sys.platform != "darwin":       # 2.33.0: dva/display.py
+                if not d.get("internal"):
+                    out += [A("monitor_settings", "what the monitor's own menu holds and offers over DDC/CI: "
+                              "brightness, contrast, sharpness, red/green/blue, speaker volume and mute, input, "
+                              "colour preset, picture mode, power"),
+                            A("monitor_set", "change one of the monitor's own settings",
+                              {"setting": "brightness, contrast, sharpness, red, green, blue, speaker_volume, mute, "
+                                          "input, color_preset, picture_mode or power",
+                               "value": "a level (0 to its maximum) or one of the values monitor_settings lists"},
+                              changes=True)]
+                out += [A("screen_layout", "how the computer drives it: resolution, refresh, scale, rotation, "
+                          "position next to the other screens, main screen, on or off, and the modes it offers"),
+                        A("screen_set", "change how the computer drives it (GNOME asks on the screen to keep it, "
+                          "and goes back after 20 seconds without an answer)",
+                          {"mode": "resolution, such as 1920x1080 or 1920x1080@75", "refresh": "Hz, such as 75",
+                           "scale": "1, 1.25, 1.5, 2 …", "rotation": "0, 90, 180 or 270",
+                           "position": "right-of / left-of / above / below another screen, or x,y",
+                           "primary": "true to make it the main screen", "on": "true or false"}, changes=True)]
         if d.get("sink"):
             out += [A("volume", "set the volume", {"percent": "0 to 150"}, changes=True),
                     A("mute", "mute or unmute", {"on": "true or false"}, changes=True),
@@ -873,6 +891,63 @@ class Devices:
             raise DeviceError("The display did not take the setting over DDC/CI (switch DDC/CI on in its own menu): "
                               + out.strip()[-200:])
         return f"Brightness of {d['name']} set to {pct} %"
+
+    async def _do_monitor_settings(self, d, args, ws, st):
+        from . import display
+        await self.need("ddcutil", st)
+        state = await display.monitor_state(self.app, d.get("port"))
+        lines = [f"{state.get('model') or d['name']} (over DDC/CI, i2c bus {state['bus']})"]
+        for row in state["settings"]:
+            if row["kind"] == "C":
+                lines.append(f"- {row['name']}: {row['current']} of {row['max']}")
+            else:
+                lines.append(f"- {row['name']}: {row.get('current_name') or row.get('value') or '?'} "
+                             f"(can be: {', '.join(o['name'] for o in row['options'])})")
+        if state["other"]:
+            lines.append("Other features it lists: " + ", ".join(f"{o['code']} {o['name']}" for o in state["other"]))
+        return "\n".join(lines)
+
+    async def _do_monitor_set(self, d, args, ws, st):
+        from . import display
+        setting = str(args.get("setting") or "").strip().lower().replace(" ", "_").replace("colour", "color")
+        value = args.get("value")
+        if not setting or value in (None, ""):
+            raise DeviceError("Say which setting and the value (monitor_settings lists them)")
+        if setting == "power" and str(value).strip().lower() not in ("on", "01", "x01"):
+            lay = await display.layout(self.app)
+            others = [o for o in lay["outputs"] if o["enabled"]
+                      and display.screen_key(o["name"]) != display.screen_key(d.get("port"))]
+            if lay["how"] and not others:
+                raise DeviceError("This monitor is the only screen that is on: switching it off would leave "
+                                  "nothing to see")
+        await self.need("ddcutil", st)
+        return await display.monitor_set(self.app, d.get("port"), setting, value)
+
+    async def _do_screen_layout(self, d, args, ws, st):
+        from . import display
+        lay = await display.layout(self.app)
+        if not lay["how"]:
+            return lay["note"]
+        lines = [f"Screens ({'GNOME' if lay['how'] == 'gnome' else 'wlr-randr'}):"]
+        for o in lay["outputs"]:
+            me = display.screen_key(o["name"]) == display.screen_key(d.get("port"))
+            state = (f"{o['mode']} Hz, scale {o['scale']:g}, rotated {o['rotation']}°, at "
+                     f"{o['position']['x']},{o['position']['y']}" + (", main screen" if o["primary"] else "")) \
+                if o["enabled"] else "off"
+            lines.append(f"{'→ ' if me else '- '}{o['name']} ({o.get('description') or ''}): {state}")
+            if me:
+                lines.append("  modes: " + ", ".join(dict.fromkeys(m["mode"] for m in o["modes"]))[:900])
+                cur = next((m for m in o["modes"] if m["current"]), None)
+                if cur and cur.get("scales"):
+                    lines.append("  scales at this mode: " + ", ".join(f"{x:g}" for x in cur["scales"]))
+        return "\n".join(lines)
+
+    async def _do_screen_set(self, d, args, ws, st):
+        from . import display
+        return await display.set_layout(self.app, d.get("port"), mode=args.get("mode"), refresh=args.get("refresh"),
+                                        scale=args.get("scale"), rotation=args.get("rotation"),
+                                        position=args.get("position"), primary=args.get("primary"),
+                                        enabled=args.get("on"))
 
     # -- sound
     async def _do_volume(self, d, args, ws, st):
