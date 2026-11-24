@@ -325,7 +325,7 @@ function ModelsTab({ state, reload }: any) {
             </div>
           );
         })}
-        {eng.installed.includes("custom") && <div className="small muted">Using your own build of the image program (DVA_SD_CLI).</div>}
+        {eng.installed.includes("custom") && <div className="small muted">Using your own build of the image program (KIMILM_SD_CLI).</div>}
         <div className="row gap-m wrap">
           <Field label="Make pictures with" inline>
             <select className="input narrow-auto" value={eng.compute} onChange={(e) => api.put("/images/settings", { image_compute: e.target.value }).then(reload)}>

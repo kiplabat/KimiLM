@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const app = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const env = { ...process.env, DVA_ENGINE_PORT: process.env.DVA_ENGINE_PORT || "8765" };
+const env = { ...process.env, KIMILM_ENGINE_PORT: process.env.KIMILM_ENGINE_PORT || "8765" };
 const npx = process.platform === "win32" ? "npx.cmd" : "npx";
 const vite = spawn(npx, ["vite"], { cwd: app, env, stdio: "inherit", shell: process.platform === "win32" });
 

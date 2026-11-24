@@ -78,7 +78,7 @@ function Privacy({ data, reload }: any) {
           </label>
         ))}
       </div>
-      <p className="muted small">Pipelines (like the Datavera publisher) and memory learning always run on a model on this computer when one is installed. Requests to OpenAI are sent with storage off.</p>
+      <p className="muted small">Pipelines and memory learning always run on a model on this computer when one is installed. Requests to OpenAI are sent with storage off.</p>
     </div>
   );
 }

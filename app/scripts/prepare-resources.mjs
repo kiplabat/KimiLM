@@ -19,7 +19,7 @@ const engineSrc = path.join(repo, "engine");
 const out = path.join(app, "resources");
 const args = process.argv.slice(2);
 const platform = args.includes("--platform") ? args[args.indexOf("--platform") + 1] : (process.platform === "win32" ? "win" : process.platform);
-const versions = JSON.parse(fs.readFileSync(path.join(engineSrc, "dva", "versions.json"), "utf8"));
+const versions = JSON.parse(fs.readFileSync(path.join(engineSrc, "kimilm", "versions.json"), "utf8"));
 const cache = path.join(app, ".cache");
 fs.mkdirSync(cache, { recursive: true });
 
@@ -63,7 +63,7 @@ async function engine() {
   const dest = path.join(out, "engine");
   fs.rmSync(dest, { recursive: true, force: true });
   const skip = (p, e) => e.name === "__pycache__" || e.name === "tests" || e.name === ".venv" || e.name.endsWith(".pyc") || e.name === "pipeline";
-  copyDir(path.join(engineSrc, "dva"), path.join(dest, "dva"), skip);
+  copyDir(path.join(engineSrc, "kimilm"), path.join(dest, "kimilm"), skip);
   copyDir(path.join(engineSrc, "builtin"), path.join(dest, "builtin"), skip);
   fs.copyFileSync(path.join(engineSrc, "requirements.txt"), path.join(dest, "requirements.txt"));
   console.log(`   engine copied to ${dest}`);
@@ -153,7 +153,7 @@ async function llama() {
         console.warn(`   llama.cpp ${tag} has no file matching ${pats.join(" + ")} (it lists: ${(pinned.assets || []).map((a) => a.name).join(", ") || "nothing"}).`);
         for (const rel of await get(`${api}?per_page=30`)) {
           asset = match(rel);
-          if (asset) { console.warn(`   using the newest release that has it: ${rel.tag_name}. Consider setting llama_cpp_tag to ${rel.tag_name} in engine/dva/versions.json.`); break; }
+          if (asset) { console.warn(`   using the newest release that has it: ${rel.tag_name}. Consider setting llama_cpp_tag to ${rel.tag_name} in engine/kimilm/versions.json.`); break; }
         }
       }
     } catch (e) { console.warn(`   ${e.message}`); }

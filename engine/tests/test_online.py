@@ -19,7 +19,7 @@ from test_engine import ENGINE, TESTS, free_port, last_assistant, tiny_gguf, wai
 
 @pytest.fixture(scope="module")
 def env():
-    tmp = Path(tempfile.mkdtemp(prefix="dva-online-"))
+    tmp = Path(tempfile.mkdtemp(prefix="kimilm-online-"))
     cloud_port = free_port()
     cloud = subprocess.Popen([sys.executable, str(TESTS / "fake_cloud_server.py"), "--port", str(cloud_port)],
                              stdout=(tmp / "cloud.log").open("w"), stderr=subprocess.STDOUT)
@@ -30,18 +30,18 @@ def env():
         wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{TESTS / "fake_llama_server.py"}" "$@"\n')
         wrapper.chmod(0o755)
     port, token = free_port(), "test-token"
-    env = {**os.environ, "DVA_TOKEN": token, "DVA_LLAMA_SERVER": str(wrapper), "DVA_SECRETS": "file",
-           "DVA_SOUND_WORKER": str(TESTS / "fake_sound_worker.py"), "DVA_SOUND_LIBRARY": "2.0.1",
+    env = {**os.environ, "KIMILM_TOKEN": token, "KIMILM_LLAMA_SERVER": str(wrapper), "KIMILM_SECRETS": "file",
+           "KIMILM_SOUND_WORKER": str(TESTS / "fake_sound_worker.py"), "KIMILM_SOUND_LIBRARY": "2.0.1",
            "PYTHONPATH": str(ENGINE), "OLLAMA_MODELS": str(tmp / "ollama"), "HF_HOME": str(tmp / "hf"),
            "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}
     log = tmp / "engine-output.log"
-    proc = subprocess.Popen([sys.executable, "-m", "dva", "serve", "--port", str(port), "--data-dir", str(tmp / "data")],
+    proc = subprocess.Popen([sys.executable, "-m", "kimilm", "serve", "--port", str(port), "--data-dir", str(tmp / "data")],
                             cwd=str(ENGINE), env=env, stdout=log.open("w"), stderr=subprocess.STDOUT, text=True)
     for _ in range(100):
-        if "DVA_READY" in log.read_text() or proc.poll() is not None:
+        if "KIMILM_READY" in log.read_text() or proc.poll() is not None:
             break
         time.sleep(0.1)
-    assert "DVA_READY" in log.read_text(), log.read_text()[-3000:]
+    assert "KIMILM_READY" in log.read_text(), log.read_text()[-3000:]
     for _ in range(50):
         try:
             if httpx.get(f"http://127.0.0.1:{cloud_port}/_requests", trust_env=False).status_code == 200:
@@ -422,7 +422,7 @@ def test_a_clip_from_googles_video_model_asks_first_and_is_counted(env):
 
 def _server(api, provider="x", quirks=None, caps=None):
     sys.path.insert(0, str(ENGINE))
-    from dva import cloud
+    from kimilm import cloud
 
     class P:
         def headers(self, pid):
@@ -470,7 +470,7 @@ def test_chat_quirks_gemini_placeholder_and_echoed_reasoning():
 
 def test_router_complexity():
     sys.path.insert(0, str(ENGINE))
-    from dva.router import complexity
+    from kimilm.router import complexity
     assert complexity("Plan the strategy and compare the trade-offs of three options") >= 0.5
     assert complexity("rename every file in the folder to lowercase") < 0.5
     assert complexity("hi") < 0.5

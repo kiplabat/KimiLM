@@ -47,15 +47,15 @@ jobs:
           RES="$(ls -d "$PWD"/app/release/linux-*unpacked | head -1)/resources"
           DATA="$(mktemp -d)"
           cd "$RES/engine"
-          DVA_TOKEN=ci PYTHONNOUSERSITE=1 DVA_SECRETS=file \
-            "$RES/python/bin/python3" -m dva serve --port 0 --data-dir "$DATA" --resources "$RES" > "$DATA/engine.out" 2>&1 &
+          KIMILM_TOKEN=ci PYTHONNOUSERSITE=1 KIMILM_SECRETS=file \
+            "$RES/python/bin/python3" -m kimilm serve --port 0 --data-dir "$DATA" --resources "$RES" > "$DATA/engine.out" 2>&1 &
           PID=$!
           for i in $(seq 1 120); do
-            if grep -q "DVA_READY" "$DATA/engine.out"; then echo "engine ready after ${i}s"; break; fi
+            if grep -q "KIMILM_READY" "$DATA/engine.out"; then echo "engine ready after ${i}s"; break; fi
             kill -0 $PID 2>/dev/null || { cat "$DATA/engine.out"; exit 1; }
             sleep 1
           done
-          grep -q "DVA_READY" "$DATA/engine.out" || { cat "$DATA/engine.out"; kill $PID; exit 1; }
+          grep -q "KIMILM_READY" "$DATA/engine.out" || { cat "$DATA/engine.out"; kill $PID; exit 1; }
           kill $PID
           "$RES/llama/cpu/llama-server" --version
 

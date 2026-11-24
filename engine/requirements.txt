@@ -10,7 +10,7 @@ croniter==7.0.0
 psutil==7.2.2
 keyring==25.7.0
 beautifulsoup4==4.15.0
-# used by run_python, the file tools and plugin pipelines (e.g. Datavera's dataset publisher)
+# used by run_python, the file tools and plugin pipelines
 pandas==3.1.1
 matplotlib==3.11.2
 openpyxl==3.1.5

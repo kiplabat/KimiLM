@@ -1,8 +1,8 @@
-"""End-to-end engine checks against a running engine process (python -m dva serve) with stand-ins:
+"""End-to-end engine checks against a running engine process (python -m kimilm serve) with stand-ins:
 fake_llama_server.py replaces llama-server (scripted answers), fake_mcp_server.py is a stdio MCP connector.
 
     cd engine && python -m pytest -q tests/test_engine.py
-Optional real-model check: set DVA_TEST_LLAMA_SERVER=/path/to/llama-server and DVA_TEST_GGUF=/path/to/model.gguf
+Optional real-model check: set KIMILM_TEST_LLAMA_SERVER=/path/to/llama-server and KIMILM_TEST_GGUF=/path/to/model.gguf
 """
 import io
 import json
@@ -42,7 +42,7 @@ def free_port():
 
 @pytest.fixture(scope="module")
 def engine():
-    tmp = Path(tempfile.mkdtemp(prefix="dva-test-"))
+    tmp = Path(tempfile.mkdtemp(prefix="kimilm-test-"))
     wrapper = tmp / ("fake-llama-server.cmd" if os.name == "nt" else "fake-llama-server")
     if os.name == "nt":
         wrapper.write_text(f'@"{sys.executable}" "{TESTS / "fake_llama_server.py"}" %*\n')
@@ -65,14 +65,14 @@ def engine():
     # KimiLM ships no plugin (2.15.0). The plugin the tests exercise (settings, a set-up script, a pipeline
     # harness, a connector) is installed the way a user installs one: a folder in the data folder's plugins.
     import shutil
-    shutil.copytree(TESTS / "plugins" / "datavera", tmp / "data" / "plugins" / "datavera")
+    shutil.copytree(TESTS / "plugins" / "sample", tmp / "data" / "plugins" / "sample")
     port = free_port()
     token = "test-token"
-    env = {**os.environ, "DVA_NO_APP_PREVIEW_ON_START": "1", "DVA_TEST_CPU": "6x12", "DVA_TOKEN": token, "DVA_LLAMA_SERVER": str(wrapper), "DVA_SECRETS": "file",
-           "DVA_SD_CLI": str(painter), "DVA_SOUND_WORKER": str(TESTS / "fake_sound_worker.py"),
-           "DVA_SOUND_LIBRARY": "2.0.1", "DVA_SOUND_LOG": str(tmp / "sound-jobs.log"),
+    env = {**os.environ, "KIMILM_NO_APP_PREVIEW_ON_START": "1", "KIMILM_TEST_CPU": "6x12", "KIMILM_TOKEN": token, "KIMILM_LLAMA_SERVER": str(wrapper), "KIMILM_SECRETS": "file",
+           "KIMILM_SD_CLI": str(painter), "KIMILM_SOUND_WORKER": str(TESTS / "fake_sound_worker.py"),
+           "KIMILM_SOUND_LIBRARY": "2.0.1", "KIMILM_SOUND_LOG": str(tmp / "sound-jobs.log"),
            "PYTHONPATH": str(ENGINE), "OLLAMA_MODELS": str(tmp / "ollama"), "HF_HOME": str(tmp / "hf"),
-           "DVA_SYSTEM_PLUGINS": str(tmp / "system-plugins")}      # 2.24.0: not the computer's (KimiOS installs one)
+           "KIMILM_SYSTEM_PLUGINS": str(tmp / "system-plugins")}      # 2.24.0: not the computer's (KimiOS installs one)
     # 2.21.0: the engine under test has no internet, on any computer (the tests never need it; a test such as
     # research_without_internet failed where a real search found real sources). Only this computer is reached.
     for k in [k for k in env if k.lower() in ("http_proxy", "https_proxy", "all_proxy", "no_proxy")]:
@@ -80,13 +80,13 @@ def engine():
     env.update({"HTTP_PROXY": "http://127.0.0.1:9", "HTTPS_PROXY": "http://127.0.0.1:9",
                 "NO_PROXY": "127.0.0.1,localhost,::1"})
     log = tmp / "engine-output.log"
-    proc = subprocess.Popen([sys.executable, "-m", "dva", "serve", "--port", str(port), "--data-dir", str(tmp / "data")],
+    proc = subprocess.Popen([sys.executable, "-m", "kimilm", "serve", "--port", str(port), "--data-dir", str(tmp / "data")],
                             cwd=str(ENGINE), env=env, stdout=log.open("w"), stderr=subprocess.STDOUT, text=True)
     for _ in range(100):
-        if "DVA_READY" in log.read_text() or proc.poll() is not None:
+        if "KIMILM_READY" in log.read_text() or proc.poll() is not None:
             break
         time.sleep(0.1)
-    assert "DVA_READY" in log.read_text(), log.read_text()[-3000:]
+    assert "KIMILM_READY" in log.read_text(), log.read_text()[-3000:]
     print("engine log:", log)
     client = httpx.Client(base_url=f"http://127.0.0.1:{port}", headers={"Authorization": f"Bearer {token}"},
                           timeout=60, trust_env=False)
@@ -123,7 +123,7 @@ def test_auth_and_bootstrap(engine):
     boot = c.get("/api/bootstrap").json()
     assert boot["version"]
     ids = {h["id"] for h in boot["harnesses"]}
-    assert {"chat", "agent", "planner", "researcher", "data-analyst", "datavera:dataset-publisher"} <= ids
+    assert {"chat", "agent", "planner", "researcher", "data-analyst", "sample:publisher"} <= ids
     assert "custom" in boot["runtime"]["installed"]
 
 
@@ -178,7 +178,7 @@ def test_approval_flow(engine):
 def test_sandbox_blocks_outside_paths(engine):
     import asyncio
     sys.path.insert(0, str(ENGINE))
-    from dva.tools import ToolContext, ToolDenied
+    from kimilm.tools import ToolContext, ToolDenied
     ctx = ToolContext(app=None, chat={"id": "x"}, project=None, workspace=engine["tmp"] / "ws",
                       folders=[str(engine["tmp"] / "project-files")], readonly=[], emit=lambda *a, **k: None,
                       approve=None)
@@ -206,7 +206,7 @@ def test_chat_and_planner_harnesses(engine):
 def test_skills_and_harnesses(engine):
     c = engine["client"]
     names = {s["name"] for s in c.get("/api/skills").json()["skills"]}
-    assert {"skill-creator", "data-analysis", "datavera-publishing"} <= names
+    assert {"skill-creator", "data-analysis", "sample-publishing"} <= names
     s = c.post("/api/skills", json={"name": "Weekly Report", "description": "Use when writing the weekly report",
                                     "body": "1. Summarise\n2. List risks"}).json()
     assert s["id"] == "weekly-report" and s["editable"]
@@ -263,15 +263,15 @@ def test_connector_stdio(engine):
 def test_plugins(engine):
     c = engine["client"]
     plugins = {p["id"]: p for p in c.get("/api/plugins").json()["plugins"]}
-    dv = plugins["datavera"]
+    dv = plugins["sample"]
     assert dv["source"] == "user"                       # installed by the test: nothing is built in any more
     assert not list((ENGINE / "builtin" / "plugins").glob("*/plugin.json")) if (ENGINE / "builtin" / "plugins").exists() else True
     assert dv["enabled"] and not dv["configured"] and dv["connectors"][0]["url"].startswith("https://")
-    c.put("/api/plugins/datavera/settings", json={"api_key": "not-a-key", "topics": "glaciers"})
-    dv = {p["id"]: p for p in c.get("/api/plugins").json()["plugins"]}["datavera"]
+    c.put("/api/plugins/sample/settings", json={"api_key": "not-a-key", "topics": "glaciers"})
+    dv = {p["id"]: p for p in c.get("/api/plugins").json()["plugins"]}["sample"]
     assert dv["values"]["api_key"] is True and dv["values"]["topics"] == "glaciers"  # secret never returned
-    result = c.post("/api/plugins/datavera/setup").json()
-    assert result["ok"] is False and "dv_sk_" in result["message"]
+    result = c.post("/api/plugins/sample/setup").json()
+    assert result["ok"] is False and "sk_sample_" in result["message"]
     created = c.post("/api/plugins-create", json={"name": "My kit", "description": "test",
                                                   "skills": ["weekly-report"], "harnesses": ["note-taker"]}).json()
     assert created["id"] == "my-kit"
@@ -281,7 +281,7 @@ def test_plugins(engine):
 
 def test_memory_api_and_secret_filter(engine):
     c = engine["client"]
-    ok = c.post("/api/memory", json={"scope": "global", "text": "Works on Datavera"})
+    ok = c.post("/api/memory", json={"scope": "global", "text": "Works on KimiLM"})
     assert ok.status_code == 200
     bad = c.post("/api/memory", json={"scope": "global", "text": "my key is dv_sk_abcdef123456"})
     assert bad.status_code == 400
@@ -299,19 +299,19 @@ def test_events_stream(engine):
     assert {"chat", "job"} <= kinds
 
 
-@pytest.mark.skipif(not os.environ.get("DVA_TEST_LLAMA_SERVER"), reason="real llama-server not configured")
+@pytest.mark.skipif(not os.environ.get("KIMILM_TEST_LLAMA_SERVER"), reason="real llama-server not configured")
 def test_real_llama_server():
-    tmp = Path(tempfile.mkdtemp(prefix="dva-real-"))
+    tmp = Path(tempfile.mkdtemp(prefix="kimilm-real-"))
     port = free_port()
-    env = {**os.environ, "DVA_TOKEN": "t", "DVA_LLAMA_SERVER": os.environ["DVA_TEST_LLAMA_SERVER"],
-           "DVA_SECRETS": "file", "PYTHONPATH": str(ENGINE)}
-    proc = subprocess.Popen([sys.executable, "-m", "dva", "serve", "--port", str(port), "--data-dir", str(tmp)],
+    env = {**os.environ, "KIMILM_TOKEN": "t", "KIMILM_LLAMA_SERVER": os.environ["KIMILM_TEST_LLAMA_SERVER"],
+           "KIMILM_SECRETS": "file", "PYTHONPATH": str(ENGINE)}
+    proc = subprocess.Popen([sys.executable, "-m", "kimilm", "serve", "--port", str(port), "--data-dir", str(tmp)],
                             cwd=str(ENGINE), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    assert proc.stdout.readline().startswith("DVA_READY")
+    assert proc.stdout.readline().startswith("KIMILM_READY")
     c = httpx.Client(base_url=f"http://127.0.0.1:{port}", headers={"Authorization": "Bearer t"}, timeout=120,
                      trust_env=False)
     try:
-        m = c.post("/api/models/import", json={"path": os.environ["DVA_TEST_GGUF"]}).json()
+        m = c.post("/api/models/import", json={"path": os.environ["KIMILM_TEST_GGUF"]}).json()
         c.put(f"/api/models/{m['id']}", json={"compute": "cpu", "ctx": 2048})
         c.put("/api/settings", json={"max_reply_tokens": 24, "learn_enabled": False})
         status = c.post(f"/api/models/{m['id']}/load", json={}).json()
@@ -349,15 +349,15 @@ def test_pipeline_harness(engine):
     assert "line one" in c.get(f"/api/jobs/{job['job_id']}").json()["log"]
 
 
-def test_datavera_pipeline_without_key(engine):
+def test_plugin_pipeline_without_key(engine):
     c = engine["client"]
-    c.put("/api/plugins/datavera/settings", json={"api_key": None})
-    chat = c.post("/api/chats", json={"harness": "datavera:dataset-publisher"}).json()
+    c.put("/api/plugins/sample/settings", json={"api_key": None})
+    chat = c.post("/api/chats", json={"harness": "sample:publisher"}).json()
     job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "run"}).json()
     done = wait_job(c, job["job_id"], timeout=90)
     msg = last_assistant(c, chat["id"])
     assert done["status"] == "done", done
-    assert "Set up the Datavera plugin first" in json.dumps(msg["meta"]["steps"])
+    assert "Set up the Sample service plugin first" in json.dumps(msg["meta"]["steps"])
 
 
 def test_finds_models_from_other_apps(engine):
@@ -519,7 +519,7 @@ def test_vision_attachment_reaches_vision_model(engine):
 def test_web_parsing_and_relevance_offline():
     sys.path.insert(0, str(ENGINE))
     import base64
-    from dva.tools import web
+    from kimilm.tools import web
     real = "https://www.epra.go.ke/statistics/energy-2024.pdf"
     ck = "https://www.bing.com/ck/a?!&&p=abc&u=a1" + base64.urlsafe_b64encode(real.encode()).decode().rstrip("=")
     assert web.unwrap(ck) == real
@@ -542,7 +542,7 @@ def test_web_parsing_and_relevance_offline():
 
 def test_loop_guard_rules():
     sys.path.insert(0, str(ENGINE))
-    from dva.runner import LoopGuard
+    from kimilm.runner import LoopGuard
 
     class DB:
         def setting(self, k, d=None):
@@ -578,7 +578,7 @@ def test_scripts_can_import_their_neighbours_like_the_installed_app(tmp_path):
     plain = subprocess.run([sys.executable, "-P", str(folder / "main.py")], capture_output=True, text=True,
                            cwd=str(tmp_path), env=env)
     assert "No module named 'helper'" in plain.stderr
-    launched = subprocess.run([sys.executable, "-P", "-m", "dva.run_script", str(folder / "main.py"), "x"],
+    launched = subprocess.run([sys.executable, "-P", "-m", "kimilm.run_script", str(folder / "main.py"), "x"],
                               capture_output=True, text=True, cwd=str(tmp_path), env=env)
     assert launched.stdout.strip() == "ok 42 ['x']", launched.stderr
 
@@ -586,7 +586,7 @@ def test_scripts_can_import_their_neighbours_like_the_installed_app(tmp_path):
 # ---------------------------------------------------------------- 2.2.0: KimiLM rename, restart and guard fixes
 def test_loop_guard_allows_rereading_after_a_change():
     sys.path.insert(0, str(ENGINE))
-    from dva.runner import LoopGuard
+    from kimilm.runner import LoopGuard
 
     class DB:
         def setting(self, k, d=None):
@@ -604,85 +604,6 @@ def test_loop_guard_allows_rereading_after_a_change():
     assert "already called" in g.check("edit_file", {"path": "app.py", "old": "a", "new": "b"})
     g.record("run_python", {"code": "x"}, False, "Error: boom", changed=False)
     assert "already called" in g.check("run_python", {"code": "x"}), "a failed run changes nothing"
-
-
-def _legacy_data_folder(root):
-    """A data folder as Datavera Agent left it, after the shell moved it to KimiLM's folder."""
-    import sqlite3
-    old = root / "Datavera Agent"
-    new = root / "KimiLM"
-    new.mkdir(parents=True)
-    con = sqlite3.connect(str(new / "datavera-agent.sqlite3"))
-    con.executescript("CREATE TABLE models (id TEXT PRIMARY KEY, name TEXT, path TEXT, files_json TEXT);"
-                      "CREATE TABLE messages (id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, role TEXT NOT NULL, "
-                      "content TEXT DEFAULT '', meta_json TEXT DEFAULT '{}', created TEXT);")
-    model_path = str(old / "models" / "qwen.gguf")
-    con.execute("INSERT INTO models VALUES ('m1', 'Qwen', ?, ?)", (model_path, json.dumps([model_path])))
-    con.execute("INSERT INTO messages VALUES ('u1', 'c1', 'user', 'later please', ?, '2026-11-15T08:00:00.000+00:00')",
-                (json.dumps({"attachments": [], "pending": "queue"}),))
-    con.execute("INSERT INTO messages VALUES ('u2', 'c1', 'user', 'see file', ?, '2026-11-15T08:00:01.000+00:00')",
-                (json.dumps({"attachments": [{"name": "a.csv", "path": str(old / "uploads" / "a.csv")}]}),))
-    con.commit()
-    con.close()
-    (new / "migrated-from.json").write_text(json.dumps({"from": str(old), "to": str(new), "paths_rewritten": False}))
-    return old, new
-
-
-def test_data_moved_from_datavera_agent_is_adopted(tmp_path, monkeypatch):
-    sys.path.insert(0, str(ENGINE))
-    monkeypatch.setenv("DVA_SECRETS", "file")
-    from dva.app_state import App
-    old, new = _legacy_data_folder(tmp_path)
-    app = App(str(new))
-    assert (new / "kimilm.sqlite3").exists() and not (new / "datavera-agent.sqlite3").exists()
-    model = app.db.get("models", "m1")
-    assert model["path"] == str(new.resolve() / "models" / "qwen.gguf")
-    assert model["files"] == [str(new.resolve() / "models" / "qwen.gguf")], "paths inside JSON are rewritten too"
-    att = app.db.get("messages", "u2")["meta"]["attachments"][0]["path"]
-    assert att == str(new.resolve() / "uploads" / "a.csv")
-    queued = app.db.get("messages", "u1")["meta"]
-    assert queued.get("not_sent") == "restart" and "pending" not in queued, "a queued message is released"
-    note = json.loads((new / "migrated-from.json").read_text())
-    assert note["paths_rewritten"] is True and note["rows_changed"] >= 3
-    app.db.conn.close()
-    again = App(str(new))                       # second start: nothing to do, nothing breaks
-    assert again.db.get("models", "m1")["path"] == model["path"]
-    again.db.conn.close()
-
-
-def test_keys_saved_under_the_old_name_are_found(monkeypatch):
-    sys.path.insert(0, str(ENGINE))
-    import keyring
-    from keyring.backend import KeyringBackend
-    from dva import secrets as sec
-    monkeypatch.delenv("DVA_SECRETS", raising=False)
-
-    class Memory(KeyringBackend):
-        priority = 1
-        store = {}
-
-        def get_password(self, service, user):
-            return self.store.get((service, user))
-
-        def set_password(self, service, user, password):
-            self.store[(service, user)] = password
-
-        def delete_password(self, service, user):
-            self.store.pop((service, user), None)
-
-    before = keyring.get_keyring()
-    keyring.set_keyring(Memory())
-    try:
-        Memory.store[("DataveraAgent", "plugin:datavera:api_key")] = "dv_sk_old"
-        s = sec.Secrets(tempfile.mkdtemp())
-        assert s.secure
-        assert s.get("plugin:datavera:api_key") == "dv_sk_old"
-        assert Memory.store[("KimiLM", "plugin:datavera:api_key")] == "dv_sk_old", "copied to the new name"
-        assert Memory.store[("DataveraAgent", "plugin:datavera:api_key")] == "dv_sk_old", "old entry kept"
-        s.delete("plugin:datavera:api_key")
-        assert not s.has("plugin:datavera:api_key"), "deleting removes both"
-    finally:
-        keyring.set_keyring(before)
 
 
 # ---------------------------------------------------------------- 2.4.0: the planner runs agents as a task graph
@@ -770,9 +691,9 @@ def test_code_errors_point_at_the_line_and_commands_run(tmp_path):
     import asyncio
     sys.path.insert(0, str(ENGINE))
     import types
-    from dva.procs import Procs
-    from dva.tools import python_exec
-    from dva.tools import ToolContext
+    from kimilm.procs import Procs
+    from kimilm.tools import python_exec
+    from kimilm.tools import ToolContext
 
     class DB:
         def setting(self, key, default=None):
@@ -900,7 +821,7 @@ def test_search_by_meaning_with_the_search_model(engine):
 # ---------------------------------------------------------------- 2.4.1: GPU runtime choice and CPU/GPU placement
 def _runtime_with(backends, devices, settings=None):
     sys.path.insert(0, str(ENGINE))
-    from dva.runtime import Runtime
+    from kimilm.runtime import Runtime
 
     class DB:
         def setting(self, key, default=None):
@@ -940,7 +861,7 @@ def test_gpu_runtime_without_a_card_is_skipped_and_parts_can_be_placed():
 
 def test_hybrid_models_need_less_context_memory():
     sys.path.insert(0, str(ENGINE))
-    from dva.gguf import kv_cache_bytes
+    from kimilm.gguf import kv_cache_bytes
     meta = {"block_count": 32, "head_count": 16, "head_count_kv": 4, "key_length": 256, "value_length": 256}
     full = kv_cache_bytes(meta, 65536)
     assert kv_cache_bytes({**meta, "full_attention_interval": 4}, 65536) == full // 4
@@ -1200,8 +1121,8 @@ def test_a_plan_can_wait_for_approval(engine):
 
 def test_plan_repair_and_failure_kinds():
     """The pure parts: which failure a step had, and whether feedback repeats itself."""
-    from dva.orchestrator import RunFit, same_objection
-    from dva.recovery import classify
+    from kimilm.orchestrator import RunFit, same_objection
+    from kimilm.recovery import classify
     assert classify("TurnStopped: The model stopped responding twice in a row") == "stall"
     assert classify(None, timed_out=True) == "timeout"
     assert classify("RuntimeError_: Not enough memory to load this model with these settings.") == "memory"
@@ -1218,7 +1139,7 @@ def test_plan_repair_and_failure_kinds():
 
 
 def test_the_forecast_sizes_the_context():
-    from dva.runtime import CTX_STEPS, Runtime
+    from kimilm.runtime import CTX_STEPS, Runtime
 
     class FakeDB:
         def get(self, table, row_id, key="id"):
@@ -1273,7 +1194,7 @@ def test_the_date_is_not_in_the_system_prompt(engine):
 
 
 def test_tool_result_size_follows_reading_speed():
-    from dva.runner import TOOL_RESULT_LIMIT, Turn
+    from kimilm.runner import TOOL_RESULT_LIMIT, Turn
 
     class DB:
         def __init__(self, budget):
@@ -1297,7 +1218,7 @@ def test_tool_result_size_follows_reading_speed():
 
 
 def test_fast_cores_are_found_on_mixed_processors(tmp_path):
-    from dva.hardware import _linux_performance_cores
+    from kimilm.hardware import _linux_performance_cores
     # Intel 12th generation style: 4 fast cores with 2 threads each (cpus 0-7), 8 efficient cores (8-15)
     (tmp_path / "cpu_core").mkdir()
     (tmp_path / "cpu_atom").mkdir()
@@ -1332,20 +1253,20 @@ def test_the_server_is_started_with_a_sized_prompt_cache_and_a_snapshot_folder(t
     assert with_cache - rt._need_bytes(model, {**plan, "cache_ram": 0}) == 256 * 2**20     # half its limit is counted
 
 
-@pytest.mark.skipif(not os.environ.get("DVA_TEST_LLAMA_SERVER"), reason="real llama-server not configured")
+@pytest.mark.skipif(not os.environ.get("KIMILM_TEST_LLAMA_SERVER"), reason="real llama-server not configured")
 def test_real_llama_server_restores_a_prompt_snapshot():
     """Against the real llama.cpp server: a planned run's two prompts (planner and agent) both survive a reload."""
-    tmp = Path(tempfile.mkdtemp(prefix="dva-real-snap-"))
+    tmp = Path(tempfile.mkdtemp(prefix="kimilm-real-snap-"))
     port = free_port()
-    env = {**os.environ, "DVA_TOKEN": "t", "DVA_LLAMA_SERVER": os.environ["DVA_TEST_LLAMA_SERVER"],
-           "DVA_SECRETS": "file", "PYTHONPATH": str(ENGINE)}
-    proc = subprocess.Popen([sys.executable, "-m", "dva", "serve", "--port", str(port), "--data-dir", str(tmp)],
+    env = {**os.environ, "KIMILM_TOKEN": "t", "KIMILM_LLAMA_SERVER": os.environ["KIMILM_TEST_LLAMA_SERVER"],
+           "KIMILM_SECRETS": "file", "PYTHONPATH": str(ENGINE)}
+    proc = subprocess.Popen([sys.executable, "-m", "kimilm", "serve", "--port", str(port), "--data-dir", str(tmp)],
                             cwd=str(ENGINE), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    assert proc.stdout.readline().startswith("DVA_READY")
+    assert proc.stdout.readline().startswith("KIMILM_READY")
     c = httpx.Client(base_url=f"http://127.0.0.1:{port}", headers={"Authorization": "Bearer t"}, timeout=180,
                      trust_env=False)
     try:
-        m = c.post("/api/models/import", json={"path": os.environ["DVA_TEST_GGUF"]}).json()
+        m = c.post("/api/models/import", json={"path": os.environ["KIMILM_TEST_GGUF"]}).json()
         c.put(f"/api/models/{m['id']}", json={"compute": "cpu", "ctx": 8192})
         c.put("/api/settings", json={"max_reply_tokens": 8, "learn_enabled": False, "team_mode": "off"})
 
@@ -1400,7 +1321,7 @@ def test_a_stopped_run_continues_from_its_accepted_steps(engine):
 
 
 def test_a_step_gets_only_the_tools_its_goal_needs(engine):
-    from dva.orchestrator import lean_kit
+    from kimilm.orchestrator import lean_kit
     assert lean_kit("Read notes.txt and list the names") == ["files"]
     assert lean_kit("Search the web for the latest tariff and compute the average with Python") == ["files", "web", "python"]
     assert lean_kit("Look at the screenshot and describe it") == ["files", "vision"]
@@ -1436,7 +1357,7 @@ def test_the_evaluation_runs_tasks_and_keeps_the_numbers(engine):
 
 
 def test_the_evaluation_checks_judge_files_and_replies(tmp_path):
-    from dva import evals
+    from kimilm import evals
     by_id = {t["id"]: t for t in evals.TASKS}
 
     def folder(task_id):
@@ -1534,8 +1455,8 @@ def test_runs_are_kept_with_their_timeline(engine):
 
 
 def test_model_choice_learns_from_measured_steps(tmp_path):
-    from dva.db import DB
-    from dva.forecast import Forecaster
+    from kimilm.db import DB
+    from kimilm.forecast import Forecaster
 
     class App:
         db = DB(tmp_path / "t.db")
@@ -1815,8 +1736,8 @@ def test_a_scheduled_task_can_be_a_long_task_with_its_setup(engine):
 
 
 def test_handoffs_limits_and_tool_kits_in_code():
-    from dva.missions import clean_limits, parse_handoff
-    from dva.orchestrator import lean_kit
+    from kimilm.missions import clean_limits, parse_handoff
+    from kimilm.orchestrator import lean_kit
     h = parse_handoff("I looked at three files.\n\n## Handoff\nDone: read a.csv, 12 rows\nFound: nothing new\n"
                       "Next: chart the rows\nand save it")
     assert h == {"done": "read a.csv, 12 rows", "found": "nothing new", "failed": "", "next": "chart the rows\nand save it"}
@@ -1836,8 +1757,8 @@ def test_failures_have_a_class_and_the_same_attempt_is_not_made_twice():
     """recovery.py: what kind of failure it was decides what may happen next, and an attempt that equals a failed
     one is refused unless its class says the same may be tried again."""
     from types import SimpleNamespace
-    from dva import recovery as rc
-    from dva.orchestrator import Orchestra
+    from kimilm import recovery as rc
+    from kimilm.orchestrator import Orchestra
     # the same error is recognised whatever numbers, paths and addresses it carries
     assert rc.signature("HTTP 403 for https://a.example/x?id=7 after 12.5 s") == rc.signature("HTTP 403 for https://b.example/y after 3 s")
     assert rc.signature("no such file C:\\Users\\a\\x.csv") == rc.signature("no such file /home/b/y.csv")
@@ -1902,7 +1823,7 @@ def test_failures_have_a_class_and_the_same_attempt_is_not_made_twice():
 
 def test_the_same_error_twice_is_said_and_three_times_stops_the_agent():
     from types import SimpleNamespace
-    from dva.runner import LoopGuard
+    from kimilm.runner import LoopGuard
     turn = SimpleNamespace(limits={}, harness={}, db=SimpleNamespace(setting=lambda k, d=None: d))
     g = LoopGuard(turn)
     g.record("web_fetch", {"url": "https://a.example/1"}, False, "Error: HTTP 403 for https://a.example/1")
@@ -1919,7 +1840,7 @@ def test_the_same_error_twice_is_said_and_three_times_stops_the_agent():
 def test_the_image_engines_own_lines_are_read_as_it_really_prints_them():
     """Lines copied from a real run of the pinned image engine on Windows (18 Nov 2026): a redraw of 6 steps at
     strength 0.6 draws 4, and the bars it prints while loading are not steps."""
-    from dva.images import INSTRUCTION, PICTURE_LINE, step_line
+    from kimilm.images import INSTRUCTION, PICTURE_LINE, step_line
     assert step_line("|============>                                     | 1/4 - 223.44s/it - ETA 11:10") == (1, 4, 223.44)
     assert step_line("|=========================>                        | 2/4 - 222.96s/it - ETA 07:26") == (2, 4, 222.96)
     assert step_line("|###                                               |  16/386 -  51.82MB/s") is None
@@ -1935,7 +1856,7 @@ def test_the_image_engines_own_lines_are_read_as_it_really_prints_them():
 
 def test_changes_that_need_no_model(tmp_path):
     from PIL import Image, ImageDraw
-    from dva import effects
+    from kimilm import effects
     assert effects.find("Make the picture glow on its outline. Deliver in the same format.") == ("glow", {"amount": 1.0})
     assert effects.find("add a strong blue glow around the edges")[1] == {"colour": "blue", "amount": 1.6}
     assert effects.find("make it black and white")[0] == "grayscale" and effects.find("blur it slightly") == ("blur", {"amount": 0.6})
@@ -1975,7 +1896,7 @@ def test_changes_that_need_no_model(tmp_path):
 
 
 def test_what_connected_services_promise_is_put_into_words():
-    from dva.mcp import Connectors
+    from kimilm.mcp import Connectors
     cn = Connectors.__new__(Connectors)
     cn.tool_cache, cn.info, cn.unreachable = {}, {}, {}
     confs = {"a": {"id": "a", "name": "Datasets", "enabled": True, "tools": [],
@@ -2067,15 +1988,15 @@ def test_the_browser_tools_work_a_website_like_a_careful_person(tmp_path):
     port = free_port()
     web = http.server.ThreadingHTTPServer(("127.0.0.1", port), functools.partial(Handler, directory=str(site)))
     threading.Thread(target=web.serve_forever, daemon=True).start()
-    env = {"DVA_NODE": node, "DVA_PLAYWRIGHT_MCP": str(cli), "DVA_BROWSER_ARGS": "--no-sandbox", "DVA_SECRETS": "file"}
+    env = {"KIMILM_NODE": node, "KIMILM_PLAYWRIGHT_MCP": str(cli), "KIMILM_BROWSER_ARGS": "--no-sandbox", "KIMILM_SECRETS": "file"}
     old = {k: os.environ.get(k) for k in env}
     os.environ.update(env)
-    os.environ.pop("DVA_NODE_IS_ELECTRON", None)
+    os.environ.pop("KIMILM_NODE_IS_ELECTRON", None)
     home = f"http://127.0.0.1:{port}"
 
     async def scenario():
-        from dva.app_state import App
-        from dva.tools import ToolContext, ToolDenied, ToolError, browser
+        from kimilm.app_state import App
+        from kimilm.tools import ToolContext, ToolDenied, ToolError, browser
         app = App(str(tmp_path / "data"))
         app.db.set_setting("browser_channel", "chrome")
         app.db.set_setting("browser_headless", True)
@@ -2207,7 +2128,7 @@ def test_the_browser_tools_work_a_website_like_a_careful_person(tmp_path):
 
 def test_a_page_is_read_the_way_an_agent_needs_it():
     """The page view without a browser: the helper's snapshot made short and usable."""
-    from dva.tools import browser as b
+    from kimilm.tools import browser as b
     snap = """### Page
 - Page URL: https://shop.example/list
 - Page Title: Shop
@@ -2287,8 +2208,8 @@ def test_a_page_is_read_the_way_an_agent_needs_it():
 def test_tool_calls_are_repaired_or_refused_with_what_to_change():
     """2.16.0: what a model plainly meant is repaired and said; what cannot be repaired is not run, and the answer
     says what is missing and how the tool is called."""
-    from dva.toolcheck import how_to_call, loose_json, repair
-    from dva.tools import Tool
+    from kimilm.toolcheck import how_to_call, loose_json, repair
+    from kimilm.tools import Tool
     S = lambda props, req, **kw: {"type": "object", "properties": props, "required": req, **kw}  # noqa: E731
     tools = {t.name: t for t in (
         Tool("read_file", "Read a file", S({"path": {"type": "string", "description": "The file to read."},
@@ -2378,9 +2299,9 @@ def test_a_cut_off_long_task_continues_by_itself_but_not_forever(tmp_path, monke
     """After a restart a long-running task goes on without being asked (a planned run only if the user chose
     that). One that cuts the app off three times in a row since its last accepted step is left alone."""
     import asyncio
-    from dva.app_state import App
-    from dva.db import now
-    monkeypatch.setenv("DVA_SECRETS", "file")
+    from kimilm.app_state import App
+    from kimilm.db import now
+    monkeypatch.setenv("KIMILM_SECRETS", "file")
 
     async def scenario():
         app = App(str(tmp_path / "data"))
@@ -2413,7 +2334,7 @@ def test_a_cut_off_long_task_continues_by_itself_but_not_forever(tmp_path, monke
 
 # ---------------------------------------------------------------- 2.10.0: MCP servers set up like in other apps
 def test_mcp_configurations_of_other_apps_are_understood(tmp_path, monkeypatch):
-    from dva import mcp_config as mc
+    from kimilm import mcp_config as mc
     claude = mc.parse('{"mcpServers": {"files": {"command": "npx", "args": ["-y", "@x/files", "C:/data"], '
                       '"env": {"API_KEY": "abc"}}, "off": {"command": "uvx", "args": ["thing"], "disabled": true}}}')
     assert [(e["name"], e["transport"], e["enabled"]) for e in claude] == [("files", "stdio", True), ("off", "stdio", False)]
@@ -2514,7 +2435,7 @@ def test_remote_connectors_send_headers_speak_both_transports_and_sign_in(tmp_pa
     import asyncio
     import threading
     import webbrowser
-    monkeypatch.setenv("DVA_SECRETS", "file")
+    monkeypatch.setenv("KIMILM_SECRETS", "file")
     ports = [free_port() for _ in range(3)]
     server = str(TESTS / "fake_mcp_server.py")
     procs = [subprocess.Popen([sys.executable, server, *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -2553,7 +2474,7 @@ def test_remote_connectors_send_headers_speak_both_transports_and_sign_in(tmp_pa
     monkeypatch.setattr(webbrowser, "open", person_signs_in)
 
     async def scenario():
-        from dva.app_state import App
+        from kimilm.app_state import App
         app = App(str(tmp_path / "data"))
         cn = app.connectors
         try:
@@ -2630,8 +2551,8 @@ def test_an_mcp_bundle_installs_as_a_plugin(engine):
 
 
 def test_a_bundle_gets_its_folder_and_settings_and_missing_programs_are_named(tmp_path, monkeypatch):
-    from dva import mcp_config as mc
-    from dva.mcp import resolve_command
+    from kimilm import mcp_config as mc
+    from kimilm.mcp import resolve_command
     plugin = mc.bundle_to_plugin({"name": "x-tool", "version": "1", "server": {"type": "node", "entry_point": "server/index.js"}})
     assert plugin["mcpServers"]["x-tool"] == {"command": "node", "args": ["${__dirname}/server/index.js"], "env": {}, "description": ""}
     assert mc.fill_bundle_vars("${__dirname}/a ${user_config.key} ${user_config.none} ${OTHER}", "/b", {"key": "v"}) == "/b/a v  ${OTHER}"
@@ -2639,14 +2560,14 @@ def test_a_bundle_gets_its_folder_and_settings_and_missing_programs_are_named(tm
         mc.bundle_to_plugin({"name": "mac-only", "server": {"mcp_config": {"command": "x"}},
                              "compatibility": {"platforms": ["plan9"]}})
     monkeypatch.setenv("PATH", str(tmp_path))                     # nothing is installed here
-    monkeypatch.delenv("DVA_NODE", raising=False)
+    monkeypatch.delenv("KIMILM_NODE", raising=False)
     with pytest.raises(ValueError, match=r"npx.*not installed.*Node\.js"):
         resolve_command("npx")
     with pytest.raises(ValueError, match="uv "):
         resolve_command("uvx")
     assert resolve_command("python")[0] == sys.executable          # the app's own Python
-    monkeypatch.setenv("DVA_NODE", "/app/KimiLM.exe")
-    monkeypatch.setenv("DVA_NODE_IS_ELECTRON", "1")
+    monkeypatch.setenv("KIMILM_NODE", "/app/KimiLM.exe")
+    monkeypatch.setenv("KIMILM_NODE_IS_ELECTRON", "1")
     assert resolve_command("node") == ("/app/KimiLM.exe", {"ELECTRON_RUN_AS_NODE": "1"})   # the app's own Node
 
 
@@ -2863,8 +2784,8 @@ def test_simple_changes_need_no_model_and_instructions_go_to_a_model_that_follow
 
 
 def test_picture_sizes_recipes_and_file_choice():
-    from dva.images import RECIPES, SD_ASSETS, SLOT_FLAGS, nearest_ratio, openai_size, pick_file
-    from dva.tools.images import size_for
+    from kimilm.images import RECIPES, SD_ASSETS, SLOT_FLAGS, nearest_ratio, openai_size, pick_file
+    from kimilm.tools.images import size_for
     row = {"settings": {"width": 1024, "height": 1024}}
     assert size_for(row, None, None, None) == (1024, 1024) and size_for(row, "square", None, None) == (1024, 1024)
     wide = size_for(row, "landscape", None, None)
@@ -2894,9 +2815,9 @@ def test_picture_sizes_recipes_and_file_choice():
 def test_the_image_engine_is_chosen_by_the_cards_and_memory_is_shared_with_text_models(tmp_path, monkeypatch):
     import asyncio
     import types
-    from dva import images
-    from dva.images import EXE, Images
-    monkeypatch.delenv("DVA_SD_CLI", raising=False)
+    from kimilm import images
+    from kimilm.images import EXE, Images
+    monkeypatch.delenv("KIMILM_SD_CLI", raising=False)
     settings = {}
     db = types.SimpleNamespace(setting=lambda k, d=None: settings.get(k, d), set_setting=settings.__setitem__,
                                all=lambda *a: [])
@@ -3101,7 +3022,7 @@ def test_an_agent_speaks_and_writes_down_a_recording(engine):
 
 def test_sound_helpers_numbers_scripts_files_and_the_catalogue(tmp_path):
     import numpy as np
-    from dva.sound import CATALOG, ONLINE, RELEASES, Sound, read_pcm, seconds_of, spell_english, srt, write_audio
+    from kimilm.sound import CATALOG, ONLINE, RELEASES, Sound, read_pcm, seconds_of, spell_english, srt, write_audio
     assert spell_english("In 2026, 3 stoves cost $45.50 & 12% less") == \
         "In twenty twenty-six, three stoves cost forty-five point five zero dollars and twelve percent less"
     assert spell_english("1,250,000 people; $3m; 1999; 2005; call 0712") == ("one million two hundred and fifty thousand people; "
@@ -3138,15 +3059,15 @@ def test_sound_helpers_numbers_scripts_files_and_the_catalogue(tmp_path):
     assert set(ONLINE["google"]) >= {"tts", "stt", "music"} and "music" not in ONLINE["openai"] and len(ONLINE["google"]["voices"]) == 30
 
 
-@pytest.mark.skipif(not os.environ.get("DVA_TEST_SOUND_MODELS"), reason="needs real speech models (DVA_TEST_SOUND_MODELS=folder)")
+@pytest.mark.skipif(not os.environ.get("KIMILM_TEST_SOUND_MODELS"), reason="needs real speech models (KIMILM_TEST_SOUND_MODELS=folder)")
 def test_real_voices_speak_and_real_whisper_reads_them_back(tmp_path):
     """With the real library and models: a two-voice script and a voice from a recording, transcribed back."""
-    models = Path(os.environ["DVA_TEST_SOUND_MODELS"])
+    models = Path(os.environ["KIMILM_TEST_SOUND_MODELS"])
 
     def worker(job):
         spec = tmp_path / "job.json"
         spec.write_text(json.dumps(job))
-        out = subprocess.run([sys.executable, "-m", "dva.sound_worker", str(spec)], cwd=str(ENGINE), capture_output=True, text=True)
+        out = subprocess.run([sys.executable, "-m", "kimilm.sound_worker", str(spec)], cwd=str(ENGINE), capture_output=True, text=True)
         last = json.loads(out.stdout.strip().splitlines()[-1])
         assert last.get("done"), (last, out.stderr[-600:])
         return last
@@ -3173,8 +3094,8 @@ def test_models_for_pictures_and_sound_really_download_and_can_be_cancelled(tmp_
     import threading
     import types
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    from dva import images, sound
-    from dva.db import DB
+    from kimilm import images, sound
+    from kimilm.db import DB
     bundle = tmp_path / "voice.tar.bz2"
     (tmp_path / "voice-model").mkdir()
     (tmp_path / "voice-model" / "model.onnx").write_bytes(b"\1" * 5000)
@@ -3211,7 +3132,7 @@ def test_models_for_pictures_and_sound_really_download_and_can_be_cancelled(tmp_
     base = f"http://127.0.0.1:{server.server_port}"
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
     monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
-    monkeypatch.setenv("DVA_SOUND_LIBRARY", "2.0.1")
+    monkeypatch.setenv("KIMILM_SOUND_LIBRARY", "2.0.1")
     events = []
     paths = types.SimpleNamespace(data=tmp_path / "data", models_dir=lambda settings=None: tmp_path / "models")
     (tmp_path / "data").mkdir()
@@ -3431,7 +3352,7 @@ def test_a_podcast_is_made_from_a_document_in_one_request(engine):
 
 
 def test_podcast_pieces_and_what_belongs_to_a_segment():
-    from dva.podcast import nearest, pieces, script_markdown
+    from kimilm.podcast import nearest, pieces, script_markdown
     text = "--- page 1 ---\nAlpha beta gamma.\n\nMore of alpha.\n--- page 2 ---\n" + "Delta epsilon zeta. " * 300 + "\n\nEnd."
     got = pieces(text, size=1000)
     assert got[0] == {"text": "Alpha beta gamma.\nMore of alpha.", "page": 2} or got[0]["text"].startswith("Alpha beta gamma.")
@@ -3443,7 +3364,7 @@ def test_podcast_pieces_and_what_belongs_to_a_segment():
     assert [c["text"][:5] for c in nearest("solar pumps", chunks, 2)] == ["Solar", "Solar"]        # in the document's order
     assert nearest("", chunks, 2) == chunks[:2]
     # talk, not text: hesitations the voices can say, pauses as pieces, and a little added when the script has none
-    from dva.podcast import natural, parts_of, timed
+    from kimilm.podcast import natural, parts_of, timed
     assert parts_of("Uhm... that is **nice** (laughs), and [pause] yes.") == ["Um", "that is nice, and", "yes."]
     assert parts_of("Mm-hmm. So the pump, erm , pays… in four seasons [chuckles].") == ["Mhm. So the pump, um, pays", "in four seasons."]
     assert parts_of(" [music] ") == []
@@ -3483,7 +3404,7 @@ def test_the_composer_cuts_fades_previews_and_saves(engine):
     second = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "mix", "preview": True, "tracks": tracks[:1], "length": "longest", "fade": 0}).json())
     assert abs(second["result"]["params"]["seconds"] - 1.0) < 0.05                      # only the part from 0.5 to 1.5 seconds
     assert len(list((tmp / "data" / "sound" / "previews").glob("*"))) == 1 and len(c.get("/api/sound/library").json()["items"]) == count
-    from dva.sound import read_pcm
+    from kimilm.sound import read_pcm
     cut = read_pcm(second["result"]["path"], 8000, 1).reshape(-1)
     assert abs(cut[:80]).max() < 0.05 < abs(cut[3000:5000]).max() and abs(cut[-80:]).max() < 0.05      # fades in and out
     saved = wait_sound(c, c.post("/api/sound/jobs", json={"kind": "mix", "name": "My mix", "tracks": tracks, "length": "longest", "fade": 0,
@@ -3495,7 +3416,7 @@ def test_the_composer_cuts_fades_previews_and_saves(engine):
 
 
 def test_words_the_dictionary_lacks_are_still_pronounced():
-    from dva.sound_worker import ed_ending, pronounce, s_ending
+    from kimilm.sound_worker import ed_ending, pronounce, s_ending
     lex = {"household": "h ˈ W s h ˌ O l d", "make": "m ˈ A k", "describe": "d ə s k ɹ ˈ I b", "season": "s ˈ i z ᵊ n", "replace": "ɹ ə p l ˈ A s",
            "class": "k l ˈ æ s", "stop": "s t ˈ ɑ p", "run": "ɹ ˈ ʌ n", "times": "t ˈ I m z", "quick": "k w ˈ ɪ k", "user": "j ˈ u z ə ɹ",
            "open": "ˈ O p ə n", "carry": "k ˈ æ ɹ i", "c": "s ˈ i", "p": "p ˈ i", "u": "j ˈ u", "a": "ˈ A", "i": "ˈ I", "l": "ˈ ɛ l", "m": "ˈ ɛ m"}
@@ -3622,8 +3543,8 @@ def test_a_followed_download_is_a_task_that_can_be_stopped(tmp_path):
     are progress, and stopping the task asks the download to stop in its own way."""
     import asyncio
     import types
-    from dva.db import DB
-    from dva.jobs import Jobs
+    from kimilm.db import DB
+    from kimilm.jobs import Jobs
     events = []
     paths = types.SimpleNamespace(data=tmp_path / "data")
     paths.data.mkdir()
@@ -3675,7 +3596,7 @@ def test_a_followed_download_is_a_task_that_can_be_stopped(tmp_path):
         # quiet: the seconds since the last sign of life, only while it runs
         assert jobs.quiet(row["id"]) is None
         # work that goes one at a time says when it waits its turn (it would look stuck otherwise), and only then
-        from dva.jobs import turn
+        from kimilm.jobs import turn
         lock, said = asyncio.Lock(), []
 
         async def one(delay, hold):
@@ -4026,8 +3947,8 @@ def test_work_that_was_cut_off_comes_back_and_leaves_no_engine_behind(tmp_path):
     import subprocess
     import types
     import psutil
-    from dva.db import DB
-    from dva.work import Control, Works, end_leftover, watch
+    from kimilm.db import DB
+    from kimilm.work import Control, Works, end_leftover, watch
     db = DB(tmp_path / "t.db")
     said = []
     app = types.SimpleNamespace(db=db, log=said.append, paths=types.SimpleNamespace(data=tmp_path),
@@ -4121,8 +4042,8 @@ def test_your_own_voice_is_recorded_sentence_by_sentence_checked_kept_and_change
     extended, recorded again take by take, and deleted with all that belongs to it."""
     import sqlite3
     import numpy as np
-    from dva.sound import read_pcm
-    from dva.voices import SAMPLE, SCRIPT, SECOND, words_of
+    from kimilm.sound import read_pcm
+    from kimilm.voices import SAMPLE, SCRIPT, SECOND, words_of
     c, tmp = engine["client"], engine["tmp"]
     ready_for_media(c, tmp)
     if not c.get("/api/sound").json()["can"].get("clone"):
@@ -4290,7 +4211,7 @@ def test_your_own_voice_is_recorded_sentence_by_sentence_checked_kept_and_change
     assert c.get("/api/sound").json()["default_voice"] != voice["id"]
     assert "Labatt, calm" not in {v["name"] for v in c.get("/api/sound").json()["voices"]}
     # agents use voices; none of their tools makes, changes or deletes one
-    from dva.tools import builtin_tools
+    from kimilm.tools import builtin_tools
     assert [t.name for t in builtin_tools() if "voice" in t.name] == ["list_voices"]
 
 
@@ -4298,7 +4219,7 @@ def test_a_take_is_measured_and_judged_and_its_best_second_found():
     """2.18.0. What is said about a take comes from its sound: how much speech, how loud, how clear of the room,
     and where its fullest second of speech is: the second the voice model is given."""
     import numpy as np
-    from dva.voices import SECOND, cut, judge, measure
+    from kimilm.voices import SECOND, cut, judge, measure
     rate = 24000
     t = np.arange(5 * rate) / rate
     # short words with gaps, then from 2.6 s a stretch of unbroken speech
@@ -4326,15 +4247,15 @@ def test_a_take_is_measured_and_judged_and_its_best_second_found():
     assert judge(measure(np.zeros(rate, dtype="float32")))["verdict"] == "again"
 
 
-@pytest.mark.skipif(not os.environ.get("DVA_TEST_SOUND_MODELS"), reason="needs real speech models (DVA_TEST_SOUND_MODELS=folder)")
+@pytest.mark.skipif(not os.environ.get("KIMILM_TEST_SOUND_MODELS"), reason="needs real speech models (KIMILM_TEST_SOUND_MODELS=folder)")
 def test_the_real_voice_model_hears_one_second_of_a_recording(tmp_path):
     """2.18.0 is built on this, measured with the model KimiLM installs: the voice comes from the first 1.04
     seconds of the recording it is given, however long the recording is, and another second gives another voice.
     If a later model or library hears more, this fails, and voices.py should give it more."""
     import numpy as np
-    from dva.sound import read_pcm
-    from dva.voices import SECOND
-    folder = Path(os.environ["DVA_TEST_SOUND_MODELS"]) / "sherpa-onnx-pocket-tts-int8-2026-01-26"
+    from kimilm.sound import read_pcm
+    from kimilm.voices import SECOND
+    folder = Path(os.environ["KIMILM_TEST_SOUND_MODELS"]) / "sherpa-onnx-pocket-tts-int8-2026-01-26"
     voice = read_pcm(folder / "test_wavs" / "bria.wav", 24000, 1)
 
     def says(name, samples):
@@ -4345,7 +4266,7 @@ def test_the_real_voice_model_hears_one_second_of_a_recording(tmp_path):
         spec.write_text(json.dumps({"kind": "speak", "out": str(tmp_path / f"{name}-out.wav"),
                                     "models": {"p": {"family": "pocket", "dir": str(folder)}},
                                     "segments": [{"model": "p", "text": "This voice comes from a short recording.", "ref_audio": str(ref)}]}))
-        out = subprocess.run([sys.executable, "-c", "import sys, sherpa_onnx as so, dva.sound_worker as w\n"
+        out = subprocess.run([sys.executable, "-c", "import sys, sherpa_onnx as so, kimilm.sound_worker as w\n"
                               "make = so.GenerationConfig\n"
                               "def seeded():\n    c = make(); c.extra = {'seed': '1'}; return c\n"
                               "so.GenerationConfig = seeded\n"                      # the same throw of the dice each time
@@ -4506,7 +4427,7 @@ def test_programs_left_by_an_engine_that_went_away_are_ended(tmp_path):
     import subprocess
     import types
     import psutil
-    from dva.procs import Procs, end_tree, python_argv
+    from kimilm.procs import Procs, end_tree, python_argv
     said = []
     app = types.SimpleNamespace(paths=types.SimpleNamespace(data=tmp_path), log=said.append,
                                 db=types.SimpleNamespace(setting=lambda k, d=None: d))
@@ -4564,8 +4485,8 @@ def test_a_step_names_its_files_exactly_and_recovery_knows_files_not_left(tmp_pa
     it differently. Now one place says where an expected file belongs; the brief lists exact paths; a step whose
     agent did not leave its files is a failure of its own kind, with advice that is not "do the same again"."""
     import types
-    from dva.orchestrator import Orchestra
-    from dva.recovery import CLASSES, classify
+    from kimilm.orchestrator import Orchestra
+    from kimilm.recovery import CLASSES, classify
     team = tmp_path / "team"
     team.mkdir()
     o = types.SimpleNamespace(dir=team)
@@ -4631,8 +4552,8 @@ def test_fail_fast_rules_in_code():
     """recovery.py (2.20.0): when the app stops an agent without waiting for its model, which class that is, what
     the planner does about it without a model call, and when 'done when' asks only for files."""
     from types import SimpleNamespace
-    from dva import recovery as rc
-    from dva.runner import LoopGuard
+    from kimilm import recovery as rc
+    from kimilm.runner import LoopGuard
     trip = rc.tripwire
     assert trip("write_file", "Error: The user declined this action.", declined=True)[0] == "permission"
     assert trip("notes__fetch", "Error: Notes needs you to sign in first")[0] == "permission"
@@ -4793,7 +4714,7 @@ def test_a_program_left_running_by_an_agents_code_ends_with_its_task(tmp_path):
     runs; what is still running when it ends stays on the list (Activity) with the same task and ends with it."""
     import asyncio
     from types import SimpleNamespace
-    from dva.procs import Procs
+    from kimilm.procs import Procs
     app = SimpleNamespace(paths=SimpleNamespace(data=tmp_path), log=[].append,
                           db=SimpleNamespace(setting=lambda k, d=None: d))
     script = ("import subprocess, sys, time\n"
@@ -4828,7 +4749,7 @@ def test_an_agent_that_names_its_own_folder_means_that_folder(tmp_path):
     """2.21.0. In the evaluation's folder 'fizz' the model wrote 'fizz/fizz.py': the file went to fizz/fizz/, and its
     code, run in fizz/, could not find it. A relative path that starts with the folder's own name means the folder,
     unless a sub-folder of that name really is there."""
-    from dva.tools import ToolContext
+    from kimilm.tools import ToolContext
     root = tmp_path / "fizz"
     root.mkdir()
     ctx = ToolContext(app=None, chat={}, project=None, workspace=root, folders=[str(root)], readonly=[],

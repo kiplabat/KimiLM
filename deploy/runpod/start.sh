@@ -55,19 +55,19 @@ if [ ! -s "$TOKENFILE" ]; then
   ( umask 077; "$KIMI_VENV/bin/python" -c "import secrets; print(secrets.token_urlsafe(32))" >"$TOKENFILE" )
 fi
 
-# DVA_SECRETS=file: a Pod has no keyring; keys you add are kept in the data folder, readable only by root.
+# KIMILM_SECRETS=file: a Pod has no keyring; keys you add are kept in the data folder, readable only by root.
 (
   cd "$KIMI_REPO/engine"
-  DVA_TOKEN="$(cat "$TOKENFILE")" DVA_UI_DIR="$KIMI_UI" DVA_SECRETS=file \
-    nohup "$KIMI_VENV/bin/python" -m dva serve --port "$PORT" --data-dir "$KIMI_DATA" >"$LOG" 2>&1 &
+  KIMILM_TOKEN="$(cat "$TOKENFILE")" KIMILM_UI_DIR="$KIMI_UI" KIMILM_SECRETS=file \
+    nohup "$KIMI_VENV/bin/python" -m kimilm serve --port "$PORT" --data-dir "$KIMI_DATA" >"$LOG" 2>&1 &
   echo $! >"$PIDFILE"
 )
 for _ in $(seq 1 120); do
-  grep -q "DVA_READY" "$LOG" 2>/dev/null && break
+  grep -q "KIMILM_READY" "$LOG" 2>/dev/null && break
   running || { tail -30 "$LOG"; echo "The engine stopped while starting (log above)." >&2; exit 1; }
   sleep 0.5
 done
-grep -q "DVA_READY" "$LOG" || { tail -30 "$LOG"; echo "The engine did not start within a minute." >&2; exit 1; }
+grep -q "KIMILM_READY" "$LOG" || { tail -30 "$LOG"; echo "The engine did not start within a minute." >&2; exit 1; }
 
 # GPU log for the whole session (see gpu-watch.sh report).
 bash "$HERE/gpu-watch.sh" start >/dev/null 2>&1 || true

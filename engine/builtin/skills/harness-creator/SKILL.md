@@ -22,5 +22,5 @@ Give only the groups the job needs: fewer tools = shorter prompts = faster and m
 4. Save with `save_harness`. Tell the user they can pick it from the harness menu in any chat, or use it in a
    scheduled task.
 
-Fixed multi-stage programs (pipelines, like the Datavera dataset publisher) contain Python code and are added
+Fixed multi-stage programs (pipelines, like a publisher that searches, downloads, checks and posts) contain Python code and are added
 as zip files or plugins, not with save_harness.

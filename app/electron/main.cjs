@@ -7,10 +7,14 @@ const crypto = require("crypto");
 const fs = require("fs");
 const http = require("http");
 const path = require("path");
-const { migrateUserData, moveLoginItem } = require("./migrate.cjs");
+
+// 2.37.0: settings were called DVA_* before (DVA_PYTHON, DVA_NO_SLICE, …); a setting given by its old name still works
+for (const [k, v] of Object.entries(process.env)) {
+  if (k.startsWith("DVA_") && process.env["KIMILM_" + k.slice(4)] === undefined) process.env["KIMILM_" + k.slice(4)] = v;
+}
 
 const isDev = !app.isPackaged;
-const token = crypto.randomBytes(24).toString("base64url");
+const token =crypto.randomBytes(24).toString("base64url");
 let engine = null;
 let enginePort = null;
 let win = null;
@@ -22,7 +26,7 @@ let awake = null;     // id of the power-save blocker while tasks are running (2
 
 const userData = app.getPath("userData");
 const prefsPath = path.join(userData, "shell-prefs.json");
-const logsDir = path.join(userData, "logs");   // created after the first-start data move (migrate.cjs)
+const logsDir = path.join(userData, "logs");
 
 function prefs() {
   try { return { keepInTray: true, openAtLogin: false, startHidden: false, keepAwake: true, ...JSON.parse(fs.readFileSync(prefsPath, "utf8")) }; }
@@ -43,7 +47,7 @@ function setZoom(z) {
   savePrefs({ zoom: z });
   if (win && !win.isDestroyed()) {
     win.webContents.setZoomFactor(z);
-    win.webContents.send("dva:zoom", z);
+    win.webContents.send("kimilm:zoom", z);
   }
   return z;
 }
@@ -58,10 +62,10 @@ function resources() {
   return isDev ? path.join(__dirname, "..", "resources") : process.resourcesPath;
 }
 
-// Which Python runs the engine: DVA_PYTHON, then the installer's own embedded Python, then engine\.venv
+// Which Python runs the engine: KIMILM_PYTHON, then the installer's own embedded Python, then engine\.venv
 // (development), then a Python 3.12 already installed on this computer that has the engine's packages.
 function pythonPath() {
-  if (process.env.DVA_PYTHON) return process.env.DVA_PYTHON;
+  if (process.env.KIMILM_PYTHON) return process.env.KIMILM_PYTHON;
   const bundled = path.join(resources(), "python", process.platform === "win32" ? "python.exe" : "bin/python3");
   if (fs.existsSync(bundled)) return bundled;
   const venv = path.join(__dirname, "..", "..", "engine", ".venv", process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
@@ -81,7 +85,7 @@ function pythonPath() {
 
 function engineDir() {
   const bundled = path.join(resources(), "engine");
-  return fs.existsSync(path.join(bundled, "dva")) ? bundled : path.join(__dirname, "..", "..", "engine");
+  return fs.existsSync(path.join(bundled, "kimilm")) ? bundled : path.join(__dirname, "..", "..", "engine");
 }
 
 function playwrightCli() {
@@ -101,11 +105,11 @@ function log(line) {
 
 // Linux (2.22.0): the engine, and every model server it starts, runs in a systemd scope in kimilm.slice with memory
 // limits. A model that runs away is then killed by the kernel instead of taking the computer down. KimiOS defines
-// kimilm.slice with its own limits; elsewhere systemd creates the slice on the fly. DVA_NO_SLICE=1 turns this off,
+// kimilm.slice with its own limits; elsewhere systemd creates the slice on the fly. KIMILM_NO_SLICE=1 turns this off,
 // and a scope that cannot be made (no systemd user session) falls back to a plain start once.
 let sliceFailed = false;
 function sliceWrap(cmd, args) {
-  if (process.platform !== "linux" || process.env.DVA_NO_SLICE === "1" || sliceFailed) return null;
+  if (process.platform !== "linux" || process.env.KIMILM_NO_SLICE === "1" || sliceFailed) return null;
   const rt = process.env.XDG_RUNTIME_DIR;
   if (!rt || !(fs.existsSync(path.join(rt, "systemd", "private")) || fs.existsSync(path.join(rt, "bus")))) return null;
   const systemdRun = ["/usr/bin/systemd-run", "/bin/systemd-run"].find((p) => fs.existsSync(p));
@@ -119,19 +123,19 @@ function startEngine() {
     const uiDir = isDev ? "" : path.join(process.resourcesPath, "ui");
     const env = {
       ...process.env,
-      DVA_TOKEN: token,
-      DVA_UI_DIR: uiDir,
-      DVA_NODE: process.execPath,
-      DVA_NODE_IS_ELECTRON: "1",
-      DVA_ELECTRON_APP: isDev ? path.join(__dirname, "..") : "",    // 2.35.0: how to start this shell again (previews)
-      DVA_PLAYWRIGHT_MCP: playwrightCli(),
+      KIMILM_TOKEN: token,
+      KIMILM_UI_DIR: uiDir,
+      KIMILM_NODE: process.execPath,
+      KIMILM_NODE_IS_ELECTRON: "1",
+      KIMILM_ELECTRON_APP: isDev ? path.join(__dirname, "..") : "",    // 2.35.0: how to start this shell again (previews)
+      KIMILM_PLAYWRIGHT_MCP: playwrightCli(),
       PYTHONUTF8: "1",
       PYTHONIOENCODING: "utf-8",
       PYTHONNOUSERSITE: "1",
       NO_PROXY: "127.0.0.1,localhost",
     };
-    const port = process.env.DVA_ENGINE_PORT || "0";
-    const args = ["-m", "dva", "serve", "--port", port, "--data-dir", userData, "--resources", resources()];
+    const port = process.env.KIMILM_ENGINE_PORT || "0";
+    const args = ["-m", "kimilm", "serve", "--port", port, "--data-dir", userData, "--resources", resources()];
     let python;
     try { python = pythonPath(); } catch (err) { reject(err); return; }
     const wrapped = sliceWrap(python, args);
@@ -144,7 +148,7 @@ function startEngine() {
     engine.stdout.on("data", (buf) => {
       const text = buf.toString();
       out.write(text);
-      const m = text.match(/DVA_READY (\d+)/);
+      const m = text.match(/KIMILM_READY (\d+)/);
       if (m && !ready) { ready = true; enginePort = Number(m[1]); clearTimeout(timer); resolve(enginePort); }
     });
     engine.stderr.on("data", (buf) => out.write(buf));
@@ -382,44 +386,44 @@ function appShortcut(a) {
     return { ok: false, reason: "On this system, open apps from KimiLM's Apps" };
   } catch (err) { log(`app shortcut: ${err.message}`); return { ok: false, reason: err.message }; }
 }
-ipcMain.handle("dva:open-app", (_e, id) => openAppWindow(String(id || "")));
-ipcMain.handle("dva:app-shortcut", (_e, a) => appShortcut(a));
+ipcMain.handle("kimilm:open-app", (_e, id) => openAppWindow(String(id || "")));
+ipcMain.handle("kimilm:app-shortcut", (_e, a) => appShortcut(a));
 
 // ------------------------------------------------------------------ IPC for the window
-ipcMain.on("dva:config", (e) => { e.returnValue = { token, port: enginePort, dev: isDev, version: app.getVersion(), platform: process.platform }; });
-ipcMain.handle("dva:pick-folder", async () => {
+ipcMain.on("kimilm:config", (e) => { e.returnValue = { token, port: enginePort, dev: isDev, version: app.getVersion(), platform: process.platform }; });
+ipcMain.handle("kimilm:pick-folder", async () => {
   const r = await dialog.showOpenDialog(win, { properties: ["openDirectory", "createDirectory"] });
   return r.canceled ? null : r.filePaths[0];
 });
-ipcMain.handle("dva:pick-file", async (_e, filters) => {
+ipcMain.handle("kimilm:pick-file", async (_e, filters) => {
   const r = await dialog.showOpenDialog(win, { properties: ["openFile"], filters: filters || [] });
   return r.canceled ? null : r.filePaths[0];
 });
-ipcMain.handle("dva:open-path", (_e, p) => shell.openPath(p));
-ipcMain.handle("dva:show-item", (_e, p) => shell.showItemInFolder(p));
-ipcMain.handle("dva:open-external", (_e, url) => { if (/^https?:\/\//.test(url)) shell.openExternal(url); });
-ipcMain.handle("dva:notify", (_e, { title, body, chatId, level }) => {
+ipcMain.handle("kimilm:open-path", (_e, p) => shell.openPath(p));
+ipcMain.handle("kimilm:show-item", (_e, p) => shell.showItemInFolder(p));
+ipcMain.handle("kimilm:open-external", (_e, url) => { if (/^https?:\/\//.test(url)) shell.openExternal(url); });
+ipcMain.handle("kimilm:notify", (_e, { title, body, chatId, level }) => {
   // 2.29.0: something that needs you also makes the taskbar ask for attention; a click opens that chat
   if (level === "action" && win && !win.isFocused()) { try { win.flashFrame(true); } catch {} }
   if (!Notification.isSupported()) return;
   const n = new Notification({ title, body, icon: iconPath(), urgency: level === "action" ? "critical" : "normal" });
-  n.on("click", () => { showWindow(); if (chatId && win) win.webContents.send("dva:open", { chatId }); });
+  n.on("click", () => { showWindow(); if (chatId && win) win.webContents.send("kimilm:open", { chatId }); });
   n.show();
 });
-ipcMain.handle("dva:get-shell-prefs", () => ({ ...prefs(), openAtLogin: app.getLoginItemSettings().openAtLogin }));
-ipcMain.handle("dva:set-shell-prefs", (_e, p) => {
+ipcMain.handle("kimilm:get-shell-prefs", () => ({ ...prefs(), openAtLogin: app.getLoginItemSettings().openAtLogin }));
+ipcMain.handle("kimilm:set-shell-prefs", (_e, p) => {
   savePrefs(p);
   if ("openAtLogin" in p) app.setLoginItemSettings({ openAtLogin: !!p.openAtLogin, args: ["--hidden"] });
   return prefs();
 });
-ipcMain.handle("dva:logs-folder", () => shell.openPath(logsDir));
-ipcMain.handle("dva:get-zoom", () => zoomFactor());
-ipcMain.handle("dva:set-zoom", (_e, z) => setZoom(z));
-ipcMain.handle("dva:step-zoom", (_e, dir) => stepZoom(Number(dir) || 0));
+ipcMain.handle("kimilm:logs-folder", () => shell.openPath(logsDir));
+ipcMain.handle("kimilm:get-zoom", () => zoomFactor());
+ipcMain.handle("kimilm:set-zoom", (_e, z) => setZoom(z));
+ipcMain.handle("kimilm:step-zoom", (_e, dir) => stepZoom(Number(dir) || 0));
 
 // ------------------------------------------------------------------ an app tried off screen (2.35.0)
 // `kimilm --kimilm-preview=<url> --kimilm-preview-out=<file> --kimilm-preview-shot=<png>`: the engine opens an app's preview page
-// (engine/dva/app_preview.py) when the computer has no Chrome-like browser to run headless. This start is separate
+// (engine/kimilm/app_preview.py) when the computer has no Chrome-like browser to run headless. This start is separate
 // from the running KimiLM: its own temporary profile, no single-instance lock, no engine, no window shown.
 function argValue(prefix) {
   const hit = process.argv.find((a) => typeof a === "string" && a.startsWith(prefix));
@@ -470,18 +474,7 @@ if (previewUrl) {
   });
   app.setAppUserModelId("com.kimilm.app");
   app.whenReady().then(async () => {
-    const moved = migrateUserData({ app, dialog });   // before anything writes into the data folder
     fs.mkdirSync(logsDir, { recursive: true });
-    if (moved.status !== "none") log(`data from the earlier app name: ${moved.status} ${moved.from || ""} -> ${moved.to || ""} ${moved.detail || ""}`);
-    if (moved.status === "moved") {
-      moveLoginItem(app, !!prefs().openAtLogin);
-      if (Notification.isSupported()) {
-        new Notification({ title: "Welcome to KimiLM", body: "Datavera Agent is now KimiLM. Your chats, models, memory and settings came with you." }).show();
-      }
-    } else if (moved.status === "failed") {
-      dialog.showMessageBoxSync({ type: "warning", title: "KimiLM", message: "Your data from Datavera Agent could not be moved",
-        detail: `${moved.detail}\n\nKimiLM starts without it. Nothing was deleted: it is still in ${moved.from}. Logs: ${logsDir}` });
-    }
     try {
       await startEngine();
     } catch (err) {
@@ -490,7 +483,7 @@ if (previewUrl) {
     if (!isDev) {
       // Content Security Policy for the window (production only: Vite's dev server needs inline scripts).
       session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
-        // 2.34.0: an app's frame comes with its own, stricter policy (no internet; engine/dva/apps.py)
+        // 2.34.0: an app's frame comes with its own, stricter policy (no internet; engine/kimilm/apps.py)
         if (isAppFrame(details.url)) return callback({ responseHeaders: details.responseHeaders });
         callback({ responseHeaders: { ...details.responseHeaders, "Content-Security-Policy": [
           "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self'; script-src 'self'"] } });

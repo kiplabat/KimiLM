@@ -60,7 +60,7 @@ python3 -m uv pip install -q --python "$VENV/bin/python" -r "$REPO/engine/requir
 
 # ------------------------------------------------------------------ llama.cpp with CUDA, at the tag KimiLM pins
 TAG="$("$VENV/bin/python" -c "import json,sys; print(json.load(open(sys.argv[1]))['llama_cpp_tag'])" \
-  "$REPO/engine/dva/versions.json")"
+  "$REPO/engine/kimilm/versions.json")"
 BACKEND=cuda; [ "$CPU_ONLY" = 1 ] && BACKEND=cpu
 DEST="$DATA/runtimes/llama/$TAG/$BACKEND"
 step "llama.cpp $TAG ($BACKEND)"

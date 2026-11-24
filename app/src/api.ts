@@ -1,12 +1,12 @@
 // Talking to the local engine. Same origin in the app (and via Vite's proxy in development).
 declare global {
-  interface Window { dva?: any }
+  interface Window { kimilm?: any }
 }
 
 const params = new URLSearchParams(location.search);
-export const TOKEN: string = window.dva?.token || params.get("token") || sessionStorage.getItem("dva-token") || "";
-if (TOKEN) sessionStorage.setItem("dva-token", TOKEN);
-export const desktop = window.dva || null;
+export const TOKEN: string = window.kimilm?.token || params.get("token") || sessionStorage.getItem("kimilm-token") || "";
+if (TOKEN) sessionStorage.setItem("kimilm-token", TOKEN);
+export const desktop = window.kimilm || null;
 
 export class ApiError extends Error {
   status: number;

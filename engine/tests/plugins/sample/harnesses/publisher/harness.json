@@ -1,0 +1,20 @@
+{
+  "name": "Sample publisher",
+  "description": "Pipeline: makes one item from a subject and publishes it to the sample service. Say a subject, or just say 'run'.",
+  "type": "pipeline",
+  "entry": "../../pipeline_entry.py",
+  "args": ["run"],
+  "args_map": {"topic": "--topic", "stop_after": "--stop-after"},
+  "inputs": {
+    "type": "object",
+    "properties": {
+      "topic": {"type": "string", "maxLength": 120, "description": "Subject"},
+      "stop_after": {"enum": ["", "draft", "submit"], "description": "Where to stop"}
+    }
+  },
+  "input_prompt": "The user is asking a publishing robot to run. Extract: topic = the subject they want (a few words, empty if none); stop_after = 'draft' if they want to check it before it is submitted, otherwise empty.",
+  "needs": ["model"],
+  "timeout_minutes": 10,
+  "learn": true,
+  "icon": "publish"
+}
