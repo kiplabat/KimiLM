@@ -37,7 +37,7 @@ nsis:
   shortcutName: KimiLM
   deleteAppDataOnUninstall: false
   runAfterFinish: true
-  include: build/installer.nsh      # step-by-step messages; offers to remove Datavera Agent (the old name)
+  include: build/installer.nsh      # step-by-step messages
 linux:
   # tar.gz: unpacked as-is by KimiOS into /usr/lib/kimilm (2.22.0); runs on any x64 Linux with a desktop
   target:

@@ -24,7 +24,7 @@ On your computer: `ssh -N -L 8188:127.0.0.1:8188 root@<pod ip> -p <ssh port> -i 
 printed `http://localhost:8188/?token=…`.
 
 Notes:
-- Secrets you add in the app are kept in `<data>/secrets.json` (`DVA_SECRETS=file`): a Pod has no keyring.
+- Secrets you add in the app are kept in `<data>/secrets.json` (`KIMILM_SECRETS=file`): a Pod has no keyring.
 - Browser tools (Playwright) are not set up; KimiOS's own services (devices, snapshots) are not present.
 - `KIMI_CPU_ONLY=1 KIMI_WORK=/tmp/x bash setup.sh` builds a CPU runtime, for trying the scripts without a GPU.
 - **Stop** keeps `/workspace` (volume disk billed while stopped); **Terminate** deletes it and ends all charges.

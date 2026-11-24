@@ -1,0 +1,38 @@
+{
+  "id": "sample",
+  "name": "Sample service",
+  "version": "1.0.0",
+  "description": "A plugin the test suite installs the way a user installs one: settings (one of them secret), a set-up script, a pipeline harness, a connector, skills, actions and schedule templates. The service it names (example.org) does not exist.",
+  "author": "KimiLM tests",
+  "homepage": "https://example.org",
+  "default_enabled": true,
+  "settings": [
+    {"key": "api_key", "label": "API key", "type": "secret", "required": true,
+     "help": "The service's key. It starts with sk_sample_."},
+    {"key": "owner", "label": "Publish as", "type": "select", "options": [],
+     "help": "Press 'Check and connect' to load your choices."},
+    {"key": "topics", "label": "Subjects", "type": "textarea",
+     "help": "Comma-separated, e.g. 'glaciers, solar capacity'."},
+    {"key": "auto_submit", "label": "Submit automatically", "type": "boolean", "default": true,
+     "help": "On: finished work is submitted. Off: it stays as a draft."},
+    {"key": "import_from", "label": "Import from a folder (optional)", "type": "folder",
+     "help": "A folder with earlier notes to bring over."}
+  ],
+  "connectors": [
+    {"id": "account", "name": "Sample service", "transport": "http", "url": "https://example.org/mcp",
+     "auth": {"type": "bearer", "setting": "api_key"}, "approval": "changes",
+     "description": "The service account: items, publishing and comments."}
+  ],
+  "setup": "setup_hook.py",
+  "actions": [
+    {"id": "stats", "label": "Summary", "run": "pipeline_entry.py", "args": ["stats"]},
+    {"id": "status", "label": "Recent runs", "run": "pipeline_entry.py", "args": ["status"]}
+  ],
+  "schedule_templates": [
+    {"name": "Publish one item every day", "when": "every day at 10:00", "harness": "sample:publisher",
+     "prompt": "Publish one new item.", "only_on_ac": true, "max_runs_per_day": 1, "auto_approve": true},
+    {"name": "Weekly summary", "when": "every monday at 09:00", "harness": "agent",
+     "prompt": "Using the Sample service connector, summarise last week's items and new comments.",
+     "connectors": ["sample:account"]}
+  ]
+}

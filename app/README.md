@@ -13,7 +13,7 @@ results it needs are ready, reads every result (accept, send back with feedback,
 writes the answer — automatically in chats, projects and scheduled tasks when a request looks multi-step. Agents can
 run commands (tests, git, build tools) and fix their own code. **Memory** covers past chats (search by words, and by
 meaning with the optional search model), project knowledge files, living project notes, and per-project isolation.
-Plugins are optional and none is built in (2.15.0): a service such as Datavera is connected as an MCP connector
+Plugins are optional and none is built in (2.15.0): online services are connected as MCP connectors
 in Plugins & connectors.
 
 From 2.9.0 there are **long-running tasks**: work that goes on until a problem is solved. A planner keeps its
@@ -54,21 +54,18 @@ slides or text (or attach it in a chat and ask for a podcast), and KimiLM reads 
 plans the episode, writes each part as a conversation with the matching pieces of the document in front of the
 model, and records it with two voices; the script is saved beside the recording. **Music is made on this
 computer** with ACE-Step 1.5 through acestep.cpp: the programs are built from the pinned source by the workflow
-`music-engine.yml` of the public repository named in `engine/dva/versions.json` (`music_engine_repo`, since 2.15.0
+`music-engine.yml` of the public repository named in `engine/kimilm/versions.json` (`music_engine_repo`, since 2.15.0
 `kiplabat/kimilm-engines`; run it once: Actions → Build music engine → Run workflow) and installed from that
 repository's release; the model (about 3.3 GB) is downloaded in the app.
 
-KimiLM was called **Datavera Agent** up to 2.1.x. Version 2.2.0 renamed it; see "Upgrading from Datavera Agent".
-
 ```
 app/                Electron shell (window, tray, start with Windows) + React UI (Vite)
-  electron/         main.cjs (starts the engine, window, tray), preload.cjs (safe bridge),
-                    migrate.cjs (first start: moves the data from Datavera Agent)
+  electron/         main.cjs (starts the engine, window, tray), preload.cjs (safe bridge)
   src/              the UI: pages/ (Chat, Projects, Models, Plugins, Skills, Harnesses, Schedules, Activity, Performance,
                     Usage, Devices, Memory, Settings); components/Charts.tsx (charts), components/Resizable.tsx
                     (resizable parts), components/Notices.tsx (notifications and the bell)
   scripts/          dev.mjs (development), prepare-resources.mjs (gathers what the installer ships)
-  build/            icons, installer.nsh (installer messages; offers to remove Datavera Agent)
+  build/            icons, installer.nsh (installer messages)
 engine/             Python engine (FastAPI on 127.0.0.1 + a per-launch token) — see engine/README.md
 ```
 
@@ -102,10 +99,10 @@ npm run dist:win
 2. `prepare-resources.mjs --platform win` — copies the engine into
    `app\resources\engine`, downloads the embeddable Python 3.12 (`python.org`) and installs the engine's packages
    into it (`pip --target … --platform win_amd64`), and downloads the llama.cpp CPU build of the pinned release
-   (`engine\dva\versions.json`). Downloads are cached in `app\.cache`.
+   (`engine\kimilm\versions.json`). Downloads are cached in `app\.cache`.
 3. `electron-builder --win` — writes `app\release\KimiLM-Setup-<version>.exe` (per-user install, no admin
-   rights, desktop + Start-menu shortcuts). The installer shows each step and what it installed, and offers to
-   remove Datavera Agent if it finds it (`build\installer.nsh`).
+   rights, desktop + Start-menu shortcuts). The installer shows each step and what it installed
+   (`build\installer.nsh`).
 
 The installer is **not code-signed** yet, so Windows SmartScreen will warn ("More info → Run anyway") until a
 signing certificate is added (`win.certificateFile` / Azure Trusted Signing in `electron-builder.yml`).
@@ -118,25 +115,11 @@ signing certificate is added (`win.certificateFile` / Azure Trusted Signing in `
 | Data (database `kimilm.sqlite3`, chats' workspaces, your skills/harnesses/plugins, logs) | `%APPDATA%\KimiLM` |
 | Models | `%APPDATA%\KimiLM\models` by default; change in **Settings → Models folder** (e.g. `D:\models`) |
 | Keys and tokens | Windows Credential Manager (service `KimiLM`) |
-| A plugin's own data | `%APPDATA%\KimiLM\plugin-data\<plugin>` (the earlier built-in Datavera plugin's data stays in `plugin-data\datavera`) |
-
-## Upgrading from Datavera Agent
-
-- **Installer:** if Datavera Agent is installed, the installer offers to remove it (recommended). Its data is kept.
-- **First start** (`electron/migrate.cjs`): `%APPDATA%\Datavera Agent` is moved to `%APPDATA%\KimiLM` — a rename
-  on the same drive, so even many GB of models move instantly. If KimiLM's folder already exists, each item it
-  doesn't have is moved; a failure puts back what was moved. If KimiLM already has its own database, nothing is
-  moved (two databases are never merged). If Datavera Agent is still running, KimiLM asks to close it.
-  `migrated-from.json` records the move; `MOVED-TO-KimiLM.txt` is left in the old place.
-- **Engine, next start:** the database is renamed to `kimilm.sqlite3` (with its `-wal`/`-shm` files), and paths
-  inside it that pointed into the old folder (models, attachments, downloads) are rewritten (`dva/migration.py`).
-- **Saved keys:** found under the old Credential Manager name (`DataveraAgent`) and copied to `KimiLM`.
-- **Start with Windows:** the old entry is removed; KimiLM's is added if it was on.
-- Unchanged on purpose: the Python package `dva`, `DVA_*` variables, the repository name.
+| A plugin's own data | `%APPDATA%\KimiLM\plugin-data\<plugin>` |
 
 ## How the pieces talk
 
-- Electron starts `python -m dva serve` with a random token in the environment, waits for `DVA_READY <port>`, and
+- Electron starts `python -m kimilm serve` with a random token in the environment, waits for `KIMILM_READY <port>`, and
   opens the window on `http://127.0.0.1:<port>/`. The engine refuses requests without the token and from other hosts.
 - Closing the window hides it to the tray: chats, long tasks and schedules continue. **Quit** from the tray stops them.
 - Node programs (the Playwright browser helper, `{node}` connectors) run on the app's own Electron

@@ -1,8 +1,8 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// In development the engine runs on DVA_ENGINE_PORT (scripts/dev.mjs) and Vite proxies /api to it.
-const enginePort = process.env.DVA_ENGINE_PORT || "8765";
+// In development the engine runs on KIMILM_ENGINE_PORT (scripts/dev.mjs) and Vite proxies /api to it.
+const enginePort = process.env.KIMILM_ENGINE_PORT || "8765";
 
 export default defineConfig({
   plugins: [react()],

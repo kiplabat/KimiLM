@@ -1,6 +1,6 @@
-"""Stand-in for dva/sound_worker.py in the tests (no speech models needed). It reads the same job file and answers
+"""Stand-in for kimilm/sound_worker.py in the tests (no speech models needed). It reads the same job file and answers
 in the same way, writes real WAV files (a tone per spoken part, its pitch by the speaker), and appends every job
-to the file named by DVA_SOUND_LOG so the tests can read what the engine asked for.
+to the file named by KIMILM_SOUND_LOG so the tests can read what the engine asked for.
 
 Marks: a text containing "unpronounceable" fails the way a voice does that cannot read a text; a recording whose
 name contains "silence" has no speech in it; a recording whose name starts with "says-" holds the words of its
@@ -21,8 +21,8 @@ def say(**data):
 
 def main(argv):
     job = json.loads(Path(argv[0]).read_text(encoding="utf-8"))
-    if os.environ.get("DVA_SOUND_LOG"):
-        with open(os.environ["DVA_SOUND_LOG"], "a", encoding="utf-8") as f:
+    if os.environ.get("KIMILM_SOUND_LOG"):
+        with open(os.environ["KIMILM_SOUND_LOG"], "a", encoding="utf-8") as f:
             f.write(json.dumps(job) + "\n")
     if job["kind"] == "speak":
         rate, pieces, marks, at = 24000, [], [], 0.0

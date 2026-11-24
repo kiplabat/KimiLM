@@ -76,7 +76,7 @@ def main(argv):
     if fmt not in ("mp3", "wav16", "wav24", "wav32"):
         fatal(tag, f"invalid output_format '{fmt}' (use: mp3, wav16, wav24, wav32)")
     import numpy as np
-    from dva.sound import write_audio
+    from kimilm.sound import write_audio
     seconds = float(req.get("duration") or 120)
     t = np.arange(int(48000 * min(seconds, 20))) / 48000
     tone = (0.3 * np.sin(2 * math.pi * 220 * t)).astype("float32")

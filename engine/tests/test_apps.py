@@ -21,8 +21,8 @@ ENGINE = Path(__file__).resolve().parents[1]
 TESTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(ENGINE))
 
-from dva import app_preview, app_share  # noqa: E402
-from dva import apps as apps_mod  # noqa: E402
+from kimilm import app_preview, app_share  # noqa: E402
+from kimilm import apps as apps_mod  # noqa: E402
 from test_engine import free_port, tiny_gguf, wait_job  # noqa: E402
 
 GAME = ("<!doctype html><html><head><title>T</title></head><body><canvas></canvas><script>"
@@ -31,7 +31,7 @@ GAME = ("<!doctype html><html><head><title>T</title></head><body><canvas></canva
 
 @pytest.fixture(scope="module")
 def engine():
-    tmp = Path(tempfile.mkdtemp(prefix="dva-apps-"))
+    tmp = Path(tempfile.mkdtemp(prefix="kimilm-apps-"))
     wrapper = tmp / ("fake-llama-server.cmd" if os.name == "nt" else "fake-llama-server")
     if os.name == "nt":
         wrapper.write_text(f'@"{sys.executable}" "{TESTS / "fake_llama_server.py"}" %*\n')
@@ -40,20 +40,20 @@ def engine():
         wrapper.chmod(0o755)
     port, token = free_port(), "test-token"
     (tmp / "registry").mkdir()
-    env = {**os.environ, "KIMIOS_REGISTRY_URL": str(tmp / "registry"), "DVA_NO_APP_PREVIEW_ON_START": "1", "DVA_TEST_CPU": "6x12", "DVA_TOKEN": token, "DVA_LLAMA_SERVER": str(wrapper),
-           "DVA_SECRETS": "file", "PYTHONPATH": str(ENGINE), "DVA_SYSTEM_PLUGINS": str(tmp / "system-plugins"),
+    env = {**os.environ, "KIMIOS_REGISTRY_URL": str(tmp / "registry"), "KIMILM_NO_APP_PREVIEW_ON_START": "1", "KIMILM_TEST_CPU": "6x12", "KIMILM_TOKEN": token, "KIMILM_LLAMA_SERVER": str(wrapper),
+           "KIMILM_SECRETS": "file", "PYTHONPATH": str(ENGINE), "KIMILM_SYSTEM_PLUGINS": str(tmp / "system-plugins"),
            "HF_HOME": str(tmp / "hf"), "OLLAMA_MODELS": str(tmp / "ollama")}
     for k in [k for k in env if k.lower() in ("http_proxy", "https_proxy", "all_proxy", "no_proxy")]:
         del env[k]
     env.update({"HTTP_PROXY": "http://127.0.0.1:9", "HTTPS_PROXY": "http://127.0.0.1:9", "NO_PROXY": "127.0.0.1,localhost"})
     log = tmp / "engine-output.log"
-    proc = subprocess.Popen([sys.executable, "-m", "dva", "serve", "--port", str(port), "--data-dir", str(tmp / "data")],
+    proc = subprocess.Popen([sys.executable, "-m", "kimilm", "serve", "--port", str(port), "--data-dir", str(tmp / "data")],
                             cwd=str(ENGINE), env=env, stdout=log.open("w"), stderr=subprocess.STDOUT, text=True)
     for _ in range(150):
-        if "DVA_READY" in log.read_text() or proc.poll() is not None:
+        if "KIMILM_READY" in log.read_text() or proc.poll() is not None:
             break
         time.sleep(0.1)
-    assert "DVA_READY" in log.read_text(), log.read_text()[-3000:]
+    assert "KIMILM_READY" in log.read_text(), log.read_text()[-3000:]
     c = httpx.Client(base_url=f"http://127.0.0.1:{port}", headers={"Authorization": f"Bearer {token}"}, timeout=60,
                      trust_env=False)
     tiny_gguf(tmp / "fake-model-Q4_K_M.gguf")

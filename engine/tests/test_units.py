@@ -14,7 +14,7 @@ import pytest
 ENGINE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ENGINE))
 
-from dva import hardware, plugins  # noqa: E402
+from kimilm import hardware, plugins  # noqa: E402
 
 posix_only = pytest.mark.skipif(os.name != "posix", reason="removable-media folders are a Linux idea")
 
@@ -106,7 +106,7 @@ def test_plugins_installed_by_the_system_are_listed_with_their_server(tmp_path, 
     write_plugin(system / "kimios", "kimios", "KimiOS",
                  mcpServers={"kimios": {"command": "/usr/libexec/kimios/kimios-mcp", "args": []}})
     write_plugin(tmp_path / "data" / "plugins" / "mine", "mine", "Mine")
-    monkeypatch.setenv("DVA_SYSTEM_PLUGINS", str(system))
+    monkeypatch.setenv("KIMILM_SYSTEM_PLUGINS", str(system))
     p = plugins.Plugins(FakePaths(tmp_path / "data"), FakeDB(), secrets=None, bus=None)
     found = {x["id"]: x for x in p.all()}
     assert found["kimios"]["source"] == "system" and found["kimios"]["enabled"]
@@ -116,21 +116,21 @@ def test_plugins_installed_by_the_system_are_listed_with_their_server(tmp_path, 
     with pytest.raises(ValueError):
         p.uninstall("kimios")                  # part of the operating system: switch off, not remove
     assert conn[0]["system"] is True
-    from dva import mcp
+    from kimilm import mcp
     connectors = mcp.Connectors.__new__(mcp.Connectors)
     connectors.plugins = p
     assert connectors.system_ids() == ["kimios:kimios"]      # every agent chat gets it (2.24.0)
 
 
 def test_no_system_plugin_folder_is_fine(tmp_path, monkeypatch):
-    monkeypatch.setenv("DVA_SYSTEM_PLUGINS", str(tmp_path / "does-not-exist"))
+    monkeypatch.setenv("KIMILM_SYSTEM_PLUGINS", str(tmp_path / "does-not-exist"))
     p = plugins.Plugins(FakePaths(tmp_path / "data"), FakeDB(), secrets=None, bus=None)
     assert p.all() == []
 
 
 # ---------------------------------------------------------------------------------------------- evaluation
 def test_evaluation_releases_other_models_first_and_all_idle_models_at_the_end(tmp_path):
-    from dva import evals
+    from kimilm import evals
 
     class Runtime:
         def __init__(self):
@@ -177,7 +177,7 @@ def test_evaluation_releases_other_models_first_and_all_idle_models_at_the_end(t
 # ---------------------------------------------------------------------------------------------- Windows memory limit
 def test_engine_memory_limit_is_a_share_of_the_computers_memory():
     import psutil
-    from dva import app_state
+    from kimilm import app_state
 
     class DB:
         def __init__(self, value):
@@ -195,7 +195,7 @@ def test_engine_memory_limit_is_a_share_of_the_computers_memory():
 
 
 def test_contain_does_nothing_outside_windows():
-    from dva import procs
+    from kimilm import procs
     if os.name != "nt":
         assert procs.contain(10 ** 9) is None
 
@@ -228,7 +228,7 @@ class ExploreDB:
 
 def explore_app(tmp_path, monkeypatch, **db_kw):
     import time as _time
-    from dva import explore, hardware
+    from kimilm import explore, hardware
     model_file = tmp_path / "m.gguf"
     model_file.write_text("x")
     models = db_kw.pop("models", [{"id": "qwen", "path": str(model_file), "bench": {}},
@@ -281,7 +281,7 @@ def test_explorer_measures_an_unmeasured_local_model_when_idle(tmp_path, monkeyp
 
 
 def test_explorer_waits_for_quiet(tmp_path, monkeypatch):
-    from dva import hardware
+    from kimilm import hardware
     app, ex = explore_app(tmp_path, monkeypatch, active_jobs=1)
     assert ex.check()[1] == "1 chat or task running"
     app, ex = explore_app(tmp_path, monkeypatch, settings={"explore_when_idle": False})
@@ -296,7 +296,7 @@ def test_explorer_waits_for_quiet(tmp_path, monkeypatch):
 
 
 def test_explorer_skips_measured_and_missing_models(tmp_path, monkeypatch):
-    from dva.db import now
+    from kimilm.db import now
     app, ex = explore_app(tmp_path, monkeypatch, models=[
         {"id": "fresh", "path": str(tmp_path / "m.gguf"), "bench": {"tune": {"at": now()}}},
         {"id": "gone", "path": "/run/media/u/Unplugged/x.gguf", "bench": {}}])
@@ -317,7 +317,7 @@ def test_explorer_stops_when_the_user_starts_something(tmp_path, monkeypatch):
         app.models.tunes[model_id] = {"state": "running"}
         app.db.active_jobs = 1                       # the user starts a chat right away
     app.models.tune = tune
-    from dva import explore
+    from kimilm import explore
     real_sleep = asyncio.sleep
     monkeypatch.setattr(explore.asyncio, "sleep", lambda s: real_sleep(0))
     entry = asyncio.run(ex.explore(app.db.models[0]))
@@ -331,7 +331,7 @@ def _at(day, hour):
 
 
 def test_a_request_made_on_three_weekdays_becomes_a_schedule_suggestion():
-    from dva import suggest
+    from kimilm import suggest
     rows = [{"content": "Summarise the new files in my reports folder", "created": _at(16, 8)},   # Monday
             {"content": "summarise the NEW files in my reports folder please", "created": _at(17, 8)},
             {"content": "Summarise new files in my reports folder (3 of them)", "created": _at(18, 9)},
@@ -346,7 +346,7 @@ def test_a_request_made_on_three_weekdays_becomes_a_schedule_suggestion():
 
 
 def test_the_same_day_twice_is_not_a_habit():
-    from dva import suggest
+    from kimilm import suggest
     rows = [{"content": "Check the server logs for errors", "created": _at(16, 8)},
             {"content": "Check the server logs for errors", "created": _at(16, 15)},
             {"content": "Check the server logs for errors", "created": _at(17, 8)}]
@@ -354,7 +354,7 @@ def test_the_same_day_twice_is_not_a_habit():
 
 
 def test_suggestions_are_off_until_switched_on():
-    from dva import suggest
+    from kimilm import suggest
 
     class DB:
         def setting(self, key, default=None):
@@ -365,7 +365,7 @@ def test_suggestions_are_off_until_switched_on():
 
 def test_age_reads_utc_and_zoned_times():
     from datetime import datetime, timedelta, timezone
-    from dva.explore import age
+    from kimilm.explore import age
     hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
     assert abs(age(hour_ago.isoformat()).total_seconds() - 3600) < 5
     assert abs(age(hour_ago.replace(tzinfo=None).isoformat()).total_seconds() - 3600) < 5      # no zone: UTC
@@ -373,8 +373,8 @@ def test_age_reads_utc_and_zoned_times():
 
 
 def test_explorer_evaluates_and_stops_when_someone_uses_the_computer(tmp_path, monkeypatch):
-    from dva import explore
-    from dva.db import now
+    from kimilm import explore
+    from kimilm.db import now
     app, ex = explore_app(tmp_path, monkeypatch, models=[
         {"id": "qwen", "path": str(tmp_path / "m.gguf"), "bench": {"tune": {"at": now()}}}])
     cancelled = []
@@ -395,7 +395,7 @@ def test_explorer_evaluates_and_stops_when_someone_uses_the_computer(tmp_path, m
 
 
 def test_desktop_idle_time_from_gnome(monkeypatch):
-    from dva import hardware
+    from kimilm import hardware
     if os.name == "nt":
         return
     monkeypatch.setattr(hardware.platform, "system", lambda: "Linux")
@@ -407,7 +407,7 @@ def test_desktop_idle_time_from_gnome(monkeypatch):
 
 # ---------------------------------------------------------------------------------------------- ARM64 Linux (2.25.0)
 def test_arm64_linux_gets_its_own_llama_builds(monkeypatch):
-    from dva import images, runtime
+    from kimilm import images, runtime
     monkeypatch.setattr(runtime.platform, "system", lambda: "Linux")
     monkeypatch.setattr(runtime.platform, "machine", lambda: "aarch64")
     assert runtime.os_key() == "linux-arm64"
@@ -421,8 +421,8 @@ def test_arm64_linux_gets_its_own_llama_builds(monkeypatch):
 
 # ---------------------------------------------------------------------------------------------- 2.26.0
 def test_a_value_that_repeats_the_whole_call_is_unwrapped_or_refused():
-    from dva import toolcheck
-    from dva.tools import Tool
+    from kimilm import toolcheck
+    from kimilm.tools import Tool
     tool = Tool("run_python", "Run Python", {"type": "object", "properties": {"code": {"type": "string"}},
                                               "required": ["code"]}, None, "python")
     tm = {"run_python": tool}
@@ -437,7 +437,7 @@ def test_a_value_that_repeats_the_whole_call_is_unwrapped_or_refused():
 
 
 def test_a_lease_whose_task_ended_does_not_keep_a_model_in_use():
-    from dva.runtime import Server
+    from kimilm.runtime import Server
 
     async def main():
         s = Server({"id": "m"}, {"ctx": 8192}, "k")
@@ -458,7 +458,7 @@ def test_a_lease_whose_task_ended_does_not_keep_a_model_in_use():
 
 
 def test_older_tool_results_are_shortened_to_fit_the_context():
-    from dva.runner import Turn
+    from kimilm.runner import Turn
     msgs = [{"role": "system", "content": "s"}] + [{"role": "tool", "content": "x" * 5000} for _ in range(4)]
     assert Turn.shorten_results(msgs)
     assert [len(m["content"]) < 1000 for m in msgs[1:]] == [True, True, False, False]   # the last two are kept
@@ -466,7 +466,7 @@ def test_older_tool_results_are_shortened_to_fit_the_context():
 
 
 def test_a_run_that_ran_out_of_context_may_load_its_model_larger():
-    from dva.orchestrator import RunFit
+    from kimilm.orchestrator import RunFit
 
     class RT:
         def fit(self, model_id, need, parallel=1, top=None):
@@ -480,9 +480,9 @@ def test_a_run_that_ran_out_of_context_may_load_its_model_larger():
 
 # ---------------------------------------------------------------------------------------------- usage and telemetry (2.27.0)
 def _meter(tmp_path):
-    from dva.cloud import USAGE
-    from dva.db import DB
-    from dva.meter import Meter
+    from kimilm.cloud import USAGE
+    from kimilm.db import DB
+    from kimilm.meter import Meter
     db = DB(tmp_path / "u.db")
     return db, Meter(db, USAGE), USAGE
 
@@ -494,7 +494,7 @@ class _Srv:
 
 def test_usage_counts_calls_by_model_purpose_and_hour(tmp_path):
     import time as _t
-    from dva.meter import purpose
+    from kimilm.meter import purpose
     db, m, usage = _meter(tmp_path)
     db.insert("models", {"id": "qwen-9b", "name": "Qwen 9B"})
     db.insert("chats", {"id": "c1", "title": "Prices", "origin": "user"})
@@ -549,7 +549,7 @@ def Meter_rows(db):
 
 def test_online_calls_are_counted_with_their_time_and_cost(tmp_path):
     import time as _t
-    from dva import cloud
+    from kimilm import cloud
     db, m, usage = _meter(tmp_path)
 
     class Prov:
@@ -566,8 +566,8 @@ def test_online_calls_are_counted_with_their_time_and_cost(tmp_path):
 
 
 def test_the_llm_stream_is_metered_and_shown_as_reading_then_writing(tmp_path):
-    from dva.llm import LLM, LLMTimeout
-    from dva.telemetry import Telemetry
+    from kimilm.llm import LLM, LLMTimeout
+    from kimilm.telemetry import Telemetry
     db, m, usage = _meter(tmp_path)
 
     class RT:
@@ -607,8 +607,8 @@ def test_the_llm_stream_is_metered_and_shown_as_reading_then_writing(tmp_path):
 
 def test_telemetry_samples_keeps_history_marks_and_kimios_readings(tmp_path, monkeypatch):
     import time as _t
-    from dva import telemetry
-    from dva.db import DB
+    from kimilm import telemetry
+    from kimilm.db import DB
     db = DB(tmp_path / "t.db")
     kos = tmp_path / "telemetry.json"
     kos.write_text(json.dumps({"gpus": [{"card": "card0", "util": 37.5}], "power_cpu_w": 9.2, "fan_rpm": 2400,
@@ -647,7 +647,7 @@ def test_telemetry_samples_keeps_history_marks_and_kimios_readings(tmp_path, mon
 
 
 def test_telemetry_minute_averages_keep_peaks():
-    from dva.telemetry import Telemetry
+    from kimilm.telemetry import Telemetry
     rows = [{"t": i, "cpu": v, "gpu": None} for i, v in enumerate([10, 90, 20])]
     agg = Telemetry._aggregate(rows)
     assert agg["cpu"] == 40 and agg["cpu_max"] == 90 and agg["gpu"] is None
@@ -655,8 +655,8 @@ def test_telemetry_minute_averages_keep_peaks():
 
 # ---------------------------------------------------------------------------------------------- 2.28.0
 def test_connector_tools_are_found_by_stem_and_by_their_short_name():
-    from dva.runner import rank_tools, resolve_tool
-    from dva.tools import Tool
+    from kimilm.runner import rank_tools, resolve_tool
+    from kimilm.tools import Tool
     S = {"type": "object", "properties": {}}
     mk = lambda n, d: Tool("mcp__kimios_kimios__" + n, "[KimiOS] " + d, S, None, "connector")  # noqa: E731
     tools = [mk("machine", "This computer's hardware."),
@@ -762,7 +762,7 @@ def _fake_sys(root):
 
 
 def test_usb_devices_are_told_apart_by_what_they_say_about_themselves():
-    from dva.devices import usb_kind
+    from kimilm.devices import usb_kind
     I = lambda *c: [{"class": a, "subclass": b, "protocol": p} for a, b, p in c]  # noqa: E731
     assert usb_kind("18d1", "4ee7", "Pixel 8", I((0xff, 0x42, 0x01)))[0] == "phone"
     assert usb_kind("04e8", "6860", "SAMSUNG_Android", I((0x06, 1, 1)))[0] == "phone"
@@ -776,7 +776,7 @@ def test_usb_devices_are_told_apart_by_what_they_say_about_themselves():
 
 
 def test_linux_devices_are_read_from_sys_with_ports_displays_and_bluetooth_input(tmp_path):
-    from dva.devices import Devices, edid_info
+    from kimilm.devices import Devices, edid_info
     _fake_sys(tmp_path)
     dv = Devices(_fake_app(tmp_path), root=tmp_path)
     found = {d["id"]: d for d in dv._linux()}
@@ -802,7 +802,7 @@ def test_linux_devices_are_read_from_sys_with_ports_displays_and_bluetooth_input
 
 def test_devices_coming_and_going_are_announced_once(tmp_path):
     import shutil as _sh
-    from dva.devices import Devices
+    from kimilm.devices import Devices
     _fake_sys(tmp_path)
     app = _fake_app(tmp_path)
     dv = Devices(app, root=tmp_path)
@@ -829,7 +829,7 @@ def test_devices_coming_and_going_are_announced_once(tmp_path):
 @posix_only
 def test_a_serial_port_is_read_and_written(tmp_path):
     import threading
-    from dva.devices import serial_exchange
+    from kimilm.devices import serial_exchange
     master, slave = os.openpty()
     port = os.ttyname(slave)
 
@@ -848,7 +848,7 @@ def test_a_serial_port_is_read_and_written(tmp_path):
 
 
 def test_programs_install_into_kimilms_toolbox_on_an_image_based_system(tmp_path, monkeypatch):
-    from dva import installer
+    from kimilm import installer
     app = _fake_app(tmp_path)
     calls = []
 
@@ -881,7 +881,7 @@ def test_programs_install_into_kimilms_toolbox_on_an_image_based_system(tmp_path
 
 
 def test_a_program_that_needs_a_password_reads_as_needing_the_user(tmp_path, monkeypatch):
-    from dva import installer, recovery
+    from kimilm import installer, recovery
     app = _fake_app(tmp_path)
 
     async def run(app_, argv, timeout=1800, on_status=None, owner=None, env=None):
@@ -897,7 +897,7 @@ def test_a_program_that_needs_a_password_reads_as_needing_the_user(tmp_path, mon
 
 
 def test_a_missing_program_is_installed_not_asked_about():
-    from dva import recovery
+    from kimilm import recovery
     assert recovery.fast_rule({"class": "missing", "reason": 'Browser "chromium" is not installed. Run `npx '
                                                              '@playwright/mcp install-browser chromium`'}) == "install"
     assert recovery.fast_rule({"class": "approach", "need": "tool", "reason": "bash: nmap: command not found"}) == "install"
@@ -906,7 +906,7 @@ def test_a_missing_program_is_installed_not_asked_about():
 
 
 def test_the_browser_helper_installs_its_browser_when_it_is_missing(tmp_path):
-    from dva.services import Services
+    from kimilm.services import Services
     app = _fake_app(tmp_path, install_programs=True)
     sv = Services(app)
     answers = [(False, 'Error: Browser "chromium" is not installed; expected executable at /x. Run `npx '
@@ -928,8 +928,8 @@ def test_the_browser_helper_installs_its_browser_when_it_is_missing(tmp_path):
 
 def test_auto_approve_is_read_at_every_approval(tmp_path):
     from types import SimpleNamespace
-    from dva.runner import Turn
-    from dva.tools import Tool
+    from kimilm.runner import Turn
+    from kimilm.tools import Tool
     app = _fake_app(tmp_path)
     app.approvals = {}
     app.jobs = SimpleNamespace(set_status=lambda *a, **k: None)
@@ -961,7 +961,7 @@ def test_auto_approve_is_read_at_every_approval(tmp_path):
 
 def test_planners_are_told_that_agents_think_install_and_are_approved():
     from types import SimpleNamespace
-    from dva.orchestrator import crew_facts
+    from kimilm.orchestrator import crew_facts
     turn = SimpleNamespace(db=_Settings(), auto_approve=True)
     text = crew_facts(turn)
     assert "thinks before it acts" in text and "install_program" in text and "approved in advance" in text
@@ -971,8 +971,8 @@ def test_planners_are_told_that_agents_think_install_and_are_approved():
 
 def test_a_chat_reply_that_took_a_while_tells_you_when_it_is_done(tmp_path):
     from types import SimpleNamespace
-    from dva.db import DB
-    from dva.jobs import Jobs
+    from kimilm.db import DB
+    from kimilm.jobs import Jobs
     db = DB(tmp_path / "j.db")
     app = SimpleNamespace(db=db, bus=_Bus(), log=lambda *a: None)
     jobs = Jobs(app)
@@ -995,8 +995,8 @@ def test_a_chat_reply_that_took_a_while_tells_you_when_it_is_done(tmp_path):
 # ---------------------------------------------------------------------------------------------- 2.30.0
 def test_a_physical_tool_asks_a_person_for_a_real_device_and_not_for_a_simulated_one(tmp_path):
     from types import SimpleNamespace
-    from dva.runner import Turn
-    from dva.tools import Tool
+    from kimilm.runner import Turn
+    from kimilm.tools import Tool
     app = _fake_app(tmp_path)
     app.approvals = {}
     app.jobs = SimpleNamespace(set_status=lambda *a, **k: None)
@@ -1019,8 +1019,8 @@ def test_a_physical_tool_asks_a_person_for_a_real_device_and_not_for_a_simulated
 def test_kimios_bench_devices_join_the_device_list(tmp_path, monkeypatch):
     import socketserver
     import threading
-    from dva import bench
-    from dva.devices import Devices
+    from kimilm import bench
+    from kimilm.devices import Devices
     sock = tmp_path / "envelope.sock"
     rows = [{"id": "sim-fridge", "model": "simulated two-compartment refrigerator", "kind": "appliance",
              "simulated": True, "driver": 2, "mode": "custom"},
@@ -1055,7 +1055,7 @@ def test_kimios_bench_devices_join_the_device_list(tmp_path, monkeypatch):
 
 # ---------------------------------------------------------------------------------------------- 2.31.0
 def test_plan_width_counts_the_steps_that_can_run_together():
-    from dva.orchestrator import plan_width
+    from kimilm.orchestrator import plan_width
     T = lambda deps, model=None, status="waiting": {"depends_on": deps, "model": model, "status": status}  # noqa: E731
     two_topics = {"a": T([]), "b": T([]), "c": T(["a", "b"])}
     assert plan_width(two_topics) == 2
@@ -1071,7 +1071,7 @@ def test_plan_width_counts_the_steps_that_can_run_together():
 
 def test_reply_slots_are_as_many_as_memory_holds():
     from types import SimpleNamespace
-    from dva.runtime import Runtime
+    from kimilm.runtime import Runtime
     GB = 2**30
     fake = SimpleNamespace(fit=lambda m, tokens, n, top=None: {"ctx": 16384, "parallel": n},
                            memory=lambda m, over: {"free": 6 * GB, "reclaimable": 0,
@@ -1085,7 +1085,7 @@ def test_reply_slots_are_as_many_as_memory_holds():
 
 def test_auto_order_starts_independent_steps_together_on_one_local_model(tmp_path):
     from types import SimpleNamespace
-    from dva.orchestrator import Orchestra, RunFit
+    from kimilm.orchestrator import Orchestra, RunFit
     o = Orchestra.__new__(Orchestra)
     o.db = _Settings(max_parallel_agents=4)
     o.order, o.sequence, o.max_parallel = "auto", False, 4
@@ -1115,8 +1115,8 @@ def _eval_app(rows):
 
 def test_skill_profiles_count_the_newest_result_of_each_task():
     """2.32.0: Check this setup's tasks are tagged with skills; a model's profile is the newest result per task."""
-    from dva import abilities
-    from dva.evals import TASKS
+    from kimilm import abilities
+    from kimilm.evals import TASKS
     assert {s for t in TASKS for s in t["skills"]} == set(abilities.SKILL_IDS)
     assert all(sum(1 for t in TASKS if k in t["skills"]) >= 1 for k in abilities.SKILL_IDS)
     rows = [  # newest first, as the query orders them
@@ -1154,7 +1154,7 @@ def test_skill_profiles_count_the_newest_result_of_each_task():
 
 def test_planned_steps_go_to_the_model_that_measured_best_at_their_kind_of_work():
     from types import SimpleNamespace
-    from dva.orchestrator import Orchestra, plan_schema
+    from kimilm.orchestrator import Orchestra, plan_schema
     o = Orchestra.__new__(Orchestra)
     o.turn = SimpleNamespace(model_id="small")
     o.logs = []
@@ -1183,9 +1183,9 @@ def test_a_snapshot_is_taken_once_before_the_first_change_of_an_unattended_reply
     import asyncio
     import sys
     from types import SimpleNamespace
-    from dva import undo
-    from dva.runner import Turn
-    from dva.tools import Tool
+    from kimilm import undo
+    from kimilm.runner import Turn
+    from kimilm.tools import Tool
     log = tmp_path / "calls.txt"
     cli = tmp_path / "kimios-snapshot"
     cli.write_text(f"#!{sys.executable}\nimport json, sys\nopen({str(log)!r}, 'a').write(' '.join(sys.argv[1:]) + "
@@ -1252,7 +1252,7 @@ def _fake_ddc(calls):
 
 
 def test_the_monitor_says_what_it_offers_and_takes_its_own_names(monkeypatch):
-    from dva import display
+    from kimilm import display
     feats = display.parse_capabilities(CAPS)
     assert feats["60"]["values"] == {"11": "HDMI-1", "12": "HDMI-2"}
     assert set(feats["D6"]["values"]) == {"01", "04"}               # listed on one line, named from MCCS
@@ -1294,7 +1294,7 @@ MUTTER_STATE = {"type": "ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv}
 
 
 def test_gnome_screens_are_read_and_changed_as_gnome_wants_them():
-    from dva import display
+    from kimilm import display
     st = display.parse_mutter(MUTTER_STATE)
     hdmi = display.find_screen(st, "card1-HDMI-A-1")                 # the kernel's name finds GNOME's
     assert hdmi["name"] == "HDMI-1" and hdmi["mode"] == "1920x1080@60" and hdmi["position"] == {"x": 1536, "y": 0}
@@ -1322,7 +1322,7 @@ def test_gnome_screens_are_read_and_changed_as_gnome_wants_them():
 
 
 def test_wlroots_screens_are_read_with_wlr_randr():
-    from dva import display
+    from kimilm import display
     st = {"outputs": display.parse_wlr_randr(json.dumps([
         {"name": "HDMI-A-1", "description": "HP M27fw", "enabled": True, "scale": 1.0, "transform": "normal",
          "position": {"x": 0, "y": 0}, "modes": [{"width": 1920, "height": 1080, "refresh": 60.0, "current": True,
@@ -1334,10 +1334,47 @@ def test_wlroots_screens_are_read_with_wlr_randr():
 
 
 def test_an_external_display_offers_its_own_settings_and_a_built_in_one_only_the_layout(tmp_path):
-    from dva.devices import Devices
+    from kimilm.devices import Devices
     dev = Devices.__new__(Devices)
     ext = [a["name"] for a in dev.actions({"kind": "display", "internal": False, "name": "HP"})]
     built = [a["name"] for a in dev.actions({"kind": "display", "internal": True, "name": "Built-in screen"})]
     if os.name == "posix" and sys.platform != "darwin":
         assert {"monitor_settings", "monitor_set", "screen_layout", "screen_set"} <= set(ext)
         assert "monitor_set" not in built and "screen_set" in built
+
+
+# ---------------------------------------------------------------------------------------------- 2.37.0: names
+def test_settings_given_by_their_old_names_still_work():
+    import subprocess
+    code = ("import json, os, kimilm; print(json.dumps({k: os.environ.get(k) for k in "
+            "('KIMILM_SD_CLI', 'KIMILM_UI_DIR', 'KIMILM_TOKEN', 'DVA_TOKEN')}))")
+    env = {**os.environ, "DVA_SD_CLI": "/opt/sd", "DVA_UI_DIR": "/old", "KIMILM_UI_DIR": "/new", "DVA_TOKEN": "t"}
+    env.pop("KIMILM_SD_CLI", None)
+    env.pop("KIMILM_TOKEN", None)
+    out = subprocess.run([sys.executable, "-c", code], cwd=str(ENGINE), env=env, capture_output=True, text=True)
+    seen = json.loads(out.stdout)
+    assert seen["KIMILM_SD_CLI"] == "/opt/sd", "an old name is read as the new one"
+    assert seen["KIMILM_UI_DIR"] == "/new", "the new name wins when both are given"
+    assert seen["KIMILM_TOKEN"] == "t" and seen["DVA_TOKEN"] is None, "the old token is not passed on"
+    from kimilm import with_old_names
+    assert with_old_names({"KIMILM_PLUGIN_DATA": "/d", "KIMILM_TOKEN": "x", "PATH": "/bin"}) == {
+        "KIMILM_PLUGIN_DATA": "/d", "DVA_PLUGIN_DATA": "/d", "KIMILM_TOKEN": "x", "PATH": "/bin"}
+
+
+def test_queued_messages_are_released_after_a_restart(tmp_path, monkeypatch):
+    import sqlite3
+    monkeypatch.setenv("KIMILM_SECRETS", "file")
+    from kimilm.app_state import App
+    data = tmp_path / "KimiLM"
+    data.mkdir()
+    con = sqlite3.connect(str(data / "kimilm.sqlite3"))
+    con.executescript("CREATE TABLE messages (id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, role TEXT NOT NULL, "
+                      "content TEXT DEFAULT '', meta_json TEXT DEFAULT '{}', created TEXT);")
+    con.execute("INSERT INTO messages VALUES ('u1', 'c1', 'user', 'later please', ?, '2026-11-15T08:00:00.000+00:00')",
+                (json.dumps({"attachments": [], "pending": "queue"}),))
+    con.commit()
+    con.close()
+    app = App(str(data))
+    queued = app.db.get("messages", "u1")["meta"]
+    assert queued.get("not_sent") == "restart" and "pending" not in queued
+    app.db.conn.close()

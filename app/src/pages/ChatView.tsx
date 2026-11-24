@@ -106,11 +106,12 @@ function PlanView({ plan, current }: any) {
 
 function PipelineResult({ step }: any) {
   const r = step.result || {};
+  const link = r.link || r.dataset?.edit_url;          // a pipeline's `link` (older pipelines: dataset.edit_url)
   return (
     <div className="pipeline-result">
       {r.cover && <img src={fileUrl(r.cover)} alt="cover" />}
       <div className="row gap-s wrap">
-        {r.dataset?.edit_url && <Button small kind="primary" onClick={() => desktop ? desktop.openExternal(r.dataset.edit_url) : window.open(r.dataset.edit_url)}>Open on Datavera</Button>}
+        {link && <Button small kind="primary" onClick={() => desktop ? desktop.openExternal(link) : window.open(link)}>{r.link_label || "Open the result"}</Button>}
         {r.run_folder && desktop && <Button small onClick={() => desktop.openPath(r.run_folder)}>Open run folder</Button>}
         <Badge kind={step.code === 0 ? "ok" : "warn"}>exit {step.code}</Badge>
       </div>
