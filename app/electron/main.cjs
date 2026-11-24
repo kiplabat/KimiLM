@@ -418,7 +418,7 @@ ipcMain.handle("dva:set-zoom", (_e, z) => setZoom(z));
 ipcMain.handle("dva:step-zoom", (_e, dir) => stepZoom(Number(dir) || 0));
 
 // ------------------------------------------------------------------ an app tried off screen (2.35.0)
-// `kimilm --kimilm-preview=<url> --kimilm-preview-out=<file>`: the engine opens an app's preview page
+// `kimilm --kimilm-preview=<url> --kimilm-preview-out=<file> --kimilm-preview-shot=<png>`: the engine opens an app's preview page
 // (engine/dva/app_preview.py) when the computer has no Chrome-like browser to run headless. This start is separate
 // from the running KimiLM: its own temporary profile, no single-instance lock, no engine, no window shown.
 function argValue(prefix) {
@@ -433,8 +433,10 @@ function runPreview(url, out) {
   app.commandLine.appendSwitch("enable-unsafe-swiftshader");
   app.whenReady().then(() => {
     if (!/^http:\/\/127\.0\.0\.1:\d+\/appframe\/[\w.-]+\/_preview\.html$/.test(url)) return app.exit(2);
-    const w = new BrowserWindow({ show: false, width: 1100, height: 800,
-      webPreferences: { offscreen: true, sandbox: true, contextIsolation: true, nodeIntegration: false } });
+    // shown, but off screen: an off-screen window paints nothing on the screen, and a hidden page would have its
+    // frames and the app's timers held back
+    const w = new BrowserWindow({ show: true, width: 1024, height: 700, useContentSize: true, frame: false, skipTaskbar: true, focusable: false,
+      webPreferences: { offscreen: true, sandbox: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false } });
     w.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
     let done = false;
     const finish = async () => {
@@ -443,9 +445,14 @@ function runPreview(url, out) {
       let text = "";
       try { text = await w.webContents.executeJavaScript('document.getElementById("kimi-preview-result").textContent'); } catch { /* none */ }
       try { if (out) fs.writeFileSync(out, text || ""); } catch { /* the engine reports no result */ }
+      const shot = argValue("--kimilm-preview-shot=");           // 2.36.0: the app's picture
+      try { if (shot) fs.writeFileSync(shot, (await w.webContents.capturePage()).toPNG()); } catch { /* no picture */ }
       app.exit(0);
     };
     w.webContents.on("page-title-updated", (_e, title) => { if (title === "KIMI_PREVIEW_DONE") finish(); });
+    w.webContents.on("console-message", (e, level, message) => {            // to stderr: the engine shows its end
+      process.stderr.write(`console: ${(e && e.message) || message}\n`);
+    });
     setTimeout(finish, 20000);
     w.loadURL(url);
   });

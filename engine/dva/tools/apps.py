@@ -26,6 +26,10 @@ async def save_app(ctx, notes=""):
     except Exception as exc:                       # noqa: BLE001 — never lose a save over a preview
         tried = {"skipped": str(exc)[:200]}
     lines.append(ctx.app.apps.preview_text(tried))
+    if tried.get("shot"):                          # 2.36.0: the person sees the picture in the chat too
+        ctx.notes.setdefault("media", []).append({"id": f"app-{m['id']}-v{got['version']}", "kind": "image",
+                                                  "path": tried["shot"], "name": f"{m['name']} v{got['version']}",
+                                                  "prompt": "", "model": "", "source": "local", "params": {}})
     return "\n".join(lines)
 
 

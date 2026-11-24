@@ -1,5 +1,6 @@
 """The engine's services wired together (one instance per running app)."""
 import asyncio
+import os
 import time
 from datetime import datetime
 
@@ -248,6 +249,8 @@ class App:
         self._bg.append(asyncio.create_task(self.devices._watch()))     # 2.29.0: devices coming and going
         try:
             await asyncio.to_thread(self.apps.seed)                     # 2.34.0: the example games, once
+            if not os.environ.get("DVA_NO_APP_PREVIEW_ON_START"):     # 2.36.0: their pictures, a little later
+                self._bg.append(asyncio.create_task(self.apps.preview_examples()))
         except Exception as exc:                                        # noqa: BLE001 — never stops the start
             self.log(f"apps: the examples could not be added: {exc}")
         self.log(f"engine started; data {self.paths.data}; secrets backend {self.secrets.backend}")

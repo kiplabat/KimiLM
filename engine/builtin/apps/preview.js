@@ -1,5 +1,5 @@
 /* 2.35.0: the host side of an app's preview (see preview.html). Stand-in answers for every kimi call, a poke at
-   1.5 s (the app's kimi.js presses keys and clicks), and the result at 4.5 s:
+   1.5 s (the app's kimi.js presses keys and clicks), and the result once the app has reported (at most 9 s):
    {hello, errors: [..], calls: {method: n}, report: {frames, frames_after, canvases, text, buttons, changed}} */
 (function () {
   "use strict";
@@ -18,7 +18,7 @@
     switch (m.method) {
       case "hello": out.hello = true; return answer(m, { app: P.app || {}, device: P.device || null });
       case "error": if (out.errors.length < 20) out.errors.push(a); return;
-      case "preview.report": out.report = a; return;
+      case "preview.report": out.report = a; out.finish(); return;
       case "notify": return answer(m, true);
       case "storage.get": return answer(m, Object.prototype.hasOwnProperty.call(store, a.key) ? store[a.key] : null);
       case "storage.set": store[a.key] = a.value; return answer(m, { ok: true });
@@ -37,9 +37,18 @@
       default: return answer(m, null, "kimi has no " + m.method);
     }
   });
+  // Poke at 1.5 s; send the result when the app has reported (its timers may run late in a hidden browser), or at 9 s
+  let sent = false;
+  const finish = () => {
+    if (sent) return;
+    sent = true;
+    const text = JSON.stringify(out);
+    document.getElementById("kimi-preview-result").textContent = text;
+    // 2.36.0: to the engine, which waits for it; the browser's screenshot follows (./_wait answers after this)
+    fetch("./_result", { method: "POST", headers: { "Content-Type": "application/json" }, body: text })
+      .catch(() => {}).finally(() => { document.title = "KIMI_PREVIEW_DONE"; });
+  };
+  out.finish = () => setTimeout(finish, 250);
   setTimeout(() => frame.contentWindow && frame.contentWindow.postMessage({ kimi: 1, event: "preview" }, "*"), 1500);
-  setTimeout(() => {
-    document.getElementById("kimi-preview-result").textContent = JSON.stringify(out);
-    document.title = "KIMI_PREVIEW_DONE";
-  }, 4500);
+  setTimeout(finish, 9000);
 })();

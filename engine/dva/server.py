@@ -427,17 +427,34 @@ def create_app(data_dir=None, resources_dir=None, token=None):
     async def apps_install(app_id: str):
         return await A().apps.install(app_id)
 
+    @api.post("/appframe/{key}/_result")
+    async def app_frame_result(key: str, request: Request):
+        """2.36.0: what a preview page saw (accepted only while that preview runs; the key is the app's own)."""
+        raw = await request.body()
+        if len(raw) > 200_000:
+            return JSONResponse({"error": "too large"}, 413)
+        try:
+            return A().apps.preview_result(key, json.loads(raw or b"{}"))
+        except (KeyError, ValueError):
+            return JSONResponse({"error": "not found"}, 404)
+
     @api.get("/appframe/{key}/{path:path}")
     async def app_frame(key: str, path: str, request: Request):
         """An app's files, for its sandboxed frame (no token: the key in the address is the app's and this start's
         alone). index.html gets KimiLM's part first; every answer carries the frame's own policy."""
         a = A()
+        if path == "_result":         # 2.36.0: a preview page's answer comes back by POST (see app_frame_post)
+            return JSONResponse({"error": "not found"}, 404)
         if path == "_wait":           # 2.35.0: holds a preview page's load until its result is written
             try:
                 a.apps.frame_file(key, "_preview.js")
             except KeyError:
                 return JSONResponse({"error": "not found"}, 404)
-            await asyncio.sleep(5.5)
+            for _ in range(100):      # 2.36.0: until the page has sent its result (then it is pictured), at most 10 s
+                if a.apps.preview_results.get(key) is not None:
+                    break
+                await asyncio.sleep(0.1)
+            await asyncio.sleep(0.4)
             return Response(content=b"GIF89a\x01\x00\x01\x00\x00\x00\x00;", media_type="image/gif",
                             headers={"Cache-Control": "no-store", "Access-Control-Allow-Origin": "*"})
         try:

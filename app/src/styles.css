@@ -727,3 +727,7 @@ a.btn { text-decoration: none; color: var(--text); }
 .app-tried.ok { color: var(--ok, #2f8a5b); background: rgba(70, 163, 123, .12); }
 .app-tried.bad { color: var(--danger); background: rgba(217, 65, 43, .1); }
 .app-ask.share { background: rgba(78, 141, 224, .1); border-color: rgba(78, 141, 224, .4); }
+/* 2.36.0: an app's picture on its tile */
+.app-tile.with-shot { flex-direction: column; align-items: stretch; padding: 0 0 10px; overflow: hidden; gap: 8px; }
+.app-tile.with-shot > .row { padding: 0 10px; }
+.app-shot { width: 100%; aspect-ratio: 1024 / 700; object-fit: cover; display: block; background: #101318; border-bottom: 1px solid var(--line); }
