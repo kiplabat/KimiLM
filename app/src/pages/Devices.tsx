@@ -167,12 +167,12 @@ function goalPrompt(id: string, ds: any, goal: string) {
 
 Work through KimiOS's bench tools, in order, and do not stop to ask me:
 1. bench(device="${id}"): read its datasheet (sensors, outputs and their hard limits, allowed set points, its own controller); then bench(device="${id}", send="HELP") for its commands.
-2. If it has no driver: write a manifest {read: [{command, pattern with one (?P<sensor>...) group per datasheet sensor}], write: {output: {command with {value}, ok}}}, then driver(action="test") until every check passes, then driver(action="promote").
+2. If it has no driver: driver(device="${id}", action="find") first (KimiOS 0.14: drivers others shared for this model); if one fits, driver(action="get", entry=…) tests it here, and promote it only if it passed. Otherwise write a manifest {read: [{command, pattern with one (?P<sensor>...) group per datasheet sensor}], write: {output: {command with {value}, ok}}}, then driver(action="test") until every check passes, then driver(action="promote").
 3. bench_experiment: a step on each output that matters (start from a steady state; long enough to see the response, e.g. 1–2 hours of device time), then control_identify on its CSV for each sensor that output moves.
-4. Choose the controller: on/off with a band for on/off outputs, PI (control_tune) for levels; compare bands or gains with control_simulate (time in band, starts per hour within the datasheet's limit).
+4. Choose the controller: controller(device="${id}", action="find") shows controllers others shared for this model, with their results; get one to check it against this datasheet and compare it with your own. On/off with a band for on/off outputs, PI (control_tune) for levels; compare bands or gains with control_simulate (time in band, starts per hour within the datasheet's limit).
 5. controller(action="check"), fix what it says, then controller(action="start").
 6. Watch with bench(device="${id}") until the goal has held for at least two hours of device time; if the guard holds an output back or a reading drifts, adjust and start again.
-Finish with: the controller you started, how well it holds the goal (mean and spread of each reading, starts per hour), and what the guard did.`;
+Finish with: the controller you started, how well it holds the goal (mean and spread of each reading, starts per hour), and what the guard did. If a driver or controller you wrote works, prepare it for sharing with action="share" (for the controller, give its results) and give me the link: nothing is sent unless I propose it.`;
 }
 
 function BenchPanel({ device }: { device: any }) {
