@@ -218,6 +218,7 @@ class Apps:
         self.secret = secrets.token_bytes(24)       # frame addresses change at each start
         self.asking = {}                            # app id -> lock: one question to a model at a time
         self.preview_data = {}                      # frame key -> what the preview page answers with (2.35.0)
+        self.preview_results = {}                   # frame key -> what the preview page sent back (2.36.0)
         self.previewing = asyncio.Lock()            # one preview at a time: a headless browser is not small
 
     # ---------------------------------------------------------------- the store
@@ -280,6 +281,8 @@ class Apps:
         out["versions"] = len(m.get("versions") or [])
         out["version"] = cur
         out["ready"] = cur is not None
+        shot = ((cur or {}).get("preview") or {}).get("shot")
+        out["shot"] = shot if shot and Path(shot).is_file() else None       # 2.36.0: its picture when tried
         return out
 
     def list(self, kind=None, device=None):
@@ -413,6 +416,7 @@ class Apps:
         if m.get("current") == n:
             raise AppError("This is the version in use: use another one first (or uninstall the app)")
         shutil.rmtree(self._dir(app_id) / f"v{n}", ignore_errors=True)
+        (self._dir(app_id) / "shots" / f"v{n}.png").unlink(missing_ok=True)
         m["versions"] = [v for v in m["versions"] if v["n"] != n]
         return self._save(m)
 
@@ -489,6 +493,13 @@ class Apps:
                 "frame-src 'none'; object-src 'none'; form-action 'none'; base-uri 'self'")
 
     # ---------------------------------------------------------------- trying it before the person does (2.35.0)
+    def preview_result(self, key, data):
+        """What a preview page sent back (only while that preview runs)."""
+        if key not in self.preview_data:
+            raise KeyError(key)
+        self.preview_results[key] = data
+        return {"ok": True}
+
     def preview_page(self, key):
         """The preview page (builtin/apps/preview.html) with the stand-in answers for this app filled in."""
         data = self.preview_data.get(key) or {}
@@ -533,23 +544,46 @@ class Apps:
         if not port:
             return {"skipped": "the engine's address is not known"}
         key = self.frame_key(app_id, n)
+        shot = self._dir(app_id) / "shots" / f"v{n}.png"          # 2.36.0: its picture, outside the app's files
+        shot.parent.mkdir(parents=True, exist_ok=True)
+        shot.unlink(missing_ok=True)
         async with self.previewing:
             self.preview_data[key] = await self._preview_answers(m)
+            self.preview_results.pop(key, None)
             try:
-                result, how = await app_preview.run(f"http://127.0.0.1:{port}/appframe/{key}/_preview.html")
+                result, how = await app_preview.run(f"http://127.0.0.1:{port}/appframe/{key}/_preview.html", shot,
+                                                    lambda: self.preview_results.get(key))
             finally:
                 self.preview_data.pop(key, None)
+                self.preview_results.pop(key, None)
         if result is None:
             got = {"skipped": how, "at": now()}
         else:
             problems, notes = app_preview.summary(result, m["kind"])
             got = {"ok": not problems, "problems": problems, "notes": notes, "how": how, "at": now()}
+        if shot.is_file() and shot.stat().st_size > 0:
+            got["shot"] = str(shot)
         m = self.manifest(app_id)
         for v in m.get("versions") or []:
             if v["n"] == n:
                 v["preview"] = got
         self._save(m)
         return got
+
+    async def preview_examples(self, delay=45):
+        """Once after a start: try the examples that have never been tried, so their tiles have pictures. Late and
+        one at a time, so the start itself is not slowed down."""
+        await asyncio.sleep(delay)
+        for app_id in self._ids():
+            try:
+                m = self.manifest(app_id)
+                cur = next((v for v in m.get("versions") or [] if v["n"] == m.get("current")), None)
+                if m.get("source") == "example" and cur and not cur.get("preview"):
+                    got = await self.preview(app_id, cur["n"])
+                    if got.get("skipped"):
+                        return                     # no browser here, or switched off: do not try the others
+            except Exception as exc:               # noqa: BLE001 — pictures are a nicety
+                self.app.log(f"apps: trying the example {app_id}: {exc}")
 
     @staticmethod
     def preview_text(got):
@@ -566,6 +600,9 @@ class Apps:
             lines.append("To fix (then save again):\n" + "\n".join(f"- {p}" for p in got["problems"]))
         else:
             lines.append("- no problems seen.")
+        if got.get("shot"):
+            lines.append(f"A picture of it after the keys and the click: {got['shot']} (look at it with look_at_image "
+                         "if you can see pictures: is it what was asked, readable, not empty or cut off?)")
         return "\n".join(lines)
 
     # ---------------------------------------------------------------- the app's own store

@@ -1,7 +1,7 @@
 {
   "name": "kimilm",
   "productName": "KimiLM",
-  "version": "2.35.0",
+  "version": "2.36.0",
   "description": "Local AI agents on your own computer: chat, projects, memory, skills, plugins, harnesses and scheduled tasks. Models run on your machine.",
   "author": "Kiplabat Tarus",
   "license": "MIT",

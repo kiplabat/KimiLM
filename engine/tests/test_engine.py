@@ -68,7 +68,7 @@ def engine():
     shutil.copytree(TESTS / "plugins" / "datavera", tmp / "data" / "plugins" / "datavera")
     port = free_port()
     token = "test-token"
-    env = {**os.environ, "DVA_TEST_CPU": "6x12", "DVA_TOKEN": token, "DVA_LLAMA_SERVER": str(wrapper), "DVA_SECRETS": "file",
+    env = {**os.environ, "DVA_NO_APP_PREVIEW_ON_START": "1", "DVA_TEST_CPU": "6x12", "DVA_TOKEN": token, "DVA_LLAMA_SERVER": str(wrapper), "DVA_SECRETS": "file",
            "DVA_SD_CLI": str(painter), "DVA_SOUND_WORKER": str(TESTS / "fake_sound_worker.py"),
            "DVA_SOUND_LIBRARY": "2.0.1", "DVA_SOUND_LOG": str(tmp / "sound-jobs.log"),
            "PYTHONPATH": str(ENGINE), "OLLAMA_MODELS": str(tmp / "ollama"), "HF_HOME": str(tmp / "hf"),

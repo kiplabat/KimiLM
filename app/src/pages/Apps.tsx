@@ -2,7 +2,7 @@
 // or a web address, add the examples, open one here or in its own window (or from the computer's apps menu).
 import React, { useEffect, useRef, useState } from "react";
 import { Download, Gamepad2, Globe, LayoutGrid, Library, Plus, SlidersHorizontal, Upload } from "lucide-react";
-import { api, enc } from "../api";
+import { api, enc, fileUrl } from "../api";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, Empty, PageHeader, Spinner, Tabs } from "../components/ui";
 import AppRunner, { appIcon, kindLabel } from "../components/AppRunner";
@@ -16,6 +16,20 @@ export function useApps(kind = "", device = "") {
 }
 
 export function AppTile({ app, onOpen }: { app: any; onOpen: () => void }) {
+  // 2.36.0: the picture taken when the version was tried, when there is one
+  if (app.shot) return (
+    <button className="app-tile with-shot" onClick={onOpen} title={app.about || app.name}>
+      <img className="app-shot" src={`${fileUrl(app.shot)}&v=${encodeURIComponent(app.version?.preview?.at || "")}`} alt="" loading="lazy" />
+      <span className="row gap-s" style={{ minWidth: 0, width: "100%" }}>
+        {appIcon(app, 32)}
+        <span className="stack-xs" style={{ minWidth: 0, alignItems: "flex-start" }}>
+          <b className="ellipsis" style={{ maxWidth: "100%" }}>{app.name}</b>
+          <span className="muted small ellipsis" style={{ maxWidth: "100%" }}>{kindLabel(app)}{app.device?.name ? ` · ${app.device.name}` : ""} · v{app.current}
+            {app.building ? " · building" : ""}</span>
+        </span>
+      </span>
+    </button>
+  );
   return (
     <button className="app-tile" onClick={onOpen} title={app.about || app.name}>
       {appIcon(app, 52)}

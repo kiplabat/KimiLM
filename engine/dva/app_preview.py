@@ -1,17 +1,16 @@
 """Trying an app before the person sees it (2.35.0).
 
-When an app is saved, it is opened for a few seconds in a headless browser, in the same sandbox as in the window,
+When an app is saved, it is opened for a few seconds in a headless browser (and pictured: 2.36.0), in the same sandbox as in the window,
 under engine/builtin/apps/preview.html: every kimi call gets a stand-in answer (nothing reaches a device or a
 model), a few keys are pressed and the middle is clicked, and the page writes what happened: errors, whether its
 animation loop ran, what it shows, whether it reacted. The builder gets that as text and fixes what it shows.
 
 The browser: Microsoft Edge or Google Chrome on Windows and macOS, a Chrome-like browser on Linux (or the one
-Playwright downloaded for the browser tools), run with --headless and --dump-dom; otherwise KimiLM's own desktop
+Playwright downloaded for the browser tools), run with --headless and --screenshot; otherwise KimiLM's own desktop
 app with --kimilm-preview (electron/main.cjs). Without either, apps are saved without a preview, and it says so."""
 from __future__ import annotations
 
 import asyncio
-import html
 import json
 import os
 import platform
@@ -21,7 +20,6 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-RESULT = re.compile(r'<pre id="kimi-preview-result">(.*?)</pre>', re.S)
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -86,39 +84,39 @@ async def _run(argv, timeout):
     return out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
 
 
-async def run(url, timeout=60):
-    """Open the preview page; returns (result dict or None, how it was tried or why it could not be)."""
+async def run(url, shot, posted, timeout=60):
+    """Open the preview page and take its picture (`shot`, a .png). `posted()` gives the result the page sent to
+    the engine (./_result). Returns (result dict or None, how it was tried or why it could not be)."""
     browser = find_browser()
+    root = platform.system() == "Linux" and hasattr(os, "geteuid") and os.geteuid() == 0
     with tempfile.TemporaryDirectory(prefix="kimi-preview-") as tmp:
         if browser:
+            how = f"headless {Path(browser).stem}"
             argv = [browser, "--headless=new", "--no-first-run", "--no-default-browser-check", "--mute-audio",
                     f"--user-data-dir={tmp}", "--use-angle=swiftshader", "--enable-unsafe-swiftshader",
-                    "--window-size=1100,800", "--autoplay-policy=no-user-gesture-required", "--dump-dom", url]
-            if platform.system() == "Linux" and hasattr(os, "geteuid") and os.geteuid() == 0:
+                    "--window-size=1024,700", "--hide-scrollbars", "--autoplay-policy=no-user-gesture-required",
+                    f"--screenshot={shot}", url]
+            if root:
                 argv.insert(1, "--no-sandbox")
-            out, err = await _run(argv, timeout)
-            if out is None:
-                return None, err
-            m = RESULT.search(out)
-            if m and m.group(1).strip():
-                try:
-                    return json.loads(html.unescape(m.group(1))), f"headless {Path(browser).stem}"
-                except ValueError:
-                    pass
-            return None, f"the browser gave no result ({(err or '').strip()[-200:] or 'nothing printed'})"
-        shell = electron()
-        if shell:
-            result = Path(tmp) / "result.json"
-            root = platform.system() == "Linux" and hasattr(os, "geteuid") and os.geteuid() == 0
-            out, err = await _run([*shell, *(["--no-sandbox"] if root else []), f"--kimilm-preview={url}",
-                                   f"--kimilm-preview-out={result}"], timeout)
-            if out is None:
-                return None, err
+        elif electron():
+            how = "KimiLM off screen"
+            out = Path(tmp) / "result.json"
+            argv = [*electron(), *(["--no-sandbox"] if root else []), f"--kimilm-preview={url}",
+                    f"--kimilm-preview-out={out}", f"--kimilm-preview-shot={shot}"]
+        else:
+            return None, "no browser to try it in (Edge, Chrome or Chromium)"
+        stdout, err = await _run(argv, timeout)
+        result = posted()
+        if result is None and not browser:
             try:
-                return json.loads(result.read_text(encoding="utf-8")), "KimiLM off screen"
+                result = json.loads((Path(tmp) / "result.json").read_text(encoding="utf-8"))
             except (OSError, ValueError):
-                return None, f"KimiLM gave no result ({(err or '').strip()[-200:] or 'nothing printed'})"
-        return None, "no browser to try it in (Edge, Chrome or Chromium)"
+                result = None
+        if result is None:
+            if stdout is None:
+                return None, err
+            return None, f"{how} gave no result ({(err or '').strip()[-200:] or 'nothing printed'})"
+        return result, how
 
 
 def summary(result, kind):

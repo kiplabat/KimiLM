@@ -40,7 +40,7 @@ def engine():
         wrapper.chmod(0o755)
     port, token = free_port(), "test-token"
     (tmp / "registry").mkdir()
-    env = {**os.environ, "KIMIOS_REGISTRY_URL": str(tmp / "registry"), "DVA_TEST_CPU": "6x12", "DVA_TOKEN": token, "DVA_LLAMA_SERVER": str(wrapper),
+    env = {**os.environ, "KIMIOS_REGISTRY_URL": str(tmp / "registry"), "DVA_NO_APP_PREVIEW_ON_START": "1", "DVA_TEST_CPU": "6x12", "DVA_TOKEN": token, "DVA_LLAMA_SERVER": str(wrapper),
            "DVA_SECRETS": "file", "PYTHONPATH": str(ENGINE), "DVA_SYSTEM_PLUGINS": str(tmp / "system-plugins"),
            "HF_HOME": str(tmp / "hf"), "OLLAMA_MODELS": str(tmp / "ollama")}
     for k in [k for k in env if k.lower() in ("http_proxy", "https_proxy", "all_proxy", "no_proxy")]:
@@ -301,6 +301,13 @@ def test_a_saved_app_is_tried_in_a_headless_browser(engine):
     c = engine["client"]
     got = c.post("/api/apps/orbit-racer/versions/1/preview").json()
     assert got["ok"] is True and got["how"].startswith("headless") and any("webgl" in n for n in got["notes"])
+    shot = Path(got["shot"])                       # 2.36.0: its picture, outside the app's files
+    assert shot.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n" and shot.parent.name == "shots"
+    tile = next(a for a in c.get("/api/apps?kind=game").json()["apps"] if a["id"] == "orbit-racer")
+    assert tile["shot"] == str(shot)
+    key = c.get("/api/apps/orbit-racer").json()["frame"].split("/")[2]
+    plain = httpx.Client(base_url=f"http://127.0.0.1:{engine['port']}", trust_env=False)
+    assert plain.post(f"/appframe/{key}/_result", json={"hello": True}).status_code == 404   # only while it runs
     assert c.get("/api/apps/orbit-racer").json()["versions"][0]["preview"]["ok"] is True
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zz:
@@ -311,3 +318,17 @@ def test_a_saved_app_is_tried_in_a_headless_browser(engine):
     assert tried["ok"] is False and any("notThere is not defined" in p for p in tried["problems"])
     assert any("nothing moves" in p for p in tried["problems"])
     assert c.post(f"/api/apps/{a['id']}/versions/7/preview").status_code == 400
+
+
+@pytest.mark.skipif(not app_preview.find_browser(), reason="no Chrome-like browser here to try apps in")
+def test_the_builder_sees_what_the_preview_saw_and_the_person_sees_its_picture(engine):
+    c = engine["client"]
+    r = c.post("/api/apps", json={"prompt": "Breakout, save with the tool", "kind": "game"}).json()
+    assert wait_job(c, r["job_id"])["status"] == "done"
+    a = c.get(f"/api/apps/{r['app']['id']}").json()
+    assert a["versions"][0]["preview"]["ok"] is False                     # the stand-in game draws nothing
+    msgs = c.get(f"/api/chats/{r['chat_id']}").json()["messages"]
+    text = json.dumps(msgs)
+    assert "Tried it for a few seconds" in text and "nothing moves" in text and "look_at_image" in text
+    media = [m for msg in msgs for s in (msg.get("meta") or {}).get("steps") or [] for m in s.get("media") or []]
+    assert any(m["path"].endswith("shots/v1.png".replace("/", os.sep)) for m in media)

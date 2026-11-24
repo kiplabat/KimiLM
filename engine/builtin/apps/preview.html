@@ -4,14 +4,14 @@
 <script>window.__PREVIEW = __PREVIEW_DATA__;</script>
 <script src="./_preview.js"></script>
 </head>
-<body style="margin:0;background:#101318">
+<body style="margin:0;background:#101318;overflow:hidden">
 <!-- 2.35.0: an app tried before the person sees it (engine/dva/app_preview.py). The app runs in the same sandbox as
      in the window; this page answers its kimi calls with stand-ins (nothing reaches a device or a model), pokes it
      with keys and a click, and writes what happened into #kimi-preview-result. -->
 <iframe id="kimi-preview-app" src="./index.html" sandbox="allow-scripts allow-pointer-lock" allow="fullscreen; gamepad; autoplay"
-        style="width:1024px;height:700px;border:0;display:block"></iframe>
-<pre id="kimi-preview-result"></pre>
-<!-- answered after 5.5 s: the page's load (and so a headless browser's dump of it) waits for the result -->
+        style="width:100vw;height:100vh;border:0;display:block"></iframe>
+<pre id="kimi-preview-result" style="display:none"></pre>
+<!-- answered once the result is in (at most 10 s): the page's load, and so a headless browser's screenshot, waits for it -->
 <img src="./_wait" alt="" style="display:none">
 </body>
 </html>
