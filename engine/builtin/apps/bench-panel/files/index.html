@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Climate panel</title>
+<style>
+  :root { --bg:#14171c; --card:#1d222a; --line:#2c333d; --text:#e9edf2; --muted:#93a0ae; --accent:#3fa7b5; --hot:#e8705a; --ok:#46a37b; --warn:#c9a227; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text); font:14px/1.4 system-ui, sans-serif; }
+  body { display:flex; flex-direction:column; gap:12px; padding:14px; overflow:auto; }
+  header { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  h1 { font-size:18px; margin:0; font-weight:600; }
+  .badge { padding:2px 9px; border-radius:99px; background:var(--line); color:var(--muted); font-size:12px; }
+  .badge.custom { background:#1f4f3a; color:#9fe3c2; } .badge.default { background:#283240; color:#b9c6d4; }
+  .badge.fallback, .badge.safe { background:#5a2a22; color:#ffc4b8; } .badge.experiment { background:#4a3c12; color:#f2d77c; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; display:flex; flex-direction:column; gap:8px; }
+  .big { font-size:34px; font-weight:650; letter-spacing:-0.5px; }
+  .muted { color:var(--muted); } .small { font-size:12px; }
+  input[type=range] { width:100%; accent-color:var(--accent); height:28px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .between { justify-content:space-between; }
+  button { background:#2a323d; color:var(--text); border:1px solid var(--line); border-radius:9px; padding:9px 14px; font:inherit; cursor:pointer; }
+  button:hover { border-color:#4a5563; } button:disabled { opacity:.5; cursor:default; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#06161a; font-weight:600; }
+  .pill { padding:3px 10px; border-radius:99px; font-size:12px; background:#283240; }
+  .pill.on { background:#1f4f3a; color:#9fe3c2; }
+  canvas { width:100%; height:240px; display:block; }
+  #msg { min-height:20px; } .err { color:#ffb4a6; } .okc { color:#9fe3c2; }
+  ul { margin:0; padding-left:16px; } li { margin:2px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Connecting…</h1>
+  <span id="mode" class="badge">…</span>
+  <span id="sim" class="badge" hidden>simulated</span>
+  <span id="clock" class="muted small"></span>
+</header>
+<div id="targets" class="grid"></div>
+<div class="card">
+  <div class="row between"><b>Last hours</b><span class="muted small" id="legend"></span></div>
+  <canvas id="chart"></canvas>
+</div>
+<div class="row">
+  <button id="hold" class="primary" disabled>Hold these targets</button>
+  <button id="release">Let the device run itself</button>
+  <span id="msg" class="small"></span>
+</div>
+<div class="grid">
+  <div class="card"><b>Outputs</b><div id="outputs" class="row"></div></div>
+  <div class="card" id="eventsCard" hidden><b>Make something happen</b><div id="events" class="row"></div></div>
+  <div class="card"><b>What the guard did</b><ul id="guard" class="small muted"><li>Nothing yet.</li></ul></div>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const COLORS = ["#3fa7b5", "#e8705a", "#c9a227", "#9b6fd6", "#46a37b"];
+let ds = null, status = null, rows = [], since = -1e12, targets = {}, dirty = false;
+
+function unit(u) { return u === "degC" ? "°C" : u === "0/1" ? "" : (u || ""); }
+function fmt(v, u) { return typeof v === "number" ? v.toFixed(1) + " " + unit(u) : "—"; }
+function say(text, cls) { $("msg").textContent = text; $("msg").className = "small " + (cls || ""); }
+
+function loopsNow() {
+  const base = (status && status.controller) || ds.default || {};
+  let loops = (base.loops || []).map((l) => ({ ...l }));
+  if (!loops.length) {                       // a device with no thermostat of its own (the heated room)
+    const outs = Object.entries(ds.outputs || {});
+    for (const [s, info] of Object.entries(ds.sensors || {})) {
+      if (!info.setpoints || !outs.length) continue;
+      const [o, oi] = outs[0];
+      const heat = ds.kind === "heater" || /heat/.test(o);
+      loops.push(oi.type === "level"
+        ? { name: s, sensor: s, output: o, setpoint: info.setpoints[0], action: heat ? "heat" : "cool", mode: "pi", kp: 0.4, ti_s: 900 }
+        : { name: s, sensor: s, output: o, setpoint: info.setpoints[0], band: 1, action: heat ? "heat" : "cool" });
+    }
+  }
+  return { base, loops };
+}
+
+function buildTargets() {
+  const { loops } = loopsNow();
+  const box = $("targets"); box.innerHTML = "";
+  for (const [s, info] of Object.entries(ds.sensors || {})) {
+    const card = document.createElement("div"); card.className = "card";
+    const loop = loops.find((l) => l.sensor === s);
+    const reading = `<div class="big" id="r_${s}">—</div>`;
+    if (info.unit === "0/1") {
+      card.innerHTML = `<div class="muted">${info.about || s}</div><div class="big" id="r_${s}">—</div>`;
+    } else if (info.setpoints) {
+      const [lo, hi] = info.setpoints;
+      if (targets[s] == null) targets[s] = loop ? Number(loop.setpoint) : lo;
+      card.innerHTML = `<div class="muted">${info.about || s}</div>${reading}
+        <div class="row between small"><span>Target</span><b id="t_${s}">${targets[s].toFixed(1)} ${unit(info.unit)}</b></div>
+        <input type="range" min="${lo}" max="${hi}" step="0.5" value="${targets[s]}" id="s_${s}" aria-label="Target for ${info.about || s}">
+        <div class="row between small muted"><span>${lo}</span><span>allowed by the datasheet</span><span>${hi}</span></div>`;
+    } else {
+      card.innerHTML = `<div class="muted">${info.about || s}</div>${reading}`;
+    }
+    box.appendChild(card);
+    const slider = card.querySelector("input");
+    if (slider) slider.addEventListener("input", () => {
+      targets[s] = Number(slider.value); $("t_" + s).textContent = `${targets[s].toFixed(1)} ${unit(info.unit)}`;
+      dirty = true; $("hold").disabled = false; say("Press Hold to send the new targets.");
+    });
+  }
+  const sim = ds.simulated;
+  $("eventsCard").hidden = !sim;
+  if (sim) {
+    const ev = ds.kind === "heater"
+      ? [["ambient", { value: 0 }, "Cold outside (0 °C)"], ["ambient", { value: 12 }, "Mild outside"], ["door_open", { seconds: 120 }, "Open the door"]]
+      : [["door_open", { seconds: 120 }, "Open the door (2 min)"], ["warm_load", { compartment: "top", degrees: 5 }, "Warm food in"],
+         ["ambient", { value: 32 }, "Hot day (32 °C)"], ["ambient", { value: 25 }, "Normal room"]];
+    $("events").innerHTML = "";
+    for (const [name, args, label] of ev) {
+      const b = document.createElement("button"); b.textContent = label;
+      b.onclick = async () => { try { say(String(await kimi.device.event(name, args)), "okc"); } catch (e) { say(e.message, "err"); } };
+      $("events").appendChild(b);
+    }
+  }
+}
+
+function showStatus() {
+  const st = status || {};
+  $("mode").textContent = st.mode || "?"; $("mode").className = "badge " + (st.mode || "");
+  $("mode").title = { custom: "a controller from a panel or an agent is running", default: "the device's own controller", fallback: "the device's own, after the custom one failed", safe: "every output at its safe value" }[st.mode] || "";
+  $("clock").textContent = st.time != null ? `device time ${(st.time / 3600).toFixed(1)} h` : "";
+  for (const [s, v] of Object.entries(st.readings || {})) {
+    const el = $("r_" + s); if (!el) continue;
+    const info = ds.sensors[s] || {};
+    el.textContent = info.unit === "0/1" ? (v ? "open" : "closed") : fmt(v, info.unit);
+  }
+  $("outputs").innerHTML = Object.entries(st.outputs || {}).map(([o, v]) => {
+    const on = v === 1 || (typeof v === "number" && v > 0.01);
+    const text = v == null ? "—" : v === 1 ? "on" : v === 0 ? "off" : Math.round(v * 100) + " %";
+    return `<span class="pill ${on ? "on" : ""}" title="${(ds.outputs[o] || {}).about || ""}">${o}: ${text}</span>`;
+  }).join("") || '<span class="muted small">none</span>';
+  const ev = (st.events || []).slice(-8).reverse();
+  $("guard").innerHTML = ev.length ? ev.map((e) => `<li>${(e.t / 3600).toFixed(1)} h · ${e.text}</li>`).join("") : "<li>Nothing yet.</li>";
+  if (!dirty) {                                  // follow what the device is holding until the person moves a slider
+    for (const l of loopsNow().loops) {
+      const sl = $("s_" + l.sensor); if (!sl) continue;
+      targets[l.sensor] = Number(l.setpoint); sl.value = l.setpoint;
+      $("t_" + l.sensor).textContent = `${Number(l.setpoint).toFixed(1)} ${unit(ds.sensors[l.sensor].unit)}`;
+    }
+  }
+}
+
+function draw() {
+  const c = $("chart"), dpr = devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight; c.width = w * dpr; c.height = h * dpr;
+  const g = c.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
+  const temps = Object.entries(ds.sensors || {}).filter(([, i]) => i.unit !== "0/1").map(([k]) => k);
+  if (rows.length < 2 || !temps.length) { g.fillStyle = "#93a0ae"; g.fillText("Waiting for readings…", 12, 20); return; }
+  const t0 = rows[0].t, t1 = rows[rows.length - 1].t;
+  let lo = Infinity, hi = -Infinity;
+  for (const r of rows) for (const k of temps) if (typeof r[k] === "number") { lo = Math.min(lo, r[k]); hi = Math.max(hi, r[k]); }
+  for (const k of temps) if (targets[k] != null) { lo = Math.min(lo, targets[k]); hi = Math.max(hi, targets[k]); }
+  lo -= 1; hi += 1;
+  const L = 40, R = 8, T = 8, B = 22;
+  const x = (t) => L + (t - t0) / Math.max(1, t1 - t0) * (w - L - R);
+  const y = (v) => T + (hi - v) / (hi - lo) * (h - T - B);
+  g.strokeStyle = "#2c333d"; g.fillStyle = "#93a0ae"; g.font = "11px system-ui"; g.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) { const v = lo + (hi - lo) * i / 4; g.beginPath(); g.moveTo(L, y(v)); g.lineTo(w - R, y(v)); g.stroke(); g.fillText(v.toFixed(0), 6, y(v) + 4); }
+  g.fillText(`${(t0 / 3600).toFixed(1)} h`, L, h - 6); g.fillText(`${(t1 / 3600).toFixed(1)} h`, w - R - 40, h - 6);
+  const outs = Object.keys(ds.outputs || {});
+  outs.forEach((o, j) => {                       // when each output was on: a band at the bottom
+    g.fillStyle = j ? "rgba(201,162,39,.25)" : "rgba(63,167,181,.25)";
+    for (let i = 1; i < rows.length; i++) { const v = rows[i - 1][o]; if (v) g.fillRect(x(rows[i - 1].t), h - B - 6 - j * 7, x(rows[i].t) - x(rows[i - 1].t), 5 * Math.min(1, v)); }
+  });
+  temps.forEach((k, j) => {
+    g.strokeStyle = COLORS[j % COLORS.length]; g.lineWidth = 2; g.beginPath();
+    rows.forEach((r, i) => { if (typeof r[k] !== "number") return; i ? g.lineTo(x(r.t), y(r[k])) : g.moveTo(x(r.t), y(r[k])); }); g.stroke();
+    if (targets[k] != null && ds.sensors[k].setpoints) { g.setLineDash([5, 4]); g.lineWidth = 1; g.beginPath(); g.moveTo(L, y(targets[k])); g.lineTo(w - R, y(targets[k])); g.stroke(); g.setLineDash([]); }
+  });
+  $("legend").innerHTML = temps.map((k, j) => `<span style="color:${COLORS[j % COLORS.length]}">━ ${ds.sensors[k].about || k}</span>`).join(" · ") + (outs.length ? " · bands: " + outs.join(", ") + " on" : "");
+}
+
+async function poll() {
+  try {
+    const info = await kimi.device.state();
+    status = info.status || info; showStatus();
+    const h = await kimi.device.history({ since });
+    if (h && h.length) { since = h[h.length - 1].t; rows = rows.concat(h).slice(-2400); }
+    draw();
+  } catch (e) { say(e.message, "err"); }
+}
+
+$("hold").onclick = async () => {
+  const { base, loops } = loopsNow();
+  const spec = { about: "set from the Climate panel", period_s: base.period_s || 10,
+    loops: loops.map((l) => ({ ...l, setpoint: targets[l.sensor] != null ? targets[l.sensor] : l.setpoint })) };
+  $("hold").disabled = true; say("Checking with the guard…");
+  try {
+    const r = await kimi.device.control(spec);
+    if (r && r.valid === false) { say("The guard said no: " + (r.problems || []).join("; "), "err"); $("hold").disabled = false; return; }
+    dirty = false; await kimi.storage.set("targets", targets);
+    say("Holding the new targets. The chart shows the device getting there.", "okc"); poll();
+  } catch (e) { say(e.message, "err"); $("hold").disabled = false; }
+};
+$("release").onclick = async () => {
+  try { await kimi.device.release(); dirty = false; say("The device's own controller runs again.", "okc"); poll(); }
+  catch (e) { say(e.message, "err"); }
+};
+addEventListener("resize", () => ds && draw());
+
+(async () => {
+  await kimi.ready;
+  try {
+    const info = await kimi.device.info();
+    ds = info.datasheet || {}; status = info.status || {};
+    $("title").textContent = ds.model || (kimi.device.current && kimi.device.current.name) || "Device";
+    $("sim").hidden = !ds.simulated;
+    const saved = await kimi.storage.get("targets");
+    if (saved && status.mode === "custom") targets = saved;
+    buildTargets(); showStatus(); await poll(); setInterval(poll, 2000);
+  } catch (e) {
+    $("title").textContent = "This panel is for a device KimiOS's guard runs";
+    say(e.message, "err");
+  }
+})();
+</script>
+</body>
+</html>

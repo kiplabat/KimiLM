@@ -135,6 +135,18 @@ def decide(body):
             if tool == "update_project_notes":
                 args["section"] = "Decisions"
             return {"tool": (tool, args)}
+    # apps (2.34.0): the App builder writes index.html ("Build a game called …"); with "save with the tool" in the
+    # request it then calls save_app itself, otherwise the app saves the draft when the turn ends. "broken app"
+    # writes a script with a syntax error, so save_app answers with what to fix.
+    if "Build a game called" in text and "write_file" in tools and not after_tool:
+        broken = "broken app" in text
+        page = ("<!doctype html><html><head><title>Stand-in</title></head><body><canvas id=c></canvas><script>"
+                + ("let x = ;" if broken else "addEventListener('keydown', () => {}); kimi.storage.set('ok', 1);")
+                + "</script></body></html>")
+        return {"tool": ("write_file", {"path": "index.html", "content": page})}
+    if "save with the tool" in text and "save_app" in tools and after_tool and not any(
+            (c.get("function") or {}).get("name") == "save_app" for m in msgs for c in (m.get("tool_calls") or [])):
+        return {"tool": ("save_app", {"notes": "saved by the stand-in"})}
     if "film about " in text and "make_video" in tools and not after_tool:        # video (2.14.0)
         subject = text.split("film about ", 1)[1].strip()
         return {"tool": ("make_video", {"title": f"About {subject}", "scenes": [

@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import {
   Activity as ActivityIcon, BookOpen, Brain, CalendarClock, Cpu, AudioLines, FolderKanban, Image as ImageIcon, MessageSquarePlus, Plug, Search,
   Settings as SettingsIcon, Workflow, Loader2, Pin, Rocket, WifiOff, Film, ChevronDown, ChevronRight, Gauge, ChartColumn, Usb,
+  LayoutGrid, Gamepad2,
 } from "lucide-react";
 import { api } from "./api";
 import { go, Shown, useApp } from "./store";
@@ -27,11 +28,16 @@ import Usage from "./pages/Usage";
 import { Handle, useSize } from "./components/Resizable";
 import { NoticeBell } from "./components/Notices";
 import Devices from "./pages/Devices";
+import Apps from "./pages/Apps";
+import Games from "./pages/Games";
+import AppRunner from "./components/AppRunner";
 
 const NAV = [
   { page: "activity", label: "Activity", icon: ActivityIcon },
   { page: "performance", label: "Performance", icon: Gauge },
   { page: "usage", label: "Usage", icon: ChartColumn },
+  { page: "apps", label: "Apps", icon: LayoutGrid },
+  { page: "games", label: "Games", icon: Gamepad2 },
   { page: "devices", label: "Devices", icon: Usb },
   { page: "tasks", label: "Long-running tasks", icon: Rocket },
   { page: "schedules", label: "Schedules", icon: CalendarClock },
@@ -160,8 +166,10 @@ function Sidebar() {
 // screens stay in the order they were first opened (moving one would reset it) and are hidden; the least recently
 // seen go when there are more than KEEP (chats: KEEP_CHATS, they can be long).
 const KEEP = 12, KEEP_CHATS = 6;
+const SOLO = new URLSearchParams(location.search).get("app") || "";    // 2.34.0: kimilm --open-app=<id>
 const SIDE_MIN = 200, SIDE_MAX = 560;
-const PER_ID = ["chat", "project", "home"];       // one kept screen per chat or project; the others one per page
+// one kept screen per chat or project (2.34.0: and per open app, which keeps running while you look elsewhere)
+const PER_ID = ["chat", "project", "home", "apps"];
 
 function slotKey(page: string, id?: string) {
   return PER_ID.includes(page) ? `${page}:${id || ""}` : page;
@@ -203,6 +211,8 @@ export default function App() {
     case "performance": page = <Performance />; break;
     case "usage": page = <Usage />; break;
     case "devices": page = <Devices />; break;
+    case "apps": page = <Apps openId={route.id} />; break;
+    case "games": page = <Games />; break;
     default: page = <Home projectId={route.page === "home" ? route.id : undefined} />;
   }
   const key = onboarding ? "onboarding" : slotKey(route.page, route.id);
@@ -212,6 +222,7 @@ export default function App() {
     return <div className="center-screen"><h2>Can't reach the engine</h2><p>{bootError}</p><p className="muted">If this persists, restart KimiLM. Logs are in the app's data folder.</p></div>;
   }
   if (!boot) return <div className="center-screen"><Spinner size={28} /><p className="muted">Starting…</p></div>;
+  if (SOLO) return <div className="solo-shell"><AppRunner appId={SOLO} solo /></div>;      // 2.34.0: an app in its own window
   return (
     <div className="shell" style={{ ["--side-w" as any]: `${sideW}px` }}>
       <Sidebar />

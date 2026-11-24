@@ -1,0 +1,9 @@
+{
+  "name": "Orbit Racer",
+  "kind": "game",
+  "dims": "3D",
+  "about": "A three-lap race in 3D against three computer cars on a closed track. Arrow keys or WASD to drive, Space to brake, C to change the camera.",
+  "icon": {"emoji": "🏎️", "color": "#4E8DE0"},
+  "notes": "An example game that comes with KimiLM",
+  "prompt": "A 3D car race with three.js: a closed track, the player's car with a chase camera, three computer cars that follow the racing line at different skills, three laps, positions, lap times and a best lap record."
+}

@@ -2,7 +2,7 @@ import React, { useEffect, useState } from "react";
 import {
   Bluetooth, Camera, Cpu, HardDrive, Keyboard, Monitor, Mouse, Network, Plug, Printer, RefreshCw, Smartphone,
   Speaker, Thermometer, Usb, Download, ShieldCheck, Refrigerator, Heater, DoorOpen, Flame, Target, Square, Search, X,
-  AlertTriangle, Copy,
+  AlertTriangle, Copy, Hammer, SlidersHorizontal,
 } from "lucide-react";
 import { api, desktop, enc } from "../api";
 import { useApp, useEvent } from "../store";
@@ -11,6 +11,9 @@ import { InlineDetail, matches } from "../components/InlineDetail";
 import { startAgentChat } from "./Skills";
 import { BenchChart, type BenchRow } from "../components/BenchChart";
 import { go } from "../store";
+import AppRunner from "../components/AppRunner";
+import { AppTile, useApps } from "./Apps";
+import { ModelPicker } from "../components/Pickers";
 
 // 2.29.0: what is plugged into this computer, what drives it and what can be done with it. Agents see the same
 // through the devices and device_control tools; here you can look, act and install what a device needs.
@@ -43,6 +46,63 @@ function ActionForm({ device, action, onDone }: any) {
       ))}
       <Button small busy={busy} onClick={run} title={action.about}>
         {action.name.replace(/_/g, " ")}</Button>
+    </div>
+  );
+}
+
+// 2.34.0: control panels for a device: apps a model builds from a description (sliders, switches, choices and live
+// charts that act on the device through KimiLM, and code to install on the device). They open here and in Apps.
+const PANEL_IDEAS: Record<string, string> = {
+  appliance: "A slider for each compartment's temperature, the live readings and a chart of the last hours, and buttons for its own thermostat",
+  heater: "A big dial for the room temperature, a chart of the last hours, and presets for night, day and away",
+  display: "Sliders for brightness and contrast, the input as buttons, colour presets, and a night mode that dims it",
+  audio: "A volume slider with mute, and a button to send all sound here",
+  phone: "The phone's battery and storage, a screenshot button with the last picture, and a box to open a web page on it",
+  board: "Buttons and a slider that send commands to the board over serial, and a log of what it answers; a MicroPython main.py for the board",
+  serial: "A console for the serial port with buttons for the commands I use most, and a live log",
+};
+function ControlPanels({ device }: { device: any }) {
+  const { toast } = useApp();
+  const { apps, examples } = useApps("device", device.id);
+  const [open, setOpen] = useState<string>("");
+  const [ask, setAsk] = useState(false);
+  const [text, setText] = useState("");
+  const [model, setModel] = useState("");
+  const [busy, setBusy] = useState(false);
+  const build = async () => {
+    setBusy(true);
+    try {
+      const r = await api.post("/apps", { kind: "device", device_id: device.id, prompt: text.trim(), model: model || undefined });
+      toast(`Building ${r.app.name}: it appears here when it is saved`, "ok"); setAsk(false); setText(""); go("chat", r.chat_id);
+    } catch (e: any) { toast(e.message, "error"); } finally { setBusy(false); }
+  };
+  const example = examples.find((e: any) => e.for?.bench && device.bench);
+  const fromExample = async () => {
+    try { const a = await api.post("/apps", { example: example.example, device_id: device.id }); setOpen(a.id); }
+    catch (e: any) { toast(e.message, "error"); }
+  };
+  if (apps === null) return null;
+  const shownApp = open || (apps.length === 1 && !ask ? apps[0].id : "");
+  return (
+    <div className="card stack-s">
+      <div className="row gap-s"><SlidersHorizontal size={16} /><h3 style={{ margin: 0 }}>Control panels</h3><div className="grow" />
+        {!ask && <Button small icon={<Hammer size={13} />} onClick={() => setAsk(true)}>Build a control panel</Button>}</div>
+      {ask && <div className="stack-s">
+        <textarea className="input" rows={3} autoFocus value={text} onChange={(e) => setText(e.target.value)}
+          placeholder={PANEL_IDEAS[device.kind] || "What should the panel show and let you change?"} />
+        <div className="row gap-s wrap">
+          <ModelPicker value={model} onChange={setModel} />
+          {!text && PANEL_IDEAS[device.kind] && <button className="chip" onClick={() => setText(PANEL_IDEAS[device.kind])}>Use the suggestion</button>}
+          <div className="grow" />
+          <Button small kind="ghost" onClick={() => setAsk(false)}>Cancel</Button>
+          <Button small kind="primary" busy={busy} disabled={!text.trim()} onClick={build}>Build it</Button>
+        </div>
+        <div className="muted small">A model writes the panel from what this device can do. It acts on the device only through KimiLM: changes ask you once, and anything that may move or switch something asks each time (unless you marked the device as safe).</div>
+      </div>}
+      {apps.length === 0 && !ask && <div className="muted small">No panel yet. Describe one and a model builds it: friendly controls and live views for this device, kept here, rebuilt when you have a better model.
+        {example && <> Or <a onClick={fromExample}>start from the example panel</a>.</>}</div>}
+      {apps.length > 1 && <div className="app-grid small-grid">{apps.map((a: any) => <AppTile key={a.id} app={a} onOpen={() => setOpen(open === a.id ? "" : a.id)} />)}</div>}
+      {shownApp && <div className="app-inline"><AppRunner appId={shownApp} embedded onBack={apps.length > 1 ? () => setOpen("") : undefined} /></div>}
     </div>
   );
 }
@@ -232,6 +292,7 @@ function BenchPanel({ device }: { device: any }) {
           {Object.entries(st.outputs || {}).map(([k, v]: any) => <span key={k}>{k}: <b>{v == null ? "—" : v === 1 ? "on" : v === 0 ? "off" : `${Math.round(v * 100)} %`}</b></span>)}
         </div>
       </div>
+      <ControlPanels device={device} />
       <div className="card stack-s">
         <h3>Make it do something</h3>
         <div className="row gap-s">
@@ -286,6 +347,7 @@ function Detail({ id, onChanged }: { id: string; onChanged: () => void }) {
         <div className="dev-kv">{kv.filter(([, v]) => v).map(([k, v]) => <React.Fragment key={k}><div>{k}</div><div>{String(v)}</div></React.Fragment>)}</div>
         {d.next && <div className="small warn">{d.next}</div>}
       </div>
+      <ControlPanels device={d} />
       {d.kind === "display" && <DisplayPanel d={d} />}
       {(d.programs || []).length > 0 && <div className="card stack-s">
         <h3>Programs that control it</h3>

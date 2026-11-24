@@ -1,0 +1,9 @@
+{
+  "name": "Tank Arena",
+  "kind": "game",
+  "dims": "3D",
+  "about": "Drive a tank in a walled arena and outlast waves of computer tanks that hunt you and take cover. WASD to drive, the mouse to aim, click or Space to fire.",
+  "icon": {"emoji": "🛡️", "color": "#46A37B"},
+  "notes": "An example game that comes with KimiLM",
+  "prompt": "A 3D tank game with three.js: the player's tank drives with WASD and aims with the mouse, computer tanks come in waves, chase the player, keep their distance and shoot when they can see the player, blocks to hide behind, health, waves and a best-wave record."
+}

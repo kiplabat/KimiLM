@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paddle Duel</title>
+<style>
+  html, body { margin:0; height:100%; background:#101318; overflow:hidden; font-family:system-ui, sans-serif; color:#e9edf2; touch-action:none; }
+  canvas { display:block; width:100vw; height:100vh; }
+  #help { position:fixed; left:0; right:0; bottom:10px; text-align:center; font-size:13px; color:#8a96a3; pointer-events:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="help">↑/↓ or W/S, the mouse or touch to move · P to pause · first to 7</div>
+<script>
+const c = document.getElementById("c"), g = c.getContext("2d");
+let W = 0, H = 0, dpr = 1;
+function resize() { dpr = devicePixelRatio || 1; W = innerWidth; H = innerHeight; c.width = W * dpr; c.height = H * dpr; g.setTransform(dpr, 0, 0, dpr, 0, 0); }
+addEventListener("resize", resize); resize();
+
+const WIN = 7;
+const S = { state: "title", you: 0, cpu: 0, level: 1, streak: 0, best: 0, paused: false, flash: 0, msg: "" };
+const P = { y: 0.5, vy: 0 }, C = { y: 0.5, aim: 0.5, think: 0 };
+const ball = { x: 0.5, y: 0.5, vx: 0, vy: 0, speed: 0.55, trail: [] };
+const keys = {};
+let pointerY = null, last = performance.now();
+
+// Sizes relative to the court (court is 1 wide, 0.56 tall in "units"; the canvas is fitted around it)
+function court() { const w = Math.min(W - 24, (H - 60) / 0.56); const h = w * 0.56; return { x: (W - w) / 2, y: (H - h) / 2 + 10, w, h }; }
+const PAD_H = 0.18, PAD_W = 0.016, BALL = 0.012;
+
+function serve(toward) {
+  ball.x = 0.5; ball.y = 0.3 + Math.random() * 0.4; ball.speed = 0.5 + 0.04 * (S.level - 1);
+  const a = (Math.random() * 0.8 - 0.4);
+  ball.vx = Math.cos(a) * ball.speed * toward; ball.vy = Math.sin(a) * ball.speed; ball.trail = [];
+}
+function reset() { S.you = 0; S.cpu = 0; S.paused = false; S.state = "play"; P.y = C.y = 0.5; serve(Math.random() < 0.5 ? -1 : 1); }
+
+addEventListener("keydown", (e) => {
+  keys[e.key.toLowerCase()] = true;
+  if (["arrowup", "arrowdown", " "].includes(e.key.toLowerCase())) e.preventDefault();
+  if ((e.key === "p" || e.key === "Escape") && S.state === "play") S.paused = !S.paused;
+  if ((e.key === "Enter" || e.key === " ") && S.state !== "play") reset();
+});
+addEventListener("keyup", (e) => { keys[e.key.toLowerCase()] = false; });
+c.addEventListener("pointermove", (e) => { const k = court(); pointerY = (e.clientY - k.y) / k.h; });
+c.addEventListener("pointerdown", (e) => { const k = court(); pointerY = (e.clientY - k.y) / k.h; if (S.state !== "play") reset(); });
+c.addEventListener("pointerleave", () => { pointerY = null; });
+
+function hit(padY, dir) {
+  // where on the paddle it hit decides the angle; every hit is a little faster
+  const off = Math.max(-1, Math.min(1, (ball.y - padY) / (PAD_H / 2)));
+  ball.speed = Math.min(1.5, ball.speed * 1.06);
+  const a = off * 1.0;
+  ball.vx = Math.cos(a) * ball.speed * dir; ball.vy = Math.sin(a) * ball.speed;
+  beep(dir > 0 ? 440 : 520, 0.05);
+}
+
+// The computer: it predicts where the ball will cross its side (with bounces), but only re-thinks every so often,
+// aims a little off and moves at a limited speed. Higher levels think sooner, aim truer and move faster.
+function cpuThink() {
+  if (ball.vx <= 0) { C.aim = 0.5 + (ball.y - 0.5) * 0.3; return; }
+  let x = ball.x, y = ball.y, vx = ball.vx, vy = ball.vy;
+  const h = 0.56;
+  let t = (0.97 - x) / vx; y += vy * t;
+  while (y < 0 || y > h) { y = y < 0 ? -y : 2 * h - y; }
+  const miss = (0.16 - Math.min(0.12, S.level * 0.02)) * (Math.random() - 0.5);
+  C.aim = y / h + miss;
+}
+
+function update(dt) {
+  if (S.state !== "play" || S.paused) return;
+  const pads = navigator.getGamepads ? [...navigator.getGamepads()].filter(Boolean) : [];
+  const axis = pads.length ? pads[0].axes[1] || 0 : 0;
+  const up = keys["arrowup"] || keys["w"] || (pads[0] && pads[0].buttons[12] && pads[0].buttons[12].pressed);
+  const down = keys["arrowdown"] || keys["s"] || (pads[0] && pads[0].buttons[13] && pads[0].buttons[13].pressed);
+  if (up || down || Math.abs(axis) > 0.15) { pointerY = null; P.y += ((down ? 1 : 0) - (up ? 1 : 0) + (Math.abs(axis) > 0.15 ? axis : 0)) * 1.3 * dt; }
+  else if (pointerY != null) P.y += (pointerY - P.y) * Math.min(1, dt * 18);
+  P.y = Math.max(PAD_H / 2, Math.min(1 - PAD_H / 2, P.y));
+
+  C.think -= dt;
+  if (C.think <= 0) { cpuThink(); C.think = Math.max(0.08, 0.35 - S.level * 0.04); }
+  const cpuSpeed = 0.55 + S.level * 0.1;
+  const d = C.aim - C.y; C.y += Math.sign(d) * Math.min(Math.abs(d), cpuSpeed * dt);
+  C.y = Math.max(PAD_H / 2, Math.min(1 - PAD_H / 2, C.y));
+
+  const h = 0.56;
+  ball.trail.push([ball.x, ball.y]); if (ball.trail.length > 12) ball.trail.shift();
+  ball.x += ball.vx * dt; ball.y += ball.vy * dt;
+  if (ball.y < BALL) { ball.y = BALL; ball.vy = Math.abs(ball.vy); beep(300, 0.03); }
+  if (ball.y > h - BALL) { ball.y = h - BALL; ball.vy = -Math.abs(ball.vy); beep(300, 0.03); }
+  const py = P.y * h, cy = C.y * h;
+  if (ball.vx < 0 && ball.x < 0.03 + PAD_W && ball.x > 0.01 && Math.abs(ball.y - py) < PAD_H * h / 2 + BALL) { ball.x = 0.03 + PAD_W; hit(py, 1); }
+  if (ball.vx > 0 && ball.x > 0.97 - PAD_W && ball.x < 0.99 && Math.abs(ball.y - cy) < PAD_H * h / 2 + BALL) { ball.x = 0.97 - PAD_W; hit(cy, -1); }
+  if (ball.x < -0.03) point("cpu");
+  if (ball.x > 1.03) point("you");
+}
+
+function point(who) {
+  S[who]++; S.flash = 0.6; beep(who === "you" ? 660 : 180, 0.15);
+  if (S.you >= WIN || S.cpu >= WIN) {
+    const won = S.you > S.cpu;
+    S.state = "over";
+    if (won) { S.streak++; S.level = Math.min(8, S.level + 1); } else { S.streak = 0; S.level = Math.max(1, S.level - 1); }
+    if (S.streak > S.best) { S.best = S.streak; save(); }
+    S.msg = won ? `You win ${S.you}–${S.cpu}!` : `The computer wins ${S.cpu}–${S.you}.`;
+    save();
+    return;
+  }
+  serve(who === "you" ? 1 : -1);
+}
+
+function save() { if (window.kimi) kimi.storage.set("record", { best: S.best, level: S.level }).catch(() => {}); }
+
+let actx = null;
+function beep(f, len) {
+  try { actx = actx || new AudioContext(); const o = actx.createOscillator(), v = actx.createGain();
+    o.frequency.value = f; o.type = "square"; v.gain.value = 0.04; o.connect(v); v.connect(actx.destination);
+    o.start(); v.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + len); o.stop(actx.currentTime + len); } catch (e) {}
+}
+
+function draw() {
+  g.fillStyle = "#101318"; g.fillRect(0, 0, W, H);
+  const k = court(), h = 0.56, sx = (x) => k.x + x * k.w, sy = (y) => k.y + y / h * k.h;
+  g.strokeStyle = "#2b3440"; g.lineWidth = 2; g.strokeRect(k.x, k.y, k.w, k.h);
+  g.setLineDash([8, 10]); g.beginPath(); g.moveTo(k.x + k.w / 2, k.y); g.lineTo(k.x + k.w / 2, k.y + k.h); g.stroke(); g.setLineDash([]);
+  g.fillStyle = "#e9edf2"; g.font = `600 ${Math.round(k.h * 0.12)}px system-ui`; g.textAlign = "center";
+  g.fillText(S.you, k.x + k.w * 0.25, k.y + k.h * 0.18); g.fillText(S.cpu, k.x + k.w * 0.75, k.y + k.h * 0.18);
+  g.font = "13px system-ui"; g.fillStyle = "#8a96a3";
+  g.fillText("You", k.x + k.w * 0.25, k.y + k.h * 0.26); g.fillText(`Computer · level ${S.level}`, k.x + k.w * 0.75, k.y + k.h * 0.26);
+  g.fillText(`Streak ${S.streak} · best ${S.best}`, W / 2, k.y - 12);
+  const ph = PAD_H * k.h, pw = PAD_W * k.w;
+  g.fillStyle = "#3fa7b5"; g.fillRect(sx(0.03) - pw, sy(P.y * h) - ph / 2, pw, ph);
+  g.fillStyle = "#e8705a"; g.fillRect(sx(0.97), sy(C.y * h) - ph / 2, pw, ph);
+  ball.trail.forEach(([x, y], i) => { g.fillStyle = `rgba(233,237,242,${i / 40})`; g.beginPath(); g.arc(sx(x), sy(y), BALL * k.w * 0.8, 0, 7); g.fill(); });
+  g.fillStyle = "#fff"; g.beginPath(); g.arc(sx(ball.x), sy(ball.y), BALL * k.w, 0, 7); g.fill();
+  if (S.flash > 0) { g.fillStyle = `rgba(255,255,255,${S.flash * 0.15})`; g.fillRect(k.x, k.y, k.w, k.h); }
+  const banner = (big, small) => {
+    g.fillStyle = "rgba(16,19,24,.82)"; g.fillRect(k.x, k.y + k.h * 0.36, k.w, k.h * 0.3);
+    g.fillStyle = "#e9edf2"; g.font = `650 ${Math.round(k.h * 0.09)}px system-ui`; g.fillText(big, W / 2, k.y + k.h * 0.5);
+    g.font = "15px system-ui"; g.fillStyle = "#b9c6d4"; g.fillText(small, W / 2, k.y + k.h * 0.59);
+  };
+  if (S.state === "title") banner("Paddle Duel", "Press Enter, Space or tap to serve");
+  else if (S.state === "over") banner(S.msg, "Press Enter or tap to play again");
+  else if (S.paused) banner("Paused", "Press P to go on");
+}
+
+function frame(now) {
+  const dt = Math.min(0.033, (now - last) / 1000); last = now;
+  S.flash = Math.max(0, S.flash - dt);
+  update(dt); draw(); requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+if (window.kimi) {
+  kimi.storage.get("record").then((r) => { if (r) { S.best = r.best || 0; S.level = r.level || 1; } }).catch(() => {});
+  kimi.on("visible", (v) => { if (!v && S.state === "play") S.paused = true; });
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+{
+  "name": "Four in a Row",
+  "kind": "game",
+  "dims": "2D",
+  "about": "Drop discs and line up four before the computer does. Three levels of a computer that looks ahead, or let your own model choose its moves.",
+  "icon": {"emoji": "🔴", "color": "#C9A227"},
+  "notes": "An example game that comes with KimiLM",
+  "prompt": "Connect four against the computer: a 7×6 board, discs that fall, a computer that looks ahead (easy, medium, hard), an option to let the person's model choose the computer's moves with the code as the fallback, and a tally of wins."
+}

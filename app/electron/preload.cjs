@@ -25,4 +25,7 @@ contextBridge.exposeInMainWorld("dva", {
   setZoom: (z) => ipcRenderer.invoke("dva:set-zoom", z),
   stepZoom: (dir) => ipcRenderer.invoke("dva:step-zoom", dir),
   onZoom: (fn) => { const h = (_e, z) => fn(z); ipcRenderer.on("dva:zoom", h); return () => ipcRenderer.removeListener("dva:zoom", h); },
+  // 2.34.0: apps (device panels and games): open one in its own window, and put it in the computer's apps menu
+  openApp: (id) => ipcRenderer.invoke("dva:open-app", id),
+  appShortcut: (a) => ipcRenderer.invoke("dva:app-shortcut", a),
 });
