@@ -40,7 +40,8 @@ STATE = None
 DEFAULT_SETTINGS = {
     "default_harness": "agent", "default_compute": "auto", "default_ctx": 8192, "max_reply_tokens": 2048,
     "unload_after_minutes": 20, "engine_memory_percent": 85, "explore_when_idle": True, "explore_idle_minutes": 30, "explore_evaluate": True, "suggestions_enabled": False, "memory_enabled": True, "learn_enabled": True, "learn_delay_seconds": 45,
-    "allow_python": True, "approval_timeout_minutes": 360, "max_native_tools": 49, "python_timeout_seconds": 180,
+    "allow_python": True, "approval_timeout_minutes": 360, "max_native_tools": 50, "python_timeout_seconds": 180,
+    "apps_preview": True,              # 2.35.0: a saved app is tried for a few seconds in a headless browser
     # 2.19.0: the most a tool call may ask for a program's time, and how many programs agents may run at once
     "code_timeout_max_seconds": 900, "code_runs_at_once": 2,
     "max_loaded_models": 3, "browser_search": True, "max_parallel_agents": 4, "max_team_depth": 2, "turn_time_limit_minutes": 30,
@@ -194,6 +195,10 @@ class App:
         if self.db.setting("max_native_tools") == 47 and not self.db.setting("native_tools_2_29"):
             self.db.set_setting("max_native_tools", 49)
         self.db.set_setting("native_tools_2_29", True)
+        # 2.35.0 adds build_app (automation: a game or a control panel from any chat)
+        if self.db.setting("max_native_tools") == 49 and not self.db.setting("native_tools_2_35"):
+            self.db.set_setting("max_native_tools", 50)
+        self.db.set_setting("native_tools_2_35", True)
 
     def _release_pending_after_restart(self):
         """Follow-ups queued while a reply was running are not sent if the app closed meanwhile: they show as

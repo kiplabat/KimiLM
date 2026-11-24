@@ -58,11 +58,53 @@
 
   // A hidden app (another screen is in front) gets no animation frames until it is shown again, so a game left
   // open does not keep drawing; games that time their frames carry on where they were
-  let visible = true;
+  let visible = true, frames = 0;
   const held = [];
   const raf = window.requestAnimationFrame.bind(window);
-  window.requestAnimationFrame = (cb) => { if (visible) return raf(cb); held.push(cb); return 0; };
-  listeners.visible = [(v) => { visible = v !== false; if (visible) held.splice(0).forEach((cb) => raf(cb)); }];
+  const counted = (cb) => (t) => { frames++; cb(t); };
+  window.requestAnimationFrame = (cb) => { if (visible) return raf(counted(cb)); held.push(cb); return 0; };
+  listeners.visible = [(v) => { visible = v !== false; if (visible) held.splice(0).forEach((cb) => raf(counted(cb))); }];
+
+  // 2.35.0: tried before the person sees it (a preview): press a few keys, click the middle of the biggest canvas
+  // (or the first button), and say what happened. Only the preview page sends this; it answers every call itself.
+  listeners.preview = [() => {
+    const canvases = Array.from(document.querySelectorAll("canvas"));
+    const big = canvases.sort((x, y) => y.width * y.height - x.width * x.height)[0];
+    const look = () => (document.body ? document.body.innerText : "").slice(0, 2000);
+    const sample = () => {
+      try {
+        if (!big) return "";
+        const g = big.getContext("2d");
+        if (!g) return "";
+        const d = g.getImageData(0, 0, big.width, big.height).data;
+        let h = 0;
+        for (let i = 0; i < d.length; i += 4093) h = (h * 31 + d[i] + d[i + 1] * 3 + d[i + 2] * 7) | 0;
+        return String(h);
+      } catch (e) { return ""; }
+    };
+    const before = { frames, text: look(), pixels: sample() };
+    const target = () => document.activeElement && document.activeElement !== document.documentElement ? document.activeElement : document.body;
+    const key = (k, code, type) => target().dispatchEvent(new KeyboardEvent(type, { key: k, code, bubbles: true, cancelable: true }));
+    const keys = [["Enter", "Enter"], [" ", "Space"], ["ArrowUp", "ArrowUp"], ["ArrowLeft", "ArrowLeft"], ["w", "KeyW"]];
+    keys.forEach(([k, c]) => key(k, c, "keydown"));
+    const el = big || document.querySelector("button") || document.body;
+    const r = el.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
+    const at = document.elementFromPoint(x, y) || el;
+    const opts = { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 1, pointerType: "mouse", isPrimary: true };
+    ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((t) =>
+      at.dispatchEvent(t.startsWith("pointer") ? new PointerEvent(t, opts) : new MouseEvent(t, opts)));
+    setTimeout(() => keys.forEach(([k, c]) => key(k, c, "keyup")), 400);
+    setTimeout(() => {
+      const text = look();
+      post({ method: "preview.report", args: {
+        frames: before.frames, frames_after: frames,
+        canvases: canvases.map((c) => [c.width, c.height, c.getContext("webgl2") || c.getContext("webgl") ? "webgl" : "2d"]),
+        text: text.slice(0, 300), text_length: text.trim().length,
+        buttons: document.querySelectorAll("button").length, inputs: document.querySelectorAll("input, select, textarea").length,
+        changed: text !== before.text || (before.pixels !== "" && sample() !== before.pixels),
+      } });
+    }, 1800);
+  }];
 
   const kimi = {
     ready: null,
@@ -98,9 +140,18 @@
     notify: (text) => call("notify", { text: String(text) }),
     on(event, fn) { (listeners[event] = listeners[event] || []).push(fn); },
   };
-  kimi.ready = call("hello", { title: document.title || "" }).then((info) => {
-    kimi.app = info.app; kimi.device.current = info.device || null;
-    return info;
+  // Say hello until the window answers (it may still be setting up when the app's first script runs)
+  kimi.ready = new Promise((resolve) => {
+    let done = false, tries = 0;
+    const hello = () => {
+      if (done || tries++ > 40) return;
+      call("hello", { title: document.title || "" }).then((info) => {
+        if (done) return;
+        done = true; kimi.app = info.app; kimi.device.current = info.device || null; resolve(info);
+      }, () => {});
+      setTimeout(hello, 500);
+    };
+    hello();
   });
   window.kimi = kimi;
 })();

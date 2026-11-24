@@ -227,7 +227,8 @@ KIT_WORDS = {
               r"shell|git\b|install|build|convert|parse|json|sql|statistic|average|sum\b|count",
     "memory": r"remember|memory|earlier chat|previous chat|chat history|knowledge|project notes?",
     "skills": r"skill",
-    "automation": r"schedul|harness|every (day|week|hour|morning)|recurring|remind",
+    "automation": r"schedul|harness|every (day|week|hour|morning)|recurring|remind|\bgame\b|control panel|"
+                  r"build (me )?an? app|make (me )?an? app",                 # 2.35.0: build_app
     "vision": r"image|photo|picture|screenshot|video|diagram|scan",
     "images": r"image|picture|illustrat|logo|poster|draw|artwork|icon\b|banner|cover art|thumbnail|wallpaper|"
               r"photo of|retouch|inpaint|change the background",
