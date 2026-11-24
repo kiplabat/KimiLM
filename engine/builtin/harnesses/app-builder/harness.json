@@ -1,0 +1,19 @@
+{
+  "name": "App builder",
+  "description": "Builds the apps you open in KimiLM: a control panel for a device (sliders, switches, choices and live charts that act on it, and code to install on the device) or a game you describe (2D or 3D, with the computer as a player). Every save is a new version; rebuilding keeps the old ones.",
+  "type": "loop",
+  "mode": "agent",
+  "tools": [
+    "files",
+    "python",
+    "devices",
+    "apps"
+  ],
+  "connectors": false,
+  "max_steps": 28,
+  "max_reply_tokens": 12000,
+  "temperature": 0.3,
+  "memory": false,
+  "learn": false,
+  "icon": "code"
+}

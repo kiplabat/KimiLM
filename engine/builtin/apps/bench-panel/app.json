@@ -1,0 +1,9 @@
+{
+  "name": "Climate panel",
+  "kind": "device",
+  "about": "Targets, live readings and a chart for a device KimiOS's guard runs (the simulated fridge or room, or a registered one): move a target, press Hold, and watch the device get there.",
+  "icon": {"emoji": "🧊", "color": "#3FA7B5"},
+  "for": {"bench": true},
+  "notes": "The example panel that comes with KimiLM",
+  "prompt": "A panel for this device: a slider for each temperature it can be asked to hold (within its datasheet), its live readings and outputs, a chart of the last hours with the targets, buttons to hold the targets or give control back to the device's own thermostat, and the things that can happen to a simulated device."
+}

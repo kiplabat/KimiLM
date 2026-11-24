@@ -302,6 +302,88 @@ function stopEngine() {
   });
 }
 
+// ------------------------------------------------------------------ apps in their own windows (2.34.0)
+// `kimilm --open-app=<id>` (the computer's apps menu, KimiOS's launch_app) opens one app in a window of its own; a
+// second start of KimiLM hands its arguments to this one.
+const appWindows = new Map();
+function isAppFrame(url) {
+  try { const u = new URL(url); return u.pathname.startsWith("/appframe/") && (u.hostname === "127.0.0.1" || u.hostname === "localhost"); }
+  catch { return false; }
+}
+function appFromArgs(argv) {
+  const hit = (argv || []).find((a) => typeof a === "string" && a.startsWith("--open-app="));
+  const id = hit ? hit.slice("--open-app=".length) : "";
+  return /^[a-z0-9][a-z0-9-]{0,47}$/.test(id) ? id : "";
+}
+function openAppWindow(id) {
+  if (!id || !enginePort) return;
+  const open = appWindows.get(id);
+  if (open && !open.isDestroyed()) { open.show(); open.focus(); return; }
+  const w = new BrowserWindow({
+    width: 1180, height: 800, minWidth: 480, minHeight: 360, show: false, title: "KimiLM app", backgroundColor: "#101318",
+    icon: iconPath(), autoHideMenuBar: true,
+    webPreferences: { preload: path.join(__dirname, "preload.cjs"), contextIsolation: true, nodeIntegration: false, sandbox: true },
+  });
+  const base = appUrl();
+  w.loadURL(`${base}?app=${encodeURIComponent(id)}`);
+  w.webContents.on("did-finish-load", () => w.webContents.setZoomFactor(zoomFactor()));
+  w.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  w.webContents.on("will-navigate", (e, url) => { if (!url.startsWith(base)) e.preventDefault(); });
+  w.once("ready-to-show", () => w.show());
+  w.on("closed", () => appWindows.delete(id));
+  appWindows.set(id, w);
+}
+
+// The computer's own apps menu: a desktop entry (Linux, KimiOS: it also lands in KimiOS's software registry, so
+// agents can open it with launch_app) or a Start menu shortcut (Windows).
+function launcher() {
+  if (process.env.APPIMAGE) return { exe: process.env.APPIMAGE, pre: [] };
+  if (!app.isPackaged) return { exe: process.execPath, pre: [path.join(__dirname, "..")] };
+  if (process.platform === "linux" && fs.existsSync("/usr/bin/kimilm") && process.execPath.startsWith("/usr/lib/kimilm")) return { exe: "/usr/bin/kimilm", pre: [] };
+  return { exe: process.execPath, pre: [] };
+}
+function desktopEntry(a, exe, pre, icon) {
+  const id = String(a.id);
+  const line = (x) => String(x || "").replace(/[\r\n]+/g, " ");
+  const q = (x) => (/[\s"'\\$`]/.test(x) ? `"${x.replace(/(["\\$`])/g, "\\$1")}"` : x);
+  const about = a.about || (a.kind === "game" ? "A game made in KimiLM" : "A control panel made in KimiLM");
+  return ["[Desktop Entry]", "Type=Application", `Name=${line(a.name || id).slice(0, 60)}`, `Comment=${line(about).slice(0, 200)}`,
+    `Exec=${[exe, ...pre].map(q).join(" ")} --open-app=${id}`, `Icon=${icon}`, "Terminal=false",
+    `Categories=${a.kind === "game" ? "Game;" : "Utility;"}`, "StartupWMClass=KimiLM", `X-KimiLM-App=${id}`,
+    `X-KimiLM-Kind=${a.kind === "game" ? "game" : "device"}`, ""].join("\n");
+}
+function appShortcut(a) {
+  const id = String((a && a.id) || "");
+  if (!/^[a-z0-9][a-z0-9-]{0,47}$/.test(id)) return { ok: false, reason: "not an app" };
+  const name = String(a.name || id).replace(/[\r\n]+/g, " ").slice(0, 60);
+  const { exe, pre } = launcher();
+  try {
+    if (process.platform === "linux") {
+      const data = process.env.XDG_DATA_HOME || path.join(app.getPath("home"), ".local", "share");
+      const entry = path.join(data, "applications", `kimilm-app-${id}.desktop`);
+      const icon = path.join(data, "icons", "hicolor", "scalable", "apps", `kimilm-app-${id}.svg`);
+      if (!a.add) { for (const f of [entry, icon]) fs.rmSync(f, { force: true }); return { ok: true }; }
+      fs.mkdirSync(path.dirname(entry), { recursive: true });
+      fs.mkdirSync(path.dirname(icon), { recursive: true });
+      if (a.icon && String(a.icon).startsWith("<svg")) fs.writeFileSync(icon, String(a.icon));
+      fs.writeFileSync(entry, desktopEntry(a, exe, pre, fs.existsSync(icon) ? icon : "kimilm"));
+      return { ok: true, path: entry };
+    }
+    if (process.platform === "win32") {
+      const dir = path.join(app.getPath("appData"), "Microsoft", "Windows", "Start Menu", "Programs", "KimiLM apps");
+      const link = path.join(dir, `${name.replace(/[<>:"/\\|?*]/g, "_")}.lnk`);
+      if (!a.add) { fs.rmSync(link, { force: true }); return { ok: true }; }
+      fs.mkdirSync(dir, { recursive: true });
+      const ok = shell.writeShortcutLink(link, { target: exe, args: [...pre.map((x) => `"${x}"`), `--open-app=${id}`].join(" "),
+        description: name, icon: process.execPath, iconIndex: 0, appUserModelId: "com.kimilm.app" });
+      return ok ? { ok: true, path: link } : { ok: false, reason: "Windows did not take the shortcut" };
+    }
+    return { ok: false, reason: "On this system, open apps from KimiLM's Apps" };
+  } catch (err) { log(`app shortcut: ${err.message}`); return { ok: false, reason: err.message }; }
+}
+ipcMain.handle("dva:open-app", (_e, id) => openAppWindow(String(id || "")));
+ipcMain.handle("dva:app-shortcut", (_e, a) => appShortcut(a));
+
 // ------------------------------------------------------------------ IPC for the window
 ipcMain.on("dva:config", (e) => { e.returnValue = { token, port: enginePort, dev: isDev, version: app.getVersion(), platform: process.platform }; });
 ipcMain.handle("dva:pick-folder", async () => {
@@ -338,7 +420,10 @@ ipcMain.handle("dva:step-zoom", (_e, dir) => stepZoom(Number(dir) || 0));
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on("second-instance", showWindow);
+  app.on("second-instance", (_e, argv) => {     // 2.34.0: `kimilm --open-app=<id>` while KimiLM runs
+    const id = appFromArgs(argv);
+    if (id) openAppWindow(id); else showWindow();
+  });
   app.setAppUserModelId("com.kimilm.app");
   app.whenReady().then(async () => {
     const moved = migrateUserData({ app, dialog });   // before anything writes into the data folder
@@ -361,6 +446,8 @@ if (!app.requestSingleInstanceLock()) {
     if (!isDev) {
       // Content Security Policy for the window (production only: Vite's dev server needs inline scripts).
       session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+        // 2.34.0: an app's frame comes with its own, stricter policy (no internet; engine/dva/apps.py)
+        if (isAppFrame(details.url)) return callback({ responseHeaders: details.responseHeaders });
         callback({ responseHeaders: { ...details.responseHeaders, "Content-Security-Policy": [
           "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self'; script-src 'self'"] } });
       });
@@ -375,8 +462,10 @@ if (!app.requestSingleInstanceLock()) {
     });
     if (!kimiosSession) createTray();
     watchWork();
-    const hidden = process.argv.includes("--hidden") || prefs().startHidden;
+    const solo = appFromArgs(process.argv);       // 2.34.0: started from an app's entry: that app, the main window hidden
+    const hidden = process.argv.includes("--hidden") || prefs().startHidden || (!!solo && !kimiosSession);
     createWindow(!hidden);
+    if (solo) openAppWindow(solo);
   });
   // Subscribing to this event keeps the app running when its window closes (the tray); it quits only when asked to
   app.on("window-all-closed", () => { if (quitting) app.quit(); });

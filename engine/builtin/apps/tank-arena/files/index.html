@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tank Arena</title>
+<style>
+  html, body { margin:0; height:100%; overflow:hidden; background:#0d1117; font-family:system-ui, sans-serif; color:#fff; touch-action:none; user-select:none; cursor:crosshair; }
+  #hud { position:fixed; top:10px; left:12px; right:12px; display:flex; justify-content:space-between; pointer-events:none; text-shadow:0 1px 3px #000; }
+  .big { font-size:24px; font-weight:700; }
+  #hp { width:200px; height:12px; background:rgba(255,255,255,.2); border-radius:6px; overflow:hidden; margin-top:4px; }
+  #hp div { height:100%; background:#46a37b; width:100%; transition:width .2s; }
+  #center { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; pointer-events:none; text-align:center; text-shadow:0 2px 6px #000; }
+  #center h1 { font-size:52px; margin:0; } #center p { font-size:17px; margin:6px; color:#dde5ee; max-width:600px; }
+  #touch { position:fixed; bottom:14px; left:0; right:0; display:none; justify-content:space-between; padding:0 14px; }
+  #touch div { display:grid; grid-template-columns:repeat(3, 64px); gap:8px; } #touch button { height:64px; border-radius:14px; border:none; background:rgba(255,255,255,.18); color:#fff; font-size:22px; }
+</style>
+</head>
+<body>
+<div id="hud"><div><div class="big" id="wave">Wave 1</div><div id="hp"><div></div></div></div><div style="text-align:right"><div class="big" id="score">0</div><div id="best"></div></div></div>
+<div id="center"><h1 id="cTitle">Tank Arena</h1><p id="cText">Press Enter or tap to start · WASD drive · the mouse aims · click or Space fires · P pauses</p></div>
+<div id="touch"><div><span></span><button data-k="up">▲</button><span></span><button data-k="left">◀</button><button data-k="down">▼</button><button data-k="right">▶</button></div><div><span></span><span></span><button data-k="fire" style="grid-column:3;grid-row:1/3;height:136px;background:rgba(232,112,90,.5)">FIRE</button></div></div>
+<script type="module">
+import * as THREE from "three";
+
+const SIZE = 60;                                     // the arena runs from -SIZE to SIZE
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(2, devicePixelRatio)); renderer.setSize(innerWidth, innerHeight); renderer.shadowMap.enabled = true;
+document.body.prepend(renderer.domElement);
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0x1d2430); scene.fog = new THREE.Fog(0x1d2430, 90, 220);
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.5, 500);
+addEventListener("resize", () => { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
+scene.add(new THREE.HemisphereLight(0xcfe0ff, 0x30301e, 0.8));
+const sun = new THREE.DirectionalLight(0xffffff, 1.7); sun.position.set(40, 90, 30); sun.castShadow = true;
+Object.assign(sun.shadow.camera, { left: -80, right: 80, top: 80, bottom: -80, far: 250 }); sun.shadow.mapSize.set(2048, 2048); scene.add(sun);
+
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(SIZE * 2, SIZE * 2, 24, 24), new THREE.MeshLambertMaterial({ color: 0x6d6a52 }));
+floor.rotation.x = -Math.PI / 2; floor.receiveShadow = true; scene.add(floor);
+const gridH = new THREE.GridHelper(SIZE * 2, 24, 0x5a5845, 0x5a5845); gridH.position.y = 0.02; scene.add(gridH);
+
+// walls and blocks to hide behind (axis-aligned boxes: {x, z, hx, hz})
+const blocks = [];
+function block(x, z, w, d, h, color) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), new THREE.MeshLambertMaterial({ color }));
+  m.position.set(x, h / 2, z); m.castShadow = m.receiveShadow = true; scene.add(m);
+  blocks.push({ x, z, hx: w / 2, hz: d / 2 });
+}
+block(0, -SIZE - 1, SIZE * 2 + 4, 2, 4, 0x3a404a); block(0, SIZE + 1, SIZE * 2 + 4, 2, 4, 0x3a404a);
+block(-SIZE - 1, 0, 2, SIZE * 2 + 4, 4, 0x3a404a); block(SIZE + 1, 0, 2, SIZE * 2 + 4, 4, 0x3a404a);
+for (const [x, z, w, d] of [[-25, -20, 12, 4], [25, 20, 12, 4], [-20, 25, 4, 12], [20, -25, 4, 12], [0, 0, 8, 8], [-40, 0, 4, 16], [40, 0, 4, 16], [0, -42, 16, 4], [0, 42, 16, 4], [-38, -40, 6, 6], [38, 40, 6, 6], [38, -38, 6, 6], [-38, 38, 6, 6]])
+  block(x, z, w, d, 3 + Math.random() * 2, 0x7b8794);
+
+function solidAt(x, z, r = 0) { return blocks.some((b) => Math.abs(x - b.x) < b.hx + r && Math.abs(z - b.z) < b.hz + r); }
+function pushOut(o, r) {
+  for (const b of blocks) {
+    const dx = o.x - b.x, dz = o.z - b.z, px = b.hx + r - Math.abs(dx), pz = b.hz + r - Math.abs(dz);
+    if (px > 0 && pz > 0) { if (px < pz) o.x += Math.sign(dx) * px; else o.z += Math.sign(dz) * pz; }
+  }
+}
+function clearLine(a, b) {                       // nothing solid between two points (sampled every metre)
+  const n = Math.ceil(a.distanceTo(b));
+  for (let i = 1; i < n; i++) { const t = i / n; if (solidAt(a.x + (b.x - a.x) * t, a.z + (b.z - a.z) * t, 0.3)) return false; }
+  return true;
+}
+
+// ---------------------------------------------------------------- tanks
+function tankMesh(color) {
+  const g = new THREE.Group(), mat = new THREE.MeshStandardMaterial({ color, roughness: 0.6, metalness: 0.2 }), dark = new THREE.MeshLambertMaterial({ color: 0x222222 });
+  const hull = new THREE.Mesh(new THREE.BoxGeometry(3.2, 1.2, 4.4), mat); hull.position.y = 1; hull.castShadow = true;
+  for (const s of [-1, 1]) { const tr = new THREE.Mesh(new THREE.BoxGeometry(0.8, 1, 4.8), dark); tr.position.set(s * 1.8, 0.6, 0); tr.castShadow = true; g.add(tr); }
+  const turret = new THREE.Group(); turret.position.y = 1.9;
+  const dome = new THREE.Mesh(new THREE.CylinderGeometry(1.2, 1.4, 0.9, 16), mat); dome.castShadow = true;
+  const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.22, 3.2, 10), dark); barrel.rotation.x = Math.PI / 2; barrel.position.z = 2; barrel.castShadow = true;
+  turret.add(dome, barrel); g.add(hull, turret); scene.add(g);
+  return { group: g, turret };
+}
+const tanks = [];
+function makeTank(x, z, enemy) {
+  const m = tankMesh(enemy ? 0xb5503c : 0x3f8f9b);
+  const t = { ...m, x, z, heading: enemy ? Math.atan2(-x, -z) : 0, aim: 0, speed: 0, hp: enemy ? 50 : 100, max: enemy ? 50 : 100, enemy, cool: enemy ? 1.5 + Math.random() : 0, strafe: Math.random() < 0.5 ? 1 : -1, think: 0, dead: false };
+  tanks.push(t); return t;
+}
+const shells = [], booms = [];
+function fire(t) {
+  if (t.cool > 0 || t.dead) return;
+  t.cool = t.enemy ? 1.8 + Math.random() * 1.2 - Math.min(0.8, wave * 0.08) : 0.55;
+  const dir = new THREE.Vector3(Math.sin(t.aim), 0, Math.cos(t.aim));
+  const m = new THREE.Mesh(new THREE.SphereGeometry(0.3, 8, 8), new THREE.MeshBasicMaterial({ color: t.enemy ? 0xffb199 : 0xbff3ff }));
+  m.position.set(t.x + dir.x * 3.8, 1.9, t.z + dir.z * 3.8); scene.add(m);
+  shells.push({ m, v: dir.multiplyScalar(t.enemy ? 34 : 46), from: t, life: 2.5 });
+  sound(t.enemy ? 150 : 200, 0.12, "sawtooth");
+}
+function boom(p, big) {
+  const m = new THREE.Mesh(new THREE.SphereGeometry(big ? 2 : 0.8, 12, 12), new THREE.MeshBasicMaterial({ color: 0xffa040, transparent: true }));
+  m.position.copy(p); scene.add(m); booms.push({ m, life: big ? 0.7 : 0.35, max: big ? 0.7 : 0.35, grow: big ? 5 : 3 });
+  sound(big ? 60 : 90, big ? 0.5 : 0.15, "square");
+}
+
+// ---------------------------------------------------------------- input
+const keys = {}, touch = {}; let mouse = null, mouseDown = false;
+addEventListener("keydown", (e) => {
+  keys[e.code] = true; if (e.code === "Space" || e.code.startsWith("Arrow")) e.preventDefault();
+  if ((e.code === "KeyP" || e.code === "Escape") && state === "play") paused = !paused;
+  if (e.code === "Enter" && state !== "play") start();
+});
+addEventListener("keyup", (e) => { keys[e.code] = false; });
+const ray = new THREE.Raycaster(), ground = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), ndc = new THREE.Vector2();
+renderer.domElement.addEventListener("pointermove", (e) => { ndc.set(e.clientX / innerWidth * 2 - 1, -e.clientY / innerHeight * 2 + 1); mouse = true; });
+renderer.domElement.addEventListener("pointerdown", (e) => { if (state !== "play") return start(); if (e.pointerType === "mouse") mouseDown = true; });
+addEventListener("pointerup", () => { mouseDown = false; });
+const coarse = matchMedia("(pointer: coarse)").matches;
+if (coarse) document.getElementById("touch").style.display = "flex";
+document.querySelectorAll("#touch button").forEach((b) => {
+  b.addEventListener("pointerdown", (e) => { touch[b.dataset.k] = true; e.stopPropagation(); });
+  b.addEventListener("pointerup", () => { touch[b.dataset.k] = false; }); b.addEventListener("pointerleave", () => { touch[b.dataset.k] = false; });
+});
+let actx = null;
+function sound(f, len, type) { try { actx = actx || new AudioContext(); const o = actx.createOscillator(), v = actx.createGain(); o.type = type; o.frequency.value = f; v.gain.value = 0.05; o.frequency.exponentialRampToValueAtTime(f * 0.4, actx.currentTime + len); o.connect(v).connect(actx.destination); o.start(); v.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + len); o.stop(actx.currentTime + len); } catch (e) {} }
+
+// ---------------------------------------------------------------- game state
+let state = "title", paused = false, wave = 0, score = 0, best = 0, player = null, between = 0;
+const $ = (id) => document.getElementById(id);
+function center(t, p) { $("cTitle").textContent = t; $("cText").textContent = p; $("center").style.display = t || p ? "flex" : "none"; }
+function clearAll() { for (const t of tanks) scene.remove(t.group); tanks.length = 0; for (const s of shells) scene.remove(s.m); shells.length = 0; }
+function start() { clearAll(); player = makeTank(0, -SIZE + 10, false); wave = 0; score = 0; paused = false; state = "play"; center("", ""); nextWave(); }
+function nextWave() {
+  wave++; between = 2;
+  const spots = [[-SIZE + 8, SIZE - 8], [SIZE - 8, SIZE - 8], [0, SIZE - 8], [-SIZE + 8, 10], [SIZE - 8, 10], [-SIZE + 8, -20], [SIZE - 8, -20]];
+  for (let i = 0; i < Math.min(7, wave + 1); i++) { const [x, z] = spots[i % spots.length]; if (Math.hypot(x - player.x, z - player.z) > 25) makeTank(x, z, true); else makeTank(-x, -z, true); }
+  if (wave > 1) player.hp = Math.min(player.max, player.hp + 30);
+  center(`Wave ${wave}`, wave === 1 ? "Destroy every tank. Hide behind the blocks." : "+30 armour");
+}
+function hitTank(t, s) {
+  t.hp -= 25; boom(s.m.position, false);
+  if (t.hp <= 0 && !t.dead) {
+    t.dead = true; boom(new THREE.Vector3(t.x, 1.5, t.z), true); scene.remove(t.group);
+    if (t.enemy) score += 100 * wave;
+    else { state = "over"; if (wave > best) { best = wave; if (window.kimi) kimi.storage.set("bestWave", best).catch(() => {}); } center("Destroyed", `You reached wave ${wave} with ${score} points · Enter or tap to play again`); }
+  }
+}
+
+// ---------------------------------------------------------------- the computer's tanks
+function enemyBrain(t, dt) {
+  const dx = player.x - t.x, dz = player.z - t.z, dist = Math.hypot(dx, dz);
+  const sees = clearLine(new THREE.Vector3(t.x, 0, t.z), new THREE.Vector3(player.x, 0, player.z));
+  // aim: lead the player a little, with an error that shrinks with the waves
+  const lead = dist / 34, px = player.x + Math.sin(player.heading) * player.speed * lead, pz = player.z + Math.cos(player.heading) * player.speed * lead;
+  const wantAim = Math.atan2(px - t.x, pz - t.z) + (Math.random() - 0.5) * Math.max(0.04, 0.25 - wave * 0.02);
+  t.aim = turnTo(t.aim, wantAim, 2.2 * dt);
+  // move: close in when it cannot see the player or is far; circle at a distance when it can
+  t.think -= dt; if (t.think <= 0) { t.think = 1 + Math.random() * 2; if (Math.random() < 0.3) t.strafe *= -1; }
+  let want = Math.atan2(dx, dz), go = 1;
+  if (sees && dist < 22) { want += Math.PI / 2 * t.strafe; go = 0.6; }
+  if (sees && dist < 12) { want = Math.atan2(-dx, -dz); go = 0.8; }
+  const ahead = { x: t.x + Math.sin(t.heading) * 5, z: t.z + Math.cos(t.heading) * 5 };
+  if (solidAt(ahead.x, ahead.z, 2)) want = t.heading + 1.3 * t.strafe;           // a block in the way: go round it
+  for (const o of tanks) if (o !== t && !o.dead && o.enemy) { const d = Math.hypot(o.x - t.x, o.z - t.z); if (d < 8) want += (o.x - t.x) * (t.z - o.z) > 0 ? 0.3 : -0.3; }
+  t.heading = turnTo(t.heading, want, 1.6 * dt);
+  t.speed = 9 * go * (1 + Math.min(0.5, wave * 0.05));
+  if (sees && dist < 60 && Math.abs(angleDiff(t.aim, wantAim)) < 0.15) fire(t);
+}
+const angleDiff = (a, b) => Math.atan2(Math.sin(b - a), Math.cos(b - a));
+const turnTo = (a, b, step) => { const d = angleDiff(a, b); return a + Math.max(-step, Math.min(step, d)); };
+
+// ---------------------------------------------------------------- the loop
+let last = performance.now();
+const camPos = new THREE.Vector3(0, 40, -SIZE - 20);
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  if (state === "play" && !paused) {
+    between -= dt; if (between < 0 && $("cTitle").textContent.startsWith("Wave")) center("", "");
+    const pads = navigator.getGamepads ? [...navigator.getGamepads()].filter(Boolean) : [], gp = pads[0];
+    const fwd = (keys.KeyW || keys.ArrowUp || touch.up ? 1 : 0) - (keys.KeyS || keys.ArrowDown || touch.down ? 1 : 0) - (gp ? gp.axes[1] || 0 : 0);
+    const turn = (keys.KeyA || keys.ArrowLeft || touch.left ? 1 : 0) - (keys.KeyD || keys.ArrowRight || touch.right ? 1 : 0) - (gp ? gp.axes[0] || 0 : 0);
+    player.heading += Math.max(-1, Math.min(1, turn)) * 1.9 * dt;
+    player.speed = Math.max(-1, Math.min(1, fwd)) * 14;
+    // aim: the mouse on the ground; a gamepad's right stick; on touch screens the nearest enemy
+    if (gp && Math.hypot(gp.axes[2] || 0, gp.axes[3] || 0) > 0.3) player.aim = player.heading + Math.atan2(-(gp.axes[2] || 0), -(gp.axes[3] || 0));
+    else if (coarse || !mouse) { const near = tanks.filter((t) => t.enemy && !t.dead).sort((a, b) => Math.hypot(a.x - player.x, a.z - player.z) - Math.hypot(b.x - player.x, b.z - player.z))[0]; if (near) player.aim = turnTo(player.aim, Math.atan2(near.x - player.x, near.z - player.z), 3 * dt); }
+    else { ray.setFromCamera(ndc, camera); const p = new THREE.Vector3(); if (ray.ray.intersectPlane(ground, p)) player.aim = turnTo(player.aim, Math.atan2(p.x - player.x, p.z - player.z), 6 * dt); }
+    if (keys.Space || mouseDown || touch.fire || (gp && gp.buttons[7] && gp.buttons[7].value > 0.2)) fire(player);
+    for (const t of tanks) {
+      if (t.dead) continue;
+      t.cool -= dt;
+      if (t.enemy) enemyBrain(t, dt);
+      t.x += Math.sin(t.heading) * t.speed * dt; t.z += Math.cos(t.heading) * t.speed * dt;
+      pushOut(t, 2.4);
+      for (const o of tanks) if (o !== t && !o.dead) { const d = Math.hypot(o.x - t.x, o.z - t.z); if (d < 4.8 && d > 0.01) { t.x -= (o.x - t.x) / d * (4.8 - d) / 2; t.z -= (o.z - t.z) / d * (4.8 - d) / 2; } }
+    }
+    for (let i = shells.length - 1; i >= 0; i--) {
+      const s = shells[i]; s.life -= dt; s.m.position.addScaledVector(s.v, dt);
+      let gone = s.life <= 0 || solidAt(s.m.position.x, s.m.position.z);
+      if (gone && s.life > 0) boom(s.m.position, false);
+      for (const t of tanks) if (!gone && !t.dead && t !== s.from && t.enemy !== s.from.enemy && Math.hypot(t.x - s.m.position.x, t.z - s.m.position.z) < 2.6) { hitTank(t, s); gone = true; }
+      if (gone) { scene.remove(s.m); shells.splice(i, 1); }
+    }
+    if (state === "play" && !tanks.some((t) => t.enemy && !t.dead)) { for (const t of tanks.filter((t) => t.dead)) scene.remove(t.group); tanks.splice(0, tanks.length, player); nextWave(); }
+  }
+  for (let i = booms.length - 1; i >= 0; i--) { const b = booms[i]; b.life -= dt; const k = 1 - b.life / b.max; b.m.scale.setScalar(1 + k * b.grow); b.m.material.opacity = Math.max(0, 1 - k); if (b.life <= 0) { scene.remove(b.m); booms.splice(i, 1); } }
+  for (const t of tanks) { t.group.position.set(t.x, 0, t.z); t.group.rotation.y = t.heading; t.turret.rotation.y = t.aim - t.heading; }
+  if (player) {
+    const want = new THREE.Vector3(player.x - Math.sin(player.heading) * 22, 26, player.z - Math.cos(player.heading) * 22);
+    camPos.lerp(want, Math.min(1, dt * 2.5)); camera.position.copy(camPos); camera.lookAt(player.x + Math.sin(player.heading) * 6, 0, player.z + Math.cos(player.heading) * 6);
+    $("hp").firstElementChild.style.width = `${Math.max(0, player.hp)}%`; $("hp").firstElementChild.style.background = player.hp > 50 ? "#46a37b" : player.hp > 25 ? "#c9a227" : "#e8705a";
+  } else { camera.position.set(Math.sin(now / 4000) * 70, 45, Math.cos(now / 4000) * 70); camera.lookAt(0, 0, 0); }
+  $("wave").textContent = `Wave ${Math.max(1, wave)} · ${tanks.filter((t) => t.enemy && !t.dead).length} left`;
+  $("score").textContent = score; $("best").textContent = best ? `best wave ${best}` : "";
+  if (paused) center("Paused", "P to go on"); else if (state === "play" && $("cTitle").textContent === "Paused") center("", "");
+  renderer.render(scene, camera); requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+if (window.kimi) {
+  kimi.storage.get("bestWave").then((b) => { if (typeof b === "number") best = b; }).catch(() => {});
+  kimi.on("visible", (v) => { if (!v && state === "play") paused = true; });
+}
+</script>
+</body>
+</html>

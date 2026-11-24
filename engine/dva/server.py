@@ -301,6 +301,144 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         data = await body(request)
         return await bench.envelope({"op": "controller_stop", "device": data.get("id")})
 
+    # 2.34.0: a control panel's way to KimiOS's controllers: check a spec, and run it (the guard still applies)
+    @api.post("/api/bench/controller")
+    async def bench_controller(request: Request):
+        from . import bench
+        data = await body(request)
+        spec = data.get("spec")
+        checked = await bench.envelope({"op": "controller_check", "device": data.get("id"), "spec": spec})
+        if not data.get("start") or not checked.get("valid"):
+            return {"valid": bool(checked.get("valid")), "problems": checked.get("problems") or [], "started": False}
+        got = await bench.envelope({"op": "controller_start", "device": data.get("id"), "spec": spec,
+                                    "by": str(data.get("by") or "a control panel")[:80]})
+        return {"valid": True, "problems": [], "started": True, "status": got.get("status")}
+
+    # ------------------------------------------------------------------ apps: device panels and games (2.34.0)
+    @api.get("/api/apps")
+    async def apps_list(kind: str = "", device: str = ""):
+        a = A()
+        return {"apps": await asyncio.to_thread(a.apps.list, kind or None, device or None),
+                "examples": a.apps.examples()}
+
+    @api.post("/api/apps")
+    async def apps_new(request: Request):
+        """Build a new app ({prompt, kind, name, device_id, model, dims}) or add an example ({example, device_id})."""
+        a = A()
+        data = await body(request)
+        device = None
+        if data.get("device_id"):
+            d = await a.devices.describe(data["device_id"])
+            device = {"id": d["id"], "key": d.get("key") or d["id"], "name": d["name"], "kind": d["kind"],
+                      "bench": bool(d.get("bench")), "bench_id": d.get("bench_id"), "simulated": bool(d.get("simulated")),
+                      "model": d.get("name"), "actions": [{k: x.get(k) for k in ("name", "about", "args", "changes",
+                                                                                  "physical")} for x in d["actions"]]}
+        if data.get("example"):
+            return await asyncio.to_thread(a.apps.add_example, data["example"], device)
+        return a.apps.build(prompt=data.get("prompt"), name=data.get("name") or "", kind=data.get("kind") or "game",
+                            device=device, model=data.get("model") or None, dims=data.get("dims") or None,
+                            project_id=data.get("project_id") or None)
+
+    @api.post("/api/apps/import")
+    async def apps_import(request: Request):
+        a = A()
+        ctype = request.headers.get("content-type", "")
+        if ctype.startswith("multipart/"):
+            form = await request.form()
+            f = form.get("file")
+            if f is None:
+                raise ValueError("Choose an app file (.kimiapp)")
+            data = await f.read()
+            return await asyncio.to_thread(a.apps.import_bytes, data, f"the file {f.filename}")
+        data = await body(request)
+        return await a.apps.import_url(data.get("url"))
+
+    @api.get("/api/apps/{app_id}")
+    async def apps_get(app_id: str):
+        return await asyncio.to_thread(A().apps.get, app_id)
+
+    @api.put("/api/apps/{app_id}")
+    async def apps_update(app_id: str, request: Request):
+        a = A()
+        data = await body(request)
+        if data.get("device_id"):                       # bind an imported panel to one of this computer's devices
+            d = await a.devices.describe(data["device_id"])
+            a.apps.bind(app_id, {"id": d["id"], "key": d.get("key") or d["id"], "name": d["name"], "kind": d["kind"],
+                                 "bench": bool(d.get("bench")), "bench_id": d.get("bench_id"),
+                                 "simulated": bool(d.get("simulated")), "model": d.get("name"),
+                                 "actions": [{k: x.get(k) for k in ("name", "about", "args", "changes", "physical")}
+                                             for x in d["actions"]]})
+        a.apps.update(app_id, data)
+        return await asyncio.to_thread(a.apps.get, app_id)
+
+    @api.delete("/api/apps/{app_id}")
+    async def apps_delete(app_id: str):
+        return await asyncio.to_thread(A().apps.delete, app_id)
+
+    @api.post("/api/apps/{app_id}/build")
+    async def apps_build(app_id: str, request: Request):
+        """Rebuild with a prompt (a better model, a change): a new version; the old ones stay."""
+        data = await body(request)
+        return A().apps.build(app_id=app_id, prompt=data.get("prompt"), model=data.get("model") or None,
+                              fresh=bool(data.get("fresh")))
+
+    @api.post("/api/apps/{app_id}/versions/{n}")
+    async def apps_use_version(app_id: str, n: int):
+        A().apps.use_version(app_id, n)
+        return await asyncio.to_thread(A().apps.get, app_id)
+
+    @api.delete("/api/apps/{app_id}/versions/{n}")
+    async def apps_delete_version(app_id: str, n: int):
+        A().apps.delete_version(app_id, n)
+        return await asyncio.to_thread(A().apps.get, app_id)
+
+    @api.get("/api/apps/{app_id}/export")
+    async def apps_export(app_id: str):
+        path = await asyncio.to_thread(A().apps.export, app_id)
+        return FileResponse(path, filename=path.name, media_type="application/zip")
+
+    @api.get("/api/apps/{app_id}/storage")
+    async def apps_storage(app_id: str):
+        return {"storage": A().apps.storage(app_id)}
+
+    @api.put("/api/apps/{app_id}/storage")
+    async def apps_storage_set(app_id: str, request: Request):
+        data = await body(request)
+        return A().apps.storage_set(app_id, data.get("key"), data.get("value"))
+
+    @api.post("/api/apps/{app_id}/ask")
+    async def apps_ask(app_id: str, request: Request):
+        data = await body(request)
+        return await A().apps.ask(app_id, data.get("prompt"), data.get("schema"), data.get("max_tokens") or 400,
+                                  once=bool(data.get("once")))
+
+    @api.post("/api/apps/{app_id}/install")
+    async def apps_install(app_id: str):
+        return await A().apps.install(app_id)
+
+    @api.get("/appframe/{key}/{path:path}")
+    async def app_frame(key: str, path: str, request: Request):
+        """An app's files, for its sandboxed frame (no token: the key in the address is the app's and this start's
+        alone). index.html gets KimiLM's part first; every answer carries the frame's own policy."""
+        a = A()
+        try:
+            target, _app_id, _n = a.apps.frame_file(key, path)
+        except KeyError:
+            return JSONResponse({"error": "not found"}, 404)
+        headers = {"Content-Security-Policy": a.apps.frame_policy(request.headers.get("host", "")),
+                   "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store",
+                   "X-Content-Type-Options": "nosniff"}
+        if target.name == "index.html" and (path or "index.html").endswith("index.html") and "_lib/" not in path:
+            from fastapi.responses import HTMLResponse
+            html = await asyncio.to_thread(target.read_text, encoding="utf-8", errors="replace")
+            return HTMLResponse(a.apps.page(html), headers=headers)
+        media = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        if target.suffix in (".js", ".mjs"):
+            media = "text/javascript"
+        if "_lib/" in path:
+            headers["Cache-Control"] = "max-age=86400"
+        return FileResponse(target, media_type=media, headers=headers)
+
     @api.get("/api/snapshots")
     async def snapshots_list():
         """2.32.0: KimiOS's snapshots of the home folder (Activity → Undo)."""

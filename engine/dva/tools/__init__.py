@@ -117,9 +117,9 @@ class ToolContext:
 
 
 def builtin_tools():
-    from . import browser, devices, files, images, meta, python_exec, setup, sound, video, vision, web
+    from . import apps, browser, devices, files, images, meta, python_exec, setup, sound, video, vision, web
     return (files.TOOLS + web.TOOLS + browser.TOOLS + python_exec.TOOLS + meta.TOOLS + vision.TOOLS + images.TOOLS
-            + sound.TOOLS + video.TOOLS + setup.TOOLS + devices.TOOLS)
+            + sound.TOOLS + video.TOOLS + setup.TOOLS + devices.TOOLS + apps.TOOLS)
 
 
 GROUPS = {
@@ -140,9 +140,10 @@ GROUPS = {
     "setup": "Find and install programs the work needs (every agent has these: 2.29.0)",
     "devices": "See the devices attached to this computer (phones, boards, sensors, displays, keyboards, audio, "
                "Bluetooth), what drives them and what can be done with them, and control them",
+    "apps": "Save the app (a device's control panel or a game) being built in this chat (2.34.0: the App builder's)",
 }
 # 2.29.0: groups every agent gets, whatever its harness lists or its step was given
 ALWAYS = ("setup",)
 # Groups a harness gets only when it lists them: they are a specialist's kit, and every tool in a model's list
 # costs reading time and makes the right choice harder (2.16.0).
-ON_REQUEST = ("browsing",)
+ON_REQUEST = ("browsing", "apps")

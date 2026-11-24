@@ -1,0 +1,9 @@
+{
+  "name": "Paddle Duel",
+  "kind": "game",
+  "dims": "2D",
+  "about": "Table tennis against the computer: first to 7. Arrow keys, W/S, the mouse, touch or a gamepad; the computer gets quicker as you win.",
+  "icon": {"emoji": "🏓", "color": "#E8705A"},
+  "notes": "An example game that comes with KimiLM",
+  "prompt": "A 2D paddle game against the computer: first to 7 points, the ball speeds up with each hit, the computer's paddle follows the ball with a delay so it can be beaten, levels that make it quicker, a best-streak record."
+}

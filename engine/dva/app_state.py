@@ -143,6 +143,8 @@ class App:
         self.scheduler = Scheduler(self)
         self.services = Services(self)
         self.devices = Devices(self)                 # what is plugged in (2.29.0)
+        from .apps import Apps
+        self.apps = Apps(self)                       # device panels and games a model builds (2.34.0)
         self.images = Images(self)
         self.sound = Sound(self)
         self.voices = Voices(self)                   # your own voice: takes, checks, the reference (2.18.0)
@@ -239,6 +241,10 @@ class App:
         self._bg.append(asyncio.create_task(self.telemetry.watch(
             self.bus, lambda mid: (self.models.get_any(mid) or {}).get("name") or str(mid).split(":")[-1])))
         self._bg.append(asyncio.create_task(self.devices._watch()))     # 2.29.0: devices coming and going
+        try:
+            await asyncio.to_thread(self.apps.seed)                     # 2.34.0: the example games, once
+        except Exception as exc:                                        # noqa: BLE001 — never stops the start
+            self.log(f"apps: the examples could not be added: {exc}")
         self.log(f"engine started; data {self.paths.data}; secrets backend {self.secrets.backend}")
         # runs that were going when the app closed or crashed can be continued (2.7.0)
         cut = self.db.all("SELECT id, chat_id, resumes, kind FROM runs WHERE status='running'")
@@ -553,6 +559,10 @@ class App:
 
     def after_turn(self, chat_id, status):
         """Run queued follow-ups (together, as one new turn). After Stop they are kept but not sent."""
+        try:
+            self.apps.after_turn(chat_id, status)      # 2.34.0: a builder that changed its app but did not save it
+        except Exception as exc:                       # noqa: BLE001 — a reply must never fail on this
+            self.log(f"apps: after the turn: {exc}")
         pending = self.pending_messages(chat_id)
         if not pending:
             return
