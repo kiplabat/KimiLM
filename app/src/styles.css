@@ -722,3 +722,8 @@ a.btn { text-decoration: none; color: var(--text); }
 .app-foot { padding-top: 2px; }
 .app-rebuild { margin: 0; }
 .app-inline { border-top: 1px solid var(--line); padding-top: 10px; }
+/* 2.35.0: an app tried before it is shown; sharing to the registry */
+.app-tried { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; padding: 2px 8px; border-radius: 99px; }
+.app-tried.ok { color: var(--ok, #2f8a5b); background: rgba(70, 163, 123, .12); }
+.app-tried.bad { color: var(--danger); background: rgba(217, 65, 43, .1); }
+.app-ask.share { background: rgba(78, 141, 224, .1); border-color: rgba(78, 141, 224, .4); }

@@ -269,6 +269,7 @@ export default function Settings({ section }: { section?: string }) {
         </Field>
         <Toggle checked={s.notify_sound ?? true} onChange={(v: boolean) => set({ notify_sound: v })} label="A short sound when something needs me" />
         <Toggle checked={s.devices_watch ?? true} onChange={(v: boolean) => set({ devices_watch: v })} label="Tell me when a device is plugged in or taken out (Devices)" />
+        <Toggle checked={s.apps_preview ?? true} onChange={(v: boolean) => set({ apps_preview: v })} label="Try every app the builder saves for a few seconds in a hidden browser, and tell the builder what went wrong (Apps)" />
       </div>
         {shell && (
           <div className="card stack-s">

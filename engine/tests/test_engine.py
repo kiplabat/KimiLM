@@ -2505,7 +2505,7 @@ def test_connectors_are_taken_over_tested_and_used(engine):
     row = next(x for x in c.get("/api/connectors").json()["connectors"] if x["id"] == cid)
     assert row["env"] == {"API_KEY": "", "REGION": ""}
     assert c.delete(f"/api/connectors/{cid}/delete").json()["ok"]
-    c.put("/api/settings", json={"max_native_tools": 49})
+    c.put("/api/settings", json={"max_native_tools": 50})
 
 
 def test_remote_connectors_send_headers_speak_both_transports_and_sign_in(tmp_path, monkeypatch):

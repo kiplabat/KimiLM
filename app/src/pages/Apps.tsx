@@ -1,7 +1,7 @@
 // 2.34.0: Apps: every control panel and game built for you, opened like any other app. Install one from a file
 // or a web address, add the examples, open one here or in its own window (or from the computer's apps menu).
 import React, { useEffect, useRef, useState } from "react";
-import { Download, Gamepad2, Globe, LayoutGrid, Plus, SlidersHorizontal, Upload } from "lucide-react";
+import { Download, Gamepad2, Globe, LayoutGrid, Library, Plus, SlidersHorizontal, Upload } from "lucide-react";
 import { api, enc } from "../api";
 import { go, useApp, useEvent } from "../store";
 import { Badge, Button, Empty, PageHeader, Spinner, Tabs } from "../components/ui";
@@ -44,6 +44,38 @@ function Bind({ app, onDone }: any) {
       <div className="row gap-s wrap">{(fit.length ? fit : devices).slice(0, 24).map((d) => <Button key={d.id} small onClick={async () => {
         try { await api.put(`/apps/${enc(app.id)}`, { device_id: d.id }); toast(`${app.name} now controls ${d.name}`, "ok"); onDone(); } catch (e: any) { toast(e.message, "error"); }
       }}>{d.name}</Button>)}</div>
+    </div>
+  );
+}
+
+// 2.35.0: apps others shared in kimios-registry (reviewed by pull request), installed after a sha256 check
+function Registry() {
+  const { toast } = useApp();
+  const [rows, setRows] = useState<any[] | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState("");
+  const load = () => api.get("/apps/registry").then((r) => { setRows(r.apps); setError(""); }).catch((e) => { setRows([]); setError(e.message); });
+  useEffect(() => { load(); }, []);
+  const install = async (r: any) => {
+    setBusy(r.path);
+    try { const a = await api.post("/apps/registry/install", { path: r.path }); toast(`Installed ${a.name}`, "ok"); go("apps", a.id); }
+    catch (e: any) { toast(e.message, "error"); } finally { setBusy(""); }
+  };
+  return (
+    <div className="card stack-s" style={{ marginTop: 18 }}>
+      <h3><Library size={15} /> From the registry</h3>
+      <div className="muted small">Games and control panels people shared in kimios-registry (each one reviewed before it is listed). Share one of yours from its bar.</div>
+      {rows === null ? <Spinner /> : error ? <div className="muted small">The registry could not be read: {error}</div> : rows.length === 0 ? <div className="muted small">Nothing shared yet.</div> :
+        <div className="app-grid small-grid">{rows.map((r) => (
+          <div key={r.path} className="app-tile" title={r.about}>
+            {appIcon(r, 44)}
+            <span className="stack-xs grow" style={{ minWidth: 0, alignItems: "flex-start" }}>
+              <b className="ellipsis" style={{ maxWidth: "100%" }}>{r.name}</b>
+              <span className="muted small ellipsis" style={{ maxWidth: "100%" }}>{r.app_kind === "game" ? `${r.dims ? r.dims + " " : ""}game` : `control panel · ${r.for?.model || r.for?.kind || "a device"}`}</span>
+              {r.installed ? <Button small onClick={() => go("apps", r.installed)}>Open</Button>
+                : <Button small kind="primary" busy={busy === r.path} onClick={() => install(r)}>Install</Button>}
+            </span>
+          </div>))}</div>}
     </div>
   );
 }
@@ -102,6 +134,7 @@ export default function Apps({ openId }: { openId?: string }) {
           {missing.map((e: any) => <Button key={e.example} small icon={<Plus size={12} />} onClick={async () => {
             try { const a = await api.post("/apps", { example: e.example }); go("apps", a.id); } catch (x: any) { toast(x.message, "error"); } }}>{e.name}</Button>)}</div>}
       </div>
+      <Registry />
     </div>
   );
 }

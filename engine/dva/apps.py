@@ -217,6 +217,8 @@ class Apps:
         self.root.mkdir(parents=True, exist_ok=True)
         self.secret = secrets.token_bytes(24)       # frame addresses change at each start
         self.asking = {}                            # app id -> lock: one question to a model at a time
+        self.preview_data = {}                      # frame key -> what the preview page answers with (2.35.0)
+        self.previewing = asyncio.Lock()            # one preview at a time: a headless browser is not small
 
     # ---------------------------------------------------------------- the store
     def _dir(self, app_id):
@@ -244,6 +246,31 @@ class Apps:
     def _ids(self):
         return sorted(p.name for p in self.root.iterdir() if p.is_dir() and (p / "app.json").is_file()
                       and ID.match(p.name))
+
+    @staticmethod
+    def device_ref(d):
+        """What an app keeps of its device (from Devices.describe): enough to find it again and to brief a builder."""
+        return {"id": d["id"], "key": d.get("key") or d["id"], "name": d["name"], "kind": d["kind"],
+                "bench": bool(d.get("bench")), "bench_id": d.get("bench_id"), "simulated": bool(d.get("simulated")),
+                "model": d.get("name"), "actions": [{k: x.get(k) for k in ("name", "about", "args", "changes", "physical")}
+                                                    for x in d.get("actions") or []]}
+
+    async def find_device(self, words):
+        """A device by id, or by words of its name or kind (for an agent that says 'the monitor')."""
+        words = str(words or "").strip()
+        if not words:
+            raise AppError("Say which device the panel is for")
+        found = await self.app.devices.look()
+        for d in found:
+            if words in (d.get("id"), d.get("key")):
+                return self.device_ref(await self.app.devices.describe(d["id"]))
+        low = set(re.findall(r"[a-z0-9]+", words.lower())) - {"the", "my", "a", "an", "device"}
+        scored = sorted(((len(low & set(re.findall(r"[a-z0-9]+", f"{d.get('name')} {d.get('kind')} {d.get('id')}".lower()))), d)
+                         for d in found), key=lambda x: -x[0])
+        if not scored or scored[0][0] == 0:
+            names = ", ".join(f"{d.get('name')} ({d.get('id')})" for d in found[:12])
+            raise AppError(f"No device matches “{words}”. Devices here: {names or 'none'}")
+        return self.device_ref(await self.app.devices.describe(scored[0][1]["id"]))
 
     def summary(self, m):
         cur = next((v for v in m.get("versions") or [] if v["n"] == m.get("current")), None)
@@ -430,6 +457,8 @@ class Apps:
         path = str(path or "index.html").replace("\\", "/").lstrip("/")
         if path == "_kimi.js":
             return SDK, app_id, int(n)
+        if path in ("_preview.html", "_preview.js"):          # 2.35.0: the page an app is tried in
+            return EXAMPLES / path[1:], app_id, int(n)
         if path.startswith("_lib/"):
             base = LIB.resolve()
             target = (base / path[5:]).resolve()
@@ -458,6 +487,86 @@ class Apps:
         return (f"default-src {own}; script-src {own} 'unsafe-inline' 'unsafe-eval'; style-src {own} 'unsafe-inline'; "
                 f"img-src {own}; media-src {own}; font-src {own}; connect-src {own}; worker-src {own}; "
                 "frame-src 'none'; object-src 'none'; form-action 'none'; base-uri 'self'")
+
+    # ---------------------------------------------------------------- trying it before the person does (2.35.0)
+    def preview_page(self, key):
+        """The preview page (builtin/apps/preview.html) with the stand-in answers for this app filled in."""
+        data = self.preview_data.get(key) or {}
+        text = (EXAMPLES / "preview.html").read_text(encoding="utf-8")
+        blob = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+        return text.replace("__PREVIEW_DATA__", blob)
+
+    async def _preview_answers(self, m):
+        """What the preview answers kimi.device with: the device's real description and state (reading only)."""
+        dev = m.get("device") or {}
+        out = {"app": {"id": m["id"], "name": m["name"], "kind": m["kind"], "version": m.get("current")},
+               "device": {k: dev.get(k) for k in ("id", "name", "kind", "bench", "simulated")} if dev.get("id") else None}
+        if m["kind"] != "device" or not dev.get("id"):
+            return out
+        try:
+            if dev.get("bench"):
+                from . import bench
+                bid = dev.get("bench_id") or str(dev["id"]).removeprefix("bench:")
+                out["info"] = await bench.envelope({"op": "device", "device": bid})
+                try:
+                    out["history"] = (await bench.envelope({"op": "history", "device": bid, "limit": 300})).get("rows") or []
+                except Exception:                                     # noqa: BLE001 — no driver yet: no history
+                    out["history"] = []
+            else:
+                out["info"] = await self.app.devices.describe(dev["id"])
+        except Exception as exc:                                      # noqa: BLE001 — unplugged: describe what it was
+            out["info"] = {"id": dev.get("id"), "name": dev.get("name"), "kind": dev.get("kind"),
+                           "actions": dev.get("actions") or [], "note": f"not reachable now: {exc}"}
+        return out
+
+    async def preview(self, app_id, n=None):
+        """Open a version for a few seconds in a headless browser with stand-in answers, and keep what it showed
+        with the version: {"ok", "problems", "notes", "how", "at"}; {"skipped": why} when it cannot be tried."""
+        from . import app_preview
+        m = self.manifest(app_id)
+        n = int(n or m.get("current") or 0)
+        if not any(v["n"] == n for v in m.get("versions") or []):
+            raise AppError(f"{m['name']} has no version {n or ''} to try".replace("  ", " "))
+        if self.app.db.setting("apps_preview") is False:
+            return {"skipped": "trying apps is switched off (Settings)"}
+        port = os.environ.get("DVA_PORT")
+        if not port:
+            return {"skipped": "the engine's address is not known"}
+        key = self.frame_key(app_id, n)
+        async with self.previewing:
+            self.preview_data[key] = await self._preview_answers(m)
+            try:
+                result, how = await app_preview.run(f"http://127.0.0.1:{port}/appframe/{key}/_preview.html")
+            finally:
+                self.preview_data.pop(key, None)
+        if result is None:
+            got = {"skipped": how, "at": now()}
+        else:
+            problems, notes = app_preview.summary(result, m["kind"])
+            got = {"ok": not problems, "problems": problems, "notes": notes, "how": how, "at": now()}
+        m = self.manifest(app_id)
+        for v in m.get("versions") or []:
+            if v["n"] == n:
+                v["preview"] = got
+        self._save(m)
+        return got
+
+    @staticmethod
+    def preview_text(got):
+        """The preview, in words for the builder (and the chat)."""
+        if not got:
+            return ""
+        if got.get("skipped"):
+            return f"It could not be tried before the person sees it: {got['skipped']}."
+        lines = [f"Tried it for a few seconds ({got.get('how')}), with keys pressed and a click; nothing reached a "
+                 "device or a model:"]
+        if got.get("notes"):
+            lines.append("- " + "; ".join(got["notes"]))
+        if got.get("problems"):
+            lines.append("To fix (then save again):\n" + "\n".join(f"- {p}" for p in got["problems"]))
+        else:
+            lines.append("- no problems seen.")
+        return "\n".join(lines)
 
     # ---------------------------------------------------------------- the app's own store
     def storage(self, app_id):
@@ -574,6 +683,46 @@ class Apps:
         except httpx.HTTPError as exc:
             raise AppError(f"The app could not be downloaded: {exc}") from None
         return self.import_bytes(data, origin=url, device=device)
+
+    # ---------------------------------------------------------------- kimios-registry (2.35.0)
+    def share(self, app_id, note=""):
+        """Write the version in use as a registry entry on this computer and give the link that proposes it."""
+        from . import app_share
+        m = self.manifest(app_id)
+        vdir = self.version_dir(app_id)
+        try:
+            entry = app_share.make_entry(m, vdir, note, self.app_version())
+        except app_share.ShareError as exc:
+            raise AppError(str(exc)) from None
+        problems = app_share.check_entry(app_share.entry_path(entry), json.dumps(entry).encode("utf-8"), check_files)
+        if problems:
+            raise AppError("The registry would not take it yet: " + "; ".join(p.split(": ", 1)[-1] for p in problems))
+        return app_share.prepare(entry, self.app.paths.data / "exports" / "share")
+
+    async def registry(self):
+        """The apps in the registry, marked when one is installed here."""
+        from . import app_share
+        try:
+            rows = await app_share.index()
+        except app_share.ShareError as exc:
+            raise AppError(str(exc)) from None
+        have = {}
+        for app_id in self._ids():
+            try:
+                origin = self.manifest(app_id).get("from") or ""
+            except KeyError:
+                continue
+            if origin.startswith("the registry: "):
+                have[origin[len("the registry: "):]] = app_id
+        return [{**r, "installed": have.get(r.get("path"))} for r in rows]
+
+    async def install_from_registry(self, rel, device=None):
+        from . import app_share
+        try:
+            entry = await app_share.get(rel)
+        except app_share.ShareError as exc:
+            raise AppError(str(exc)) from None
+        return await asyncio.to_thread(self.import_bytes, app_share.as_kimiapp(entry), f"the registry: {rel}", device)
 
     def bind(self, app_id, device):
         """Give an imported device panel one of this computer's devices."""
@@ -741,9 +890,11 @@ class Apps:
             last = next((v for v in m.get("versions") or [] if v["n"] == m.get("current")), {})
             if fp and fp != b.get("fingerprint") and fp != last.get("fingerprint"):
                 try:
-                    self.save_version(app_id, notes="Saved when the builder finished", prompt=b.get("prompt") or "",
-                                      model=self._chat_model(chat_id), chat_id=chat_id, by="auto")
-                    self._say(chat_id, f"Saved the app as version {self.manifest(app_id)['current']}.")
+                    got = self.save_version(app_id, notes="Saved when the builder finished",
+                                            prompt=b.get("prompt") or "", model=self._chat_model(chat_id),
+                                            chat_id=chat_id, by="auto")
+                    self._say(chat_id, f"Saved the app as version {got['version']}.")
+                    self._later(self._preview_and_say(app_id, got["version"], chat_id))
                 except AppError as exc:
                     self._say(chat_id, f"The app could not be saved: {exc}. Ask me to fix it.")
             m = self.manifest(app_id)
@@ -761,6 +912,25 @@ class Apps:
         mid = ((row or {}).get("meta") or {}).get("model") or (self.app.db.get("chats", chat_id) or {}).get("model") or ""
         named = self.app.models.get_any(mid) if mid else None
         return (named or {}).get("name") or mid
+
+    def _later(self, coro):
+        try:
+            task = asyncio.get_running_loop().create_task(coro)
+            self._tasks = getattr(self, "_tasks", set())
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        except RuntimeError:                       # no loop (a test calling this directly)
+            coro.close()
+
+    async def _preview_and_say(self, app_id, n, chat_id):
+        try:
+            got = await self.preview(app_id, n)
+        except Exception as exc:                   # noqa: BLE001 — a preview never breaks a saved app
+            self.app.log(f"apps: preview of {app_id} v{n}: {exc}")
+            return
+        if got.get("problems"):
+            self._say(chat_id, f"Version {n} was tried and showed problems: {'; '.join(got['problems'])[:300]}. "
+                               "Ask the builder in this chat to fix them.")
 
     def _say(self, chat_id, text):
         self.app.bus.publish("notify", title="Apps", body=text, level="info", chat_id=chat_id)

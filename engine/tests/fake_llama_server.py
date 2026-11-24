@@ -138,6 +138,9 @@ def decide(body):
     # apps (2.34.0): the App builder writes index.html ("Build a game called …"); with "save with the tool" in the
     # request it then calls save_app itself, otherwise the app saves the draft when the turn ends. "broken app"
     # writes a script with a syntax error, so save_app answers with what to fix.
+    if "Make me a game:" in text and "build_app" in tools and not after_tool:                   # 2.35.0
+        wish = text.split("Make me a game:", 1)[1].strip().splitlines()[0]
+        return {"tool": ("build_app", {"description": wish, "kind": "game", "dims": "2D"})}
     if "Build a game called" in text and "write_file" in tools and not after_tool:
         broken = "broken app" in text
         page = ("<!doctype html><html><head><title>Stand-in</title></head><body><canvas id=c></canvas><script>"

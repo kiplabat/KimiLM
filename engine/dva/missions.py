@@ -53,7 +53,7 @@ ALLOWABLE = {
     "browser": "click, type and choose on websites",
     "connector": "use the actions of its connectors",
     "skills": "save skills",
-    "automation": "create scheduled tasks and harnesses",
+    "automation": "create scheduled tasks and harnesses, and have apps built",
 }
 OPEN = ("paused", "stopped", "interrupted")
 NOTHING = re.compile(r"^\W*(nothing|none|no\b|n/?a|not applicable|-+|—+)", re.I)

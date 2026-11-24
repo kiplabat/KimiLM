@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 from . import VERSION
 from .app_state import App
@@ -328,11 +328,7 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         data = await body(request)
         device = None
         if data.get("device_id"):
-            d = await a.devices.describe(data["device_id"])
-            device = {"id": d["id"], "key": d.get("key") or d["id"], "name": d["name"], "kind": d["kind"],
-                      "bench": bool(d.get("bench")), "bench_id": d.get("bench_id"), "simulated": bool(d.get("simulated")),
-                      "model": d.get("name"), "actions": [{k: x.get(k) for k in ("name", "about", "args", "changes",
-                                                                                  "physical")} for x in d["actions"]]}
+            device = a.apps.device_ref(await a.devices.describe(data["device_id"]))
         if data.get("example"):
             return await asyncio.to_thread(a.apps.add_example, data["example"], device)
         return a.apps.build(prompt=data.get("prompt"), name=data.get("name") or "", kind=data.get("kind") or "game",
@@ -353,6 +349,21 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         data = await body(request)
         return await a.apps.import_url(data.get("url"))
 
+    # 2.35.0: kimios-registry: apps shared on purpose (reviewed by pull request), and installing them
+    @api.get("/api/apps/registry")
+    async def apps_registry():
+        return {"apps": await A().apps.registry()}
+
+    @api.post("/api/apps/registry/install")
+    async def apps_registry_install(request: Request):
+        data = await body(request)
+        return await A().apps.install_from_registry(data.get("path"))
+
+    @api.post("/api/apps/{app_id}/share")
+    async def apps_share(app_id: str, request: Request):
+        data = await body(request)
+        return await asyncio.to_thread(A().apps.share, app_id, data.get("note") or "")
+
     @api.get("/api/apps/{app_id}")
     async def apps_get(app_id: str):
         return await asyncio.to_thread(A().apps.get, app_id)
@@ -362,12 +373,7 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         a = A()
         data = await body(request)
         if data.get("device_id"):                       # bind an imported panel to one of this computer's devices
-            d = await a.devices.describe(data["device_id"])
-            a.apps.bind(app_id, {"id": d["id"], "key": d.get("key") or d["id"], "name": d["name"], "kind": d["kind"],
-                                 "bench": bool(d.get("bench")), "bench_id": d.get("bench_id"),
-                                 "simulated": bool(d.get("simulated")), "model": d.get("name"),
-                                 "actions": [{k: x.get(k) for k in ("name", "about", "args", "changes", "physical")}
-                                             for x in d["actions"]]})
+            a.apps.bind(app_id, a.apps.device_ref(await a.devices.describe(data["device_id"])))
         a.apps.update(app_id, data)
         return await asyncio.to_thread(a.apps.get, app_id)
 
@@ -412,6 +418,11 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         return await A().apps.ask(app_id, data.get("prompt"), data.get("schema"), data.get("max_tokens") or 400,
                                   once=bool(data.get("once")))
 
+    @api.post("/api/apps/{app_id}/versions/{n}/preview")
+    async def apps_preview(app_id: str, n: int):
+        """2.35.0: try a version for a few seconds in a headless browser (stand-ins for the device and the model)."""
+        return await A().apps.preview(app_id, n)
+
     @api.post("/api/apps/{app_id}/install")
     async def apps_install(app_id: str):
         return await A().apps.install(app_id)
@@ -421,6 +432,14 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         """An app's files, for its sandboxed frame (no token: the key in the address is the app's and this start's
         alone). index.html gets KimiLM's part first; every answer carries the frame's own policy."""
         a = A()
+        if path == "_wait":           # 2.35.0: holds a preview page's load until its result is written
+            try:
+                a.apps.frame_file(key, "_preview.js")
+            except KeyError:
+                return JSONResponse({"error": "not found"}, 404)
+            await asyncio.sleep(5.5)
+            return Response(content=b"GIF89a\x01\x00\x01\x00\x00\x00\x00;", media_type="image/gif",
+                            headers={"Cache-Control": "no-store", "Access-Control-Allow-Origin": "*"})
         try:
             target, _app_id, _n = a.apps.frame_file(key, path)
         except KeyError:
@@ -428,6 +447,12 @@ def create_app(data_dir=None, resources_dir=None, token=None):
         headers = {"Content-Security-Policy": a.apps.frame_policy(request.headers.get("host", "")),
                    "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store",
                    "X-Content-Type-Options": "nosniff"}
+        if path == "_preview.html":                                   # 2.35.0: an app being tried
+            from fastapi.responses import HTMLResponse
+            host = request.headers.get("host", "")
+            headers["Content-Security-Policy"] = headers["Content-Security-Policy"].replace(
+                "frame-src 'none'", f"frame-src 'self' http://{host}")       # the page holds the app in a frame
+            return HTMLResponse(a.apps.preview_page(key), headers=headers)
         if target.name == "index.html" and (path or "index.html").endswith("index.html") and "_lib/" not in path:
             from fastapi.responses import HTMLResponse
             html = await asyncio.to_thread(target.read_text, encoding="utf-8", errors="replace")

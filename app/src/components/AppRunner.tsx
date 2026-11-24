@@ -5,7 +5,8 @@
 // computer's apps menu and uninstall.
 import React, { useEffect, useRef, useState } from "react";
 import {
-  ArrowLeft, Bug, Cpu, ExternalLink, Hammer, Maximize2, MessageSquare, Monitor, RotateCcw, Trash2, Upload, X,
+  ArrowLeft, Bug, CheckCircle2, Cpu, ExternalLink, FlaskConical, Hammer, Maximize2, MessageSquare, Monitor, RotateCcw,
+  Share2, Trash2, Upload, X,
 } from "lucide-react";
 import { api, desktop, enc, TOKEN } from "../api";
 import { go, useApp, useEvent, useShown } from "../store";
@@ -43,6 +44,7 @@ export default function AppRunner({ appId, solo, embedded, onBack }: { appId: st
   const [fresh, setFresh] = useState(false);
   const [busy, setBusy] = useState("");
   const [frameKey, setFrameKey] = useState(0);
+  const [shared, setShared] = useState<any>(null);       // 2.35.0: the registry entry written for sharing
   const frame = useRef<HTMLIFrameElement>(null);
   const appRef = useRef<any>(null);
   const once = useRef<Record<string, boolean>>({});
@@ -211,6 +213,18 @@ export default function AppRunner({ appId, solo, embedded, onBack }: { appId: st
       if (solo) window.close(); else if (onBack) onBack(); else go("apps");
     } catch (e: any) { toast(e.message, "error"); }
   };
+  const tryIt = async () => {                 // 2.35.0: a few seconds in a hidden browser, with stand-ins
+    setBusy("try");
+    try { const r = await api.post(`/apps/${enc(app.id)}/versions/${app.current}/preview`); load();
+      toast(r.skipped ? `Not tried: ${r.skipped}` : r.ok ? "Tried it: no problems seen" : `Tried it: ${r.problems.length} problem(s)`, r.ok ? "ok" : "info"); }
+    catch (e: any) { toast(e.message, "error"); } finally { setBusy(""); }
+  };
+  const share = async () => {
+    setBusy("share");
+    try { setShared(await api.post(`/apps/${enc(app.id)}/share`, {})); }
+    catch (e: any) { toast(e.message, "error"); } finally { setBusy(""); }
+  };
+  const openLink = (url: string) => { if (desktop?.openExternal) desktop.openExternal(url); else window.open(url, "_blank", "noopener"); };
   const install = async () => {
     setBusy("install");
     try { const r = await api.post(`/apps/${enc(app.id)}/install`); toast(r.result, "ok"); load(); }
@@ -230,6 +244,9 @@ export default function AppRunner({ appId, solo, embedded, onBack }: { appId: st
           <span className="muted small ellipsis">{kindLabel(app)}{app.device?.name ? ` · ${app.device.name}` : ""}{cur?.model ? ` · built by ${cur.model}` : ""}</span>
         </div>
         {app.building && <Badge kind="accent" title="A builder is making a new version; this one stays until it is saved"><Spinner size={11} /> building</Badge>}
+        {cur?.preview && !cur.preview.skipped && (cur.preview.ok
+          ? <span className="app-tried ok" title={`Tried for a few seconds (${cur.preview.how}): ${(cur.preview.notes || []).join("; ")}`}><CheckCircle2 size={13} /> tried</span>
+          : <span className="app-tried bad" title={(cur.preview.problems || []).join("\n")}><Bug size={13} /> {cur.preview.problems.length} problem{cur.preview.problems.length === 1 ? "" : "s"} when tried</span>)}
         <div className="grow" />
         {(app.versions || []).length > 0 && <select className="input narrow-auto" value={app.current || ""} title="Every build is a version; choose which one runs"
           onChange={async (e) => { setApp(await api.post(`/apps/${enc(app.id)}/versions/${e.target.value}`)); setFrameKey((k) => k + 1); }}>
@@ -254,6 +271,16 @@ export default function AppRunner({ appId, solo, embedded, onBack }: { appId: st
       </div>}
       {asks.map((q) => <div key={q.id} className="app-ask"><span className="grow">{q.text}</span>
         {q.choices.map(([v, label]) => <Button key={v} small kind={v === "no" ? "ghost" : v === "once" ? "default" : "primary"} onClick={() => q.resolve(v)}>{label}</Button>)}</div>)}
+      {cur?.preview?.problems?.length > 0 && !errors.length && <div className="app-errors"><Bug size={14} />
+        <span className="grow ellipsis" title={cur.preview.problems.join("\n")}>When it was tried: {cur.preview.problems[0]}</span>
+        <Button small onClick={() => doRebuild(`When the app was tried it showed these problems; fix them and keep everything else as it is:\n${cur.preview.problems.join("\n")}`)} busy={busy === "build"}>Ask the builder to fix it</Button></div>}
+      {shared && <div className="app-ask share"><Share2 size={14} />
+        <span className="grow">Written for the registry: <code>{shared.path}</code>. {shared.upload
+          ? <>It is too long for a filled-in link: open the upload page and drop the file <code>{shared.file}</code> there, then press <b>Propose changes</b>.</>
+          : <>Open the link, read it on GitHub and press <b>Propose changes</b>.</>} Nothing is sent before that; the registry reviews it.</span>
+        <Button small kind="primary" onClick={() => openLink(shared.link)}>{shared.upload ? "Open the upload page" : "Open the link"}</Button>
+        {desktop?.showItem && <Button small onClick={() => desktop.showItem(shared.file)}>Show the file</Button>}
+        <button className="icon-btn" onClick={() => setShared(null)}><X size={13} /></button></div>}
       {errors.length > 0 && <div className="app-errors"><Bug size={14} /><span className="grow ellipsis" title={errors.join("\n")}>{errors[errors.length - 1]}</span>
         <Button small onClick={fixErrors} busy={busy === "build"}>Ask the builder to fix it</Button>
         <button className="icon-btn" onClick={() => setErrors([])}><X size={13} /></button></div>}
@@ -268,7 +295,11 @@ export default function AppRunner({ appId, solo, embedded, onBack }: { appId: st
           title="Put this version's device part on the device">Install on the device ({app.device_part.target})</Button>}
         {app.installed && <span className="muted">on the device: v{app.installed.version}, {String(app.installed.when).slice(0, 16).replace("T", " ")}</span>}
         <div className="grow" />
+        {app.current && <Button small kind="ghost" icon={<FlaskConical size={13} />} busy={busy === "try"} onClick={tryIt}
+          title="Run this version for a few seconds in a hidden browser (nothing reaches the device or a model) and see what it shows">Try it</Button>}
         <Button small kind="ghost" icon={<Upload size={13} />} onClick={exportApp} title="A .kimiapp file to install on another computer">Export</Button>
+        {app.current && <Button small kind="ghost" icon={<Share2 size={13} />} busy={busy === "share"} onClick={share}
+          title="Propose it to kimios-registry, where others can install it (you read it on GitHub first)">Share</Button>}
         {desktop?.appShortcut && !solo && (app.shortcut
           ? <Button small kind="ghost" icon={<Monitor size={13} />} onClick={() => shortcut(false)}>Remove from the computer's apps</Button>
           : <Button small kind="ghost" icon={<Monitor size={13} />} onClick={() => shortcut(true)} title="Open it from the computer's own apps menu, like any other app">Add to the computer's apps</Button>)}

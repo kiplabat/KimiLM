@@ -123,6 +123,7 @@ function startEngine() {
       DVA_UI_DIR: uiDir,
       DVA_NODE: process.execPath,
       DVA_NODE_IS_ELECTRON: "1",
+      DVA_ELECTRON_APP: isDev ? path.join(__dirname, "..") : "",    // 2.35.0: how to start this shell again (previews)
       DVA_PLAYWRIGHT_MCP: playwrightCli(),
       PYTHONUTF8: "1",
       PYTHONIOENCODING: "utf-8",
@@ -416,8 +417,44 @@ ipcMain.handle("dva:get-zoom", () => zoomFactor());
 ipcMain.handle("dva:set-zoom", (_e, z) => setZoom(z));
 ipcMain.handle("dva:step-zoom", (_e, dir) => stepZoom(Number(dir) || 0));
 
+// ------------------------------------------------------------------ an app tried off screen (2.35.0)
+// `kimilm --kimilm-preview=<url> --kimilm-preview-out=<file>`: the engine opens an app's preview page
+// (engine/dva/app_preview.py) when the computer has no Chrome-like browser to run headless. This start is separate
+// from the running KimiLM: its own temporary profile, no single-instance lock, no engine, no window shown.
+function argValue(prefix) {
+  const hit = process.argv.find((a) => typeof a === "string" && a.startsWith(prefix));
+  return hit ? hit.slice(prefix.length) : "";
+}
+const previewUrl = argValue("--kimilm-preview=");
+function runPreview(url, out) {
+  app.setPath("userData", fs.mkdtempSync(path.join(require("os").tmpdir(), "kimilm-preview-")));
+  app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
+  app.commandLine.appendSwitch("use-angle", "swiftshader");          // WebGL off screen, with or without a GPU
+  app.commandLine.appendSwitch("enable-unsafe-swiftshader");
+  app.whenReady().then(() => {
+    if (!/^http:\/\/127\.0\.0\.1:\d+\/appframe\/[\w.-]+\/_preview\.html$/.test(url)) return app.exit(2);
+    const w = new BrowserWindow({ show: false, width: 1100, height: 800,
+      webPreferences: { offscreen: true, sandbox: true, contextIsolation: true, nodeIntegration: false } });
+    w.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    let done = false;
+    const finish = async () => {
+      if (done) return;
+      done = true;
+      let text = "";
+      try { text = await w.webContents.executeJavaScript('document.getElementById("kimi-preview-result").textContent'); } catch { /* none */ }
+      try { if (out) fs.writeFileSync(out, text || ""); } catch { /* the engine reports no result */ }
+      app.exit(0);
+    };
+    w.webContents.on("page-title-updated", (_e, title) => { if (title === "KIMI_PREVIEW_DONE") finish(); });
+    setTimeout(finish, 20000);
+    w.loadURL(url);
+  });
+}
+
 // ------------------------------------------------------------------ lifecycle
-if (!app.requestSingleInstanceLock()) {
+if (previewUrl) {
+  runPreview(previewUrl, argValue("--kimilm-preview-out="));
+} else if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   app.on("second-instance", (_e, argv) => {     // 2.34.0: `kimilm --open-app=<id>` while KimiLM runs

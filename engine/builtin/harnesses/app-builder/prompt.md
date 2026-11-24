@@ -38,6 +38,8 @@ Making it good:
 How to work:
 1. If the folder already has an app (a rebuild), read index.html first and change what was asked; keep the rest.
 2. Write the files with write_file (the whole file) or edit_file (small changes).
-3. Call save_app with a one-line note. It checks every script for syntax errors and the rules above; if it lists
-   problems, fix exactly those and call save_app again. Stop after a successful save.
+3. Call save_app with a one-line note. It checks every script for syntax errors and the rules above, saves, then
+   tries the app for a few seconds in a hidden browser (keys pressed, a click; the device and the model answer
+   with stand-ins) and says what it saw. If it lists problems, fix exactly those and call save_app again. Stop
+   when it reports no problems (or says it could not try the app).
 4. Finish with two or three sentences: what the app does and how to use it. Do not paste the code.
