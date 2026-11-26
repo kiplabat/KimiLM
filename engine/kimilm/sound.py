@@ -996,7 +996,30 @@ class Sound:
         repo = os.environ.get("KIMILM_MUSIC_ENGINE_REPO") or v["music_engine_repo"]
         return {"repo": repo, "tag": v["music_engine_tag"], "commit": v["acestep_commit"], "built_from": v["acestep_repo"],
                 "url": f"https://github.com/{repo}/releases/download/{v['music_engine_tag']}/{ACE_ASSET}",
+                "asset": ACE_ASSET,
+                "release_api": f"https://api.github.com/repos/{repo}/releases/tags/{v['music_engine_tag']}",
                 "workflow": f"https://github.com/{repo}/actions/workflows/music-engine.yml"}
+
+    async def _missing_build_reason(self, src):
+        """Why the download was not there: no release at all, or a release without a build for this system."""
+        not_built = ("The music engine has not been built yet. It is built once by the workflow "
+                     f"“Build music engine” in {src['repo']} on GitHub (Actions → Build music engine → "
+                     "Run workflow, about 15 minutes); then press Install again. Or choose a folder "
+                     "that already holds the programs.")
+        api = src.get("release_api")
+        if not api:
+            return not_built
+        try:
+            release = await fetch_json(api, headers={"Accept": "application/vnd.github+json"}, timeout=15)
+        except Exception:      # no such release (404), offline or rate-limited: the general sentence fits
+            return not_built
+        names = [a.get("name", "") for a in (release.get("assets") or []) if isinstance(a, dict)]
+        system = "Windows" if os.name == "nt" else "Linux" if sys.platform.startswith("linux") else sys.platform
+        has = ", ".join(n for n in names if n) or "nothing yet"
+        return (f"The music engine release {src['tag']} in {src['repo']} has no build for {system} "
+                f"({src.get('asset', ACE_ASSET)}); it holds: {has}. Run the workflow “Build music engine” again "
+                "(Actions → Build music engine → Run workflow, about 15 minutes): it builds for Windows and Linux. "
+                "Then press Install again. Or choose a folder that already holds the programs.")
 
     async def install_music_engine(self):
         """Download the programs that KimiLM's own repository built from the pinned acestep.cpp source."""
@@ -1016,10 +1039,7 @@ class Sound:
                 await fetch(src["url"], archive, state=state, progress=progress)
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 404:
-                    raise SoundError("The music engine has not been built yet. It is built once by the workflow "
-                                     f"“Build music engine” in {src['repo']} on GitHub (Actions → Build music engine → "
-                                     "Run workflow, about 15 minutes); then press Install again. Or choose a folder "
-                                     "that already holds the programs.") from exc
+                    raise SoundError(await self._missing_build_reason(src)) from exc
                 raise
             tmp = target.with_name("acestep.tmp")
             shutil.rmtree(tmp, ignore_errors=True)

@@ -3213,6 +3213,19 @@ def test_models_for_pictures_and_sound_really_download_and_can_be_cancelled(tmp_
         await so.install_music_engine()
         failed = [k for kind, k in events if kind == "music_engine" and k.get("action") == "failed"]
         assert failed and "has not been built yet" in failed[-1]["error"] and "Run workflow" in failed[-1]["error"] and not so.music_engine()
+        # a release built for Windows only: said so, instead of "not built yet" (2.37.1)
+        async def windows_only(url, headers=None, timeout=30):
+            assert url.endswith("/releases/tags/music-engine-test")
+            return {"tag_name": "music-engine-test", "assets": [{"name": "acestep-windows-x64.zip"}]}
+        monkeypatch.setattr(sound, "fetch_json", windows_only)
+        monkeypatch.setattr(sound.Sound, "engine_source", lambda self: {
+            **where, "url": f"{base}/not-built/acestep-linux-x64.tar.gz", "asset": "acestep-linux-x64.tar.gz",
+            "release_api": "https://api.github.com/repos/kiplabat/KimiLM/releases/tags/music-engine-test"})
+        await so.install_music_engine()
+        failed = [k for kind, k in events if kind == "music_engine" and k.get("action") == "failed"]
+        err = failed[-1]["error"]
+        assert "has no build for" in err and "acestep-linux-x64.tar.gz" in err and "acestep-windows-x64.zip" in err, err
+        assert "has not been built yet" not in err and not so.music_engine()
         monkeypatch.setattr(sound.Sound, "engine_source", lambda self: {**where, "url": f"{base}/acestep-linux-x64.tar.gz"})
         await so.install_music_engine()
         assert so.music_engine() == {"dir": str(tmp_path / "data" / "runtimes" / "acestep"), "source": "installed"}
