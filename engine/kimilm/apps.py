@@ -477,10 +477,11 @@ class Apps:
 
     @staticmethod
     def page(html):
-        """The app's index.html with KimiLM's part first: an import map (three.js and its controls, served by
-        KimiLM) and the kimi API."""
+        """The app's index.html with KimiLM's part first: an import map (three.js and its controls, and the
+        kimi/game engine, all served by KimiLM) and the kimi API."""
         extra = ('<script type="importmap">{"imports":{"three":"./_lib/three.module.min.js",'
-                 '"three/addons/":"./_lib/addons/"}}</script><script src="./_kimi.js"></script>')
+                 '"three/addons/":"./_lib/addons/","kimi/game":"./_lib/kimi-game/kimi-game.js"}}</script>'
+                 '<script src="./_kimi.js"></script>')
         return inject(html, extra)
 
     @staticmethod
