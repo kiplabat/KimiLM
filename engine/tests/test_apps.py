@@ -126,12 +126,16 @@ def test_examples_come_installed_and_run_in_a_locked_frame(engine):
     plain = httpx.Client(base_url=f"http://127.0.0.1:{port}", trust_env=False)          # no token: the key is enough
     page = plain.get(app["frame"])
     assert page.status_code == 200 and '"three":"./_lib/three.module.min.js"' in page.text
+    assert '"kimi/game":"./_lib/kimi-game/kimi-game.js"' in page.text                        # 2.39.0: the game engine
     csp = page.headers["content-security-policy"]
     assert "frame-src 'none'" in csp and "https:" not in csp and "connect-src 'self'" in csp
     base = app["frame"].rsplit("/", 1)[0]
     assert plain.get(base + "/_kimi.js").status_code == 200
     lib = plain.get(base + "/_lib/three.module.min.js")
     assert lib.status_code == 200 and lib.headers["access-control-allow-origin"] == "*"
+    eng = plain.get(base + "/_lib/kimi-game/kimi-game.js")
+    assert eng.status_code == 200 and eng.headers["content-type"].startswith("text/javascript") and "kimi/game" in eng.text
+    assert "nyota-city" in ids                                                               # 2.39.0: the open-world example
     assert plain.get(base + "/../../app.json").status_code == 404
     assert plain.get(base.replace("orbit-racer.1.", "orbit-racer.1.0") + "/index.html").status_code == 404
     assert plain.get("/appframe/orbit-racer.2." + base.rsplit(".", 1)[1] + "/index.html").status_code == 404
