@@ -1,9 +1,0 @@
-{
-  "name": "Nyota City",
-  "kind": "game",
-  "dims": "3D",
-  "about": "An open-world action game in a city made in code: six missions against the Kivuli gang, cars, matatus and boda-bodas to drive, six weapons with a sniper scope, rockets and grenades, police that respond to your heat, day and night. Mouse and keys or a gamepad.",
-  "icon": {"emoji": "🌆", "color": "#F2A541"},
-  "notes": "An example game that comes with KimiLM, made with kimi/game 0.2.0 (github.com/kiplabat/kimi-game)",
-  "prompt": "A 3D open-world third-person action game: a city with roads, towers and buildings you can walk into; cars, minibuses and motorbikes to drive; a pistol, rifle, shotgun, scoped sniper, rocket launcher and grenades; enemies that take cover and flank; police that come when you are wanted; missions; day and night."
-}

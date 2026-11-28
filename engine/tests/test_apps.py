@@ -135,7 +135,7 @@ def test_examples_come_installed_and_run_in_a_locked_frame(engine):
     assert lib.status_code == 200 and lib.headers["access-control-allow-origin"] == "*"
     eng = plain.get(base + "/_lib/kimi-game/kimi-game.js")
     assert eng.status_code == 200 and eng.headers["content-type"].startswith("text/javascript") and "kimi/game" in eng.text
-    assert "nyota-city" in ids                                                               # 2.39.0: the open-world example
+    assert "sundown-city" in ids                                                             # 2.40.0: the open-world example (was nyota-city)
     assert plain.get(base + "/../../app.json").status_code == 404
     assert plain.get(base.replace("orbit-racer.1.", "orbit-racer.1.0") + "/index.html").status_code == 404
     assert plain.get("/appframe/orbit-racer.2." + base.rsplit(".", 1)[1] + "/index.html").status_code == 404
